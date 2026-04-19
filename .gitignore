@@ -1,0 +1,34 @@
+.env
+!.env.example
+target/
+node_modules/
+*.o
+*.d
+data/
+!data/recommended-watchlist.json
+!data/margin-stocks.json
+!data/liquid-5l-symbols.json
+!data/volume_groups.json
+
+# Cargo.lock should be committed for binary applications
+# Rust backup files
+**/*.rs.bk
+.DS_Store
+
+
+*.pem
+*.pyc
+__pycache__/
+
+*.woff2
+
+venv/
+# Added by code-review-graph
+.code-review-graph/
+
+.claude/
+.kilo/
+
+*.csv
+
+parquets/

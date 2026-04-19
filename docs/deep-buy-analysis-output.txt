@@ -1,0 +1,255 @@
+
+════════════════════════════════════════════════════════════════════════════════
+  DEEP BUY SIGNAL ANALYSIS
+  2025-12-01 to 2026-03-28 — BUY direction only, no lookahead
+════════════════════════════════════════════════════════════════════════════════
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 1: Building BUY feature matrix
+████████████████████████████████████████████████████████████████████████████████
+  Loaded 59966 BUY candidates across 80 days
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 2: BUY Feature Importance
+████████████████████████████████████████████████████████████████████████████████
+
+  ── Exit window: short (bucket 35) ──
+  Feature              | Thresh  | HIGH: AvgRet   N    | LOW:  AvgRet   N    | Lift
+  -------------------------------------------------------------------------------------
+  move_pct             |    0.39 |  -0.099 29983 |  -0.003 29983 | -0.096
+  move_pct             |    0.78 |  -0.187 14992 |  -0.005 44974 | -0.182
+  move_pct             |    1.40 |  -0.451  5997 |  -0.006 53969 | -0.445
+  max_vol_rate         |   49.85 |  -0.002 29987 |  -0.099 29979 | +0.097 ★★★
+  max_vol_rate         |  242.72 | +  0.006 14993 |  -0.070 44973 | +0.075 ★★★
+  max_vol_rate         | 1133.20 |  -0.023  5997 |  -0.054 53969 | +0.031 ★★
+  avg_vol_rate         |   24.66 | +  0.012 29984 |  -0.113 29982 | +0.125 ★★★
+  avg_vol_rate         |  130.89 | +  0.020 14992 |  -0.074 44974 | +0.095 ★★★
+  avg_vol_rate         |  654.61 |  -0.009  5997 |  -0.055 53969 | +0.046 ★★
+  gap_pct              |   -0.07 |  -0.070 29983 |  -0.031 29983 | -0.039
+  gap_pct              |    0.44 |  -0.090 14992 |  -0.037 44974 | -0.053
+  gap_pct              |    1.17 |  -0.229  5997 |  -0.031 53969 | -0.198
+  abs_gap_pct          |    0.56 |  -0.057 29983 |  -0.044 29983 | -0.013
+  abs_gap_pct          |    1.17 |  -0.070 14992 |  -0.044 44974 | -0.026
+  abs_gap_pct          |    2.18 |  -0.089  5997 |  -0.046 53969 | -0.042
+  vwap_dist_pct        |    0.27 |  -0.094 29983 |  -0.008 29983 | -0.086
+  vwap_dist_pct        |    0.53 |  -0.191 14992 |  -0.004 44974 | -0.188
+  vwap_dist_pct        |    0.95 |  -0.436  5997 |  -0.008 53969 | -0.428
+  avg_body             |    0.50 |  -0.005 29986 |  -0.096 29980 | +0.091 ★★★
+  avg_body             |    0.64 |  -0.033 14996 |  -0.056 44970 | +0.023 ★★
+  avg_body             |    0.75 |  -0.035  6572 |  -0.053 53394 | +0.017 ★
+  range_pct            |    1.27 |  -0.075 29983 |  -0.026 29983 | -0.049
+  range_pct            |    2.03 |  -0.158 14992 |  -0.015 44974 | -0.144
+  range_pct            |    3.19 |  -0.273  5997 |  -0.026 53969 | -0.247
+  prev_range_pct       |    0.32 |  -0.014 14992 |  -0.063 44974 | +0.048 ★★
+  vol_accel_12         |    0.67 |  -0.022 30003 |  -0.079 29963 | +0.057 ★★★
+  vol_accel_12         |    4.72 |  -0.140  5997 |  -0.041 53969 | -0.099
+  vol_accel_23         |    0.67 |  -0.009 29983 |  -0.092 29983 | +0.083 ★★★
+  vol_accel_23         |    1.50 |  -0.038 14992 |  -0.055 44974 | +0.017 ★
+  vol_accel_23         |    4.29 |  -0.087  6002 |  -0.047 53964 | -0.041
+  gap_down(<0)         |    1.00 |  -0.026 23439 |  -0.067 36527 | +0.041 ★★
+  gap_down(<0)         |    1.00 |  -0.026 23439 |  -0.067 36527 | +0.041 ★★
+  gap_up(>0)           |    1.00 |  -0.075 17974 |  -0.040 41992 | -0.034
+  gap_up(>0)           |    1.00 |  -0.075 17974 |  -0.040 41992 | -0.034
+  prev_day_down        |    1.00 |  -0.061 25706 |  -0.043 34260 | -0.018
+  prev_day_down        |    1.00 |  -0.061 25706 |  -0.043 34260 | -0.018
+  prev_day_up          |    1.00 |  -0.017 19671 |  -0.067 40295 | +0.050 ★★★
+  prev_day_up          |    1.00 |  -0.017 19671 |  -0.067 40295 | +0.050 ★★★
+  prev2_day_down       |    1.00 | +  0.034 20024 |  -0.093 39942 | +0.127 ★★★
+  prev2_day_down       |    1.00 | +  0.034 20024 |  -0.093 39942 | +0.127 ★★★
+  vwap_above           |    1.00 |  -0.060 47802 |  -0.014 12164 | -0.045
+  vwap_above           |    1.00 |  -0.060 47802 |  -0.014 12164 | -0.045
+  vwap_above           |    1.00 |  -0.060 47802 |  -0.014 12164 | -0.045
+
+  ── Exit window: med (bucket 46) ──
+  Feature              | Thresh  | HIGH: AvgRet   N    | LOW:  AvgRet   N    | Lift
+  -------------------------------------------------------------------------------------
+  move_pct             |    0.39 |  -0.119 29983 |  -0.015 29983 | -0.104
+  move_pct             |    0.78 |  -0.209 14992 |  -0.020 44974 | -0.189
+  move_pct             |    1.40 |  -0.484  5997 |  -0.021 53969 | -0.463
+  max_vol_rate         |   49.85 |  -0.032 29987 |  -0.102 29979 | +0.070 ★★★
+  max_vol_rate         |  242.72 |  -0.037 14993 |  -0.077 44973 | +0.040 ★★
+  max_vol_rate         | 1133.20 |  -0.057  5997 |  -0.068 53969 | +0.011 ★
+  avg_vol_rate         |   24.66 |  -0.018 29984 |  -0.116 29982 | +0.098 ★★★
+  avg_vol_rate         |  130.89 |  -0.023 14992 |  -0.082 44974 | +0.059 ★★★
+  avg_vol_rate         |  654.61 |  -0.045  5997 |  -0.070 53969 | +0.025 ★★
+  gap_pct              |   -0.07 |  -0.098 29983 |  -0.037 29983 | -0.061
+  gap_pct              |    0.44 |  -0.126 14992 |  -0.048 44974 | -0.078
+  gap_pct              |    1.17 |  -0.271  5997 |  -0.045 53969 | -0.227
+  abs_gap_pct          |    0.56 |  -0.077 29983 |  -0.057 29983 | -0.020
+  abs_gap_pct          |    1.17 |  -0.098 14992 |  -0.057 44974 | -0.041
+  abs_gap_pct          |    2.18 |  -0.129  5997 |  -0.060 53969 | -0.068
+  vwap_dist_pct        |    0.27 |  -0.115 29983 |  -0.019 29983 | -0.096
+  vwap_dist_pct        |    0.53 |  -0.221 14992 |  -0.016 44974 | -0.205
+  vwap_dist_pct        |    0.95 |  -0.455  5997 |  -0.024 53969 | -0.431
+  avg_body             |    0.50 |  -0.022 29986 |  -0.113 29980 | +0.091 ★★★
+  avg_body             |    0.64 |  -0.047 14996 |  -0.074 44970 | +0.027 ★★
+  avg_body             |    0.75 |  -0.045  6572 |  -0.070 53394 | +0.024 ★★
+  range_pct            |    1.27 |  -0.101 29983 |  -0.033 29983 | -0.068
+  range_pct            |    2.03 |  -0.190 14992 |  -0.026 44974 | -0.164
+  range_pct            |    3.19 |  -0.317  5997 |  -0.039 53969 | -0.278
+  prev_range_pct       |    0.32 |  -0.049 14992 |  -0.073 44974 | +0.024 ★★
+  prev_range_pct       |    1.31 |  -0.109  5997 |  -0.063 53969 | -0.047
+  vol_accel_12         |    0.67 |  -0.039 30003 |  -0.096 29963 | +0.058 ★★★
+  vol_accel_12         |    1.53 |  -0.077 14992 |  -0.064 44974 | -0.013
+  vol_accel_12         |    4.72 |  -0.156  5997 |  -0.057 53969 | -0.098
+  vol_accel_23         |    0.67 |  -0.022 29983 |  -0.113 29983 | +0.091 ★★★
+  vol_accel_23         |    1.50 |  -0.044 14992 |  -0.075 44974 | +0.031 ★★
+  vol_accel_23         |    4.29 |  -0.089  6002 |  -0.065 53964 | -0.024
+  gap_down(<0)         |    1.00 |  -0.031 23439 |  -0.090 36527 | +0.059 ★★★
+  gap_down(<0)         |    1.00 |  -0.031 23439 |  -0.090 36527 | +0.059 ★★★
+  gap_up(>0)           |    1.00 |  -0.109 17974 |  -0.049 41992 | -0.060
+  gap_up(>0)           |    1.00 |  -0.109 17974 |  -0.049 41992 | -0.060
+  prev_day_up          |    1.00 |  -0.050 19671 |  -0.076 40295 | +0.025 ★★
+  prev_day_up          |    1.00 |  -0.050 19671 |  -0.076 40295 | +0.025 ★★
+  prev2_day_down       |    1.00 | +  0.005 20024 |  -0.103 39942 | +0.108 ★★★
+  prev2_day_down       |    1.00 | +  0.005 20024 |  -0.103 39942 | +0.108 ★★★
+  vwap_above           |    1.00 |  -0.078 47802 |  -0.027 12164 | -0.051
+  vwap_above           |    1.00 |  -0.078 47802 |  -0.027 12164 | -0.051
+  vwap_above           |    1.00 |  -0.078 47802 |  -0.027 12164 | -0.051
+
+  ── Exit window: long (bucket 71) ──
+  Feature              | Thresh  | HIGH: AvgRet   N    | LOW:  AvgRet   N    | Lift
+  -------------------------------------------------------------------------------------
+  move_pct             |    0.39 |  -0.133 29983 |  -0.027 29983 | -0.105
+  move_pct             |    0.78 |  -0.235 14992 |  -0.028 44974 | -0.207
+  move_pct             |    1.40 |  -0.526  5997 |  -0.030 53969 | -0.496
+  max_vol_rate         |   49.85 |  -0.048 29987 |  -0.111 29979 | +0.063 ★★★
+  max_vol_rate         |  242.72 |  -0.061 14993 |  -0.086 44973 | +0.025 ★★
+  avg_vol_rate         |   24.66 |  -0.035 29984 |  -0.125 29982 | +0.090 ★★★
+  avg_vol_rate         |  130.89 |  -0.048 14992 |  -0.091 44974 | +0.043 ★★
+  avg_vol_rate         |  654.61 |  -0.064  5997 |  -0.082 53969 | +0.017 ★
+  gap_pct              |   -0.07 |  -0.116 29983 |  -0.044 29983 | -0.072
+  gap_pct              |    0.44 |  -0.152 14992 |  -0.056 44974 | -0.096
+  gap_pct              |    1.17 |  -0.315  5997 |  -0.054 53969 | -0.261
+  abs_gap_pct          |    0.56 |  -0.099 29983 |  -0.060 29983 | -0.039
+  abs_gap_pct          |    1.17 |  -0.140 14992 |  -0.060 44974 | -0.080
+  abs_gap_pct          |    2.18 |  -0.177  5997 |  -0.069 53969 | -0.108
+  vwap_dist_pct        |    0.27 |  -0.129 29983 |  -0.031 29983 | -0.098
+  vwap_dist_pct        |    0.53 |  -0.239 14992 |  -0.027 44974 | -0.213
+  vwap_dist_pct        |    0.95 |  -0.477  5997 |  -0.036 53969 | -0.442
+  avg_body             |    0.50 |  -0.027 29986 |  -0.133 29980 | +0.106 ★★★
+  avg_body             |    0.64 |  -0.048 14996 |  -0.090 44970 | +0.042 ★★
+  avg_body             |    0.75 |  -0.030  6572 |  -0.086 53394 | +0.056 ★★★
+  range_pct            |    1.27 |  -0.129 29983 |  -0.031 29983 | -0.099
+  range_pct            |    2.03 |  -0.237 14992 |  -0.027 44974 | -0.210
+  range_pct            |    3.19 |  -0.370  5997 |  -0.048 53969 | -0.322
+  prev_range_pct       |    0.32 |  -0.070 14992 |  -0.083 44974 | +0.013 ★
+  prev_range_pct       |    1.31 |  -0.137  5997 |  -0.074 53969 | -0.063
+  vol_accel_12         |    0.67 |  -0.050 30003 |  -0.110 29963 | +0.060 ★★★
+  vol_accel_12         |    1.53 |  -0.089 14992 |  -0.077 44974 | -0.013
+  vol_accel_12         |    4.72 |  -0.169  5997 |  -0.070 53969 | -0.099
+  vol_accel_23         |    0.67 |  -0.031 29983 |  -0.129 29983 | +0.098 ★★★
+  vol_accel_23         |    1.50 |  -0.052 14992 |  -0.089 44974 | +0.037 ★★
+  vol_accel_23         |    4.29 |  -0.103  6002 |  -0.077 53964 | -0.025
+  gap_down(<0)         |    1.00 |  -0.040 23439 |  -0.106 36527 | +0.066 ★★★
+  gap_down(<0)         |    1.00 |  -0.040 23439 |  -0.106 36527 | +0.066 ★★★
+  gap_up(>0)           |    1.00 |  -0.133 17974 |  -0.057 41992 | -0.076
+  gap_up(>0)           |    1.00 |  -0.133 17974 |  -0.057 41992 | -0.076
+  prev_day_down        |    1.00 |  -0.068 25706 |  -0.089 34260 | +0.021 ★★
+  prev_day_down        |    1.00 |  -0.068 25706 |  -0.089 34260 | +0.021 ★★
+  prev_day_up          |    1.00 |  -0.068 19671 |  -0.086 40295 | +0.018 ★
+  prev_day_up          |    1.00 |  -0.068 19671 |  -0.086 40295 | +0.018 ★
+  prev2_day_down       |    1.00 |  -0.008 20024 |  -0.116 39942 | +0.107 ★★★
+  prev2_day_down       |    1.00 |  -0.008 20024 |  -0.116 39942 | +0.107 ★★★
+  vwap_above           |    1.00 |  -0.091 47802 |  -0.036 12164 | -0.055
+  vwap_above           |    1.00 |  -0.091 47802 |  -0.036 12164 | -0.055
+  vwap_above           |    1.00 |  -0.091 47802 |  -0.036 12164 | -0.055
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 3: Exhaustive BUY filter+ranking search
+████████████████████████████████████████████████████████████████████████████████
+  Testing 896 filter combos × 7 rankers × 13 TP/SL × 3 exit windows × 3 positions...
+  10000 tested, 8259 valid...  20000 tested, 16622 valid...  30000 tested, 24727 valid...  40000 tested, 33115 valid...  50000 tested, 40925 valid...  60000 tested, 49485 valid...  70000 tested, 58053 valid...  80000 tested, 66565 valid...  90000 tested, 74559 valid...  100000 tested, 82391 valid...  110000 tested, 91370 valid...  120000 tested, 100164 valid...  130000 tested, 108758 valid...  140000 tested, 117627 valid...  150000 tested, 125995 valid...  160000 tested, 133692 valid...  170000 tested, 141800 valid...  180000 tested, 150904 valid...  190000 tested, 159289 valid...  200000 tested, 167003 valid...  210000 tested, 175561 valid...  220000 tested, 183450 valid...  230000 tested, 191291 valid...  240000 tested, 199737 valid...  250000 tested, 208269 valid...  260000 tested, 215397 valid...  270000 tested, 223811 valid...  280000 tested, 231264 valid...  290000 tested, 238843 valid...  300000 tested, 246569 valid...  310000 tested, 253745 valid...  320000 tested, 261843 valid...  330000 tested, 268942 valid...  340000 tested, 276559 valid...  350000 tested, 284503 valid...  360000 tested, 293021 valid...  370000 tested, 301103 valid...  380000 tested, 308890 valid...  390000 tested, 316601 valid...  400000 tested, 322257 valid...  410000 tested, 330415 valid...  420000 tested, 337892 valid...  430000 tested, 346075 valid...  440000 tested, 355107 valid...  450000 tested, 363509 valid...  460000 tested, 371786 valid...  470000 tested, 381169 valid...  480000 tested, 389595 valid...  490000 tested, 397834 valid...  500000 tested, 405476 valid...  510000 tested, 413749 valid...  520000 tested, 421921 valid...  530000 tested, 427238 valid...  Tested 533169 combos, 428539 valid
+
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  TOP 80 BUY CONFIGS — SORTED BY AVG DAILY ROC
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+    # Label                                                                                 Sigs Win%  AvgROC  TotalPnl  Grn/Tot
+  ---------------------------------------------------------------------------------------------------------------------------------------
+    1 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=5 exit=long                124  51%   +4.25%     +69722  24/36 (67%)
+    2 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long                 88  53%   +4.12%     +50811  23/36 (64%)
+    3 gapDn<-1+2dayDn+vwapFar+vol>200 rank=entryVol TP=0 SL=0 pos=8 exit=long                152  51%   +4.03%     +80980  23/36 (64%)
+    4 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=8 exit=long                 152  51%   +4.01%     +79809  23/36 (64%)
+    5 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=5 exit=long                 124  52%   +4.00%     +60906  23/36 (64%)
+    6 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=8 exit=long                152  51%   +4.00%     +79047  23/36 (64%)
+    7 gapDn<-1+2dayDn+vwapFar+vol>200 rank=entryVol TP=0 SL=0 pos=5 exit=long                124  53%   +3.97%     +59711  23/36 (64%)
+    8 gapDn<-1+2dayDn+vwapFar+vol>200 rank=body TP=0 SL=0 pos=8 exit=long                    152  48%   +3.89%     +72726  23/36 (64%)
+    9 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=8 exit=long                    152  49%   +3.84%     +70014  24/36 (67%)
+   10 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=5 exit=long                    124  52%   +3.77%     +52520  25/36 (69%)
+   11 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=8 exit=long                 152  50%   +3.76%     +65204  24/36 (67%)
+   12 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapDnSize TP=0 SL=0 pos=8 exit=long               152  50%   +3.76%     +65204  24/36 (67%)
+   13 gapDn<-1+noMom+vwapBelow+vol>200 rank=move TP=0 SL=0 pos=3 exit=long                    52  58%   +3.73%     +50371  22/33 (67%)
+   14 gapDn<-1+2dayDn+vwapFar+vol>200 rank=body TP=0 SL=0 pos=3 exit=long                     88  49%   +3.65%     +40650  22/36 (61%)
+   15 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=5 exit=long                 124  50%   +3.61%     +46740  25/36 (69%)
+   16 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapDnSize TP=0 SL=0 pos=5 exit=long               124  50%   +3.61%     +46740  25/36 (69%)
+   17 gapDn<-1+noMom+vwapBelow+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long                52  58%   +3.59%     +47628  22/33 (67%)
+   18 gapDn<-1+noMom+vwapBelow+vol>200 rank=move TP=0 SL=0 pos=5 exit=long                    58  57%   +3.54%     +50090  22/33 (67%)
+   19 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapSize TP=0 SL=0 pos=5 exit=long                 58  57%   +3.54%     +50090  22/33 (67%)
+   20 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapDnSize TP=0 SL=0 pos=5 exit=long               58  57%   +3.54%     +50090  22/33 (67%)
+   21 gapDn<-1+noMom+vwapBelow+vol>200 rank=volRate TP=0 SL=0 pos=5 exit=long                 58  57%   +3.52%     +49471  22/33 (67%)
+   22 gapDn<-1+noMom+vwapBelow+vol>200 rank=volXmove TP=0 SL=0 pos=5 exit=long                58  57%   +3.52%     +49471  22/33 (67%)
+   23 gapDn<-1+noMom+vwapBelow+vol>200 rank=entryVol TP=0 SL=0 pos=5 exit=long                58  57%   +3.52%     +49471  22/33 (67%)
+   24 gapDn<-1+noMom+vwapBelow+vol>200 rank=body TP=0 SL=0 pos=5 exit=long                    58  57%   +3.52%     +49471  22/33 (67%)
+   25 gapDn<-1+noMom+vwapBelow+vol>200 rank=volRate TP=0 SL=0 pos=8 exit=long                 59  56%   +3.49%     +48441  21/33 (64%)
+   26 gapDn<-1+noMom+vwapBelow+vol>200 rank=move TP=0 SL=0 pos=8 exit=long                    59  56%   +3.49%     +48441  21/33 (64%)
+   27 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapSize TP=0 SL=0 pos=8 exit=long                 59  56%   +3.49%     +48441  21/33 (64%)
+   28 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapDnSize TP=0 SL=0 pos=8 exit=long               59  56%   +3.49%     +48441  21/33 (64%)
+   29 gapDn<-1+noMom+vwapBelow+vol>200 rank=volXmove TP=0 SL=0 pos=8 exit=long                59  56%   +3.49%     +48441  21/33 (64%)
+   30 gapDn<-1+noMom+vwapBelow+vol>200 rank=entryVol TP=0 SL=0 pos=8 exit=long                59  56%   +3.49%     +48441  21/33 (64%)
+   31 gapDn<-1+noMom+vwapBelow+vol>200 rank=body TP=0 SL=0 pos=8 exit=long                    59  56%   +3.49%     +48441  21/33 (64%)
+   32 gapDn<-1+noMom+vwapBelow+vol>200 rank=entryVol TP=0 SL=0 pos=3 exit=long                52  56%   +3.46%     +45174  22/33 (67%)
+   33 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=3 exit=long                     88  50%   +3.42%     +35757  25/36 (69%)
+   34 gapDn<-1+noMom+vwapBelow+vol>200 rank=body TP=0 SL=0 pos=3 exit=long                    52  54%   +3.37%     +43253  21/33 (64%)
+   35 gapDn<-1+noMom+vwapBelow+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=long                 52  54%   +3.32%     +42444  21/33 (64%)
+   36 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=med                  88  51%   +3.30%     +44235  23/36 (64%)
+   37 gapDn<-1+2dayDn+vwapFar+vol>200 rank=body TP=0 SL=0 pos=5 exit=long                    124  48%   +3.30%     +35516  23/36 (64%)
+   38 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapSize TP=0 SL=0 pos=3 exit=long                 52  54%   +3.30%     +41943  20/33 (61%)
+   39 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapDnSize TP=0 SL=0 pos=3 exit=long               52  54%   +3.30%     +41943  20/33 (61%)
+   40 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=3 exit=long                  88  52%   +3.28%     +32828  25/36 (69%)
+   41 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapDnSize TP=0 SL=0 pos=3 exit=long                88  52%   +3.28%     +32828  25/36 (69%)
+   42 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=5 exit=med                 124  52%   +3.28%     +62525  23/36 (64%)
+   43 gapDn<-1+2dayDn+noVwap+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long                 108  54%   +3.28%     +62629  27/40 (68%)
+   44 gapDn<-1+2dayDn+vwapFar+vol>200 rank=entryVol TP=0 SL=0 pos=3 exit=long                 88  52%   +3.26%     +32524  23/36 (64%)
+   45 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=5 exit=med                  124  52%   +3.20%     +59643  23/36 (64%)
+   46 gapDn<-1+2dayDn+vwapFar+vol>200 rank=entryVol TP=0 SL=0 pos=5 exit=med                 124  52%   +3.18%     +59221  23/36 (64%)
+   47 gapDn<-1+2dayDn+vwapFar+vol>200 rank=entryVol TP=0 SL=0 pos=8 exit=med                 152  51%   +3.08%     +72805  23/36 (64%)
+   48 gapDn<-1+2dayDn+vwapAbove+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long              103  53%   +3.06%     +54882  26/40 (65%)
+   49 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=8 exit=med                  152  51%   +3.03%     +69449  23/36 (64%)
+   50 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=8 exit=med                 152  52%   +3.02%     +69412  23/36 (64%)
+   51 gapDn<-2+2dayDn+vwapFar+vol>200 rank=body TP=0 SL=0 pos=3 exit=long                     59  49%   +2.95%     +16868  18/30 (60%)
+   52 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=8 exit=med                     152  51%   +2.93%     +64185  23/36 (64%)
+   53 gapDn<-1+2dayDn+vwapFar+vol>200 rank=body TP=0 SL=0 pos=8 exit=med                     152  51%   +2.91%     +62806  22/36 (61%)
+   54 gapDn<-1+2dayDn+noVwap+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=med                  108  54%   +2.90%     +59740  28/40 (70%)
+   55 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=5 exit=med                     124  52%   +2.86%     +47558  22/36 (61%)
+   56 bigGap>2+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=long                  96  53%   +2.85%     +53796  27/41 (66%)
+   57 gapDn<-1+noMom+vwapBelow+vol>200 rank=move TP=0 SL=0 pos=3 exit=med                     52  58%   +2.85%     +47920  20/33 (61%)
+   58 gapDn<-2+2dayDn+vwapAbove+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=long                69  51%   +2.83%     +18424  22/35 (63%)
+   59 gapDn<-2+2dayDn+vwapFar+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long                 59  46%   +2.82%     +14449  17/30 (57%)
+   60 gapDn<-1+noMom+vwapBelow+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=med                 52  58%   +2.81%     +47131  20/33 (61%)
+   61 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=8 exit=med                  152  51%   +2.80%     +56401  23/36 (64%)
+   62 gapDn<-1+2dayDn+vwapFar+vol>200 rank=gapDnSize TP=0 SL=0 pos=8 exit=med                152  51%   +2.80%     +56401  23/36 (64%)
+   63 gapDn<-1+2dayDn+vwapFar+vol>500 rank=volXmove TP=0 SL=0 pos=3 exit=long                 75  53%   +2.77%     +36491  19/32 (59%)
+   64 gapDn<-1+2dayDn+vwapFar+vol>200 rank=move TP=0 SL=0 pos=3 exit=med                      88  50%   +2.77%     +32778  24/36 (67%)
+   65 gapDn<-2+2dayDn+vwapAbove+vol>200 rank=volXmove TP=0 SL=0 pos=3 exit=long               69  49%   +2.76%     +16646  22/35 (63%)
+   66 bigGap>2+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=short                 96  58%   +2.72%     +53300  26/41 (63%)
+   67 bigGap>2+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=3 exit=long                  96  53%   +2.72%     +50332  26/41 (63%)
+   68 noGap+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=3 exit=long                    126  55%   +2.71%     +67820  29/42 (69%)
+   69 gapDn<-1+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=long                  88  51%   +2.71%     +20677  21/36 (58%)
+   70 gapDn<-1+noMom+vwapBelow+vol>200 rank=volRate TP=0 SL=0 pos=5 exit=med                  58  55%   +2.69%     +48295  19/33 (58%)
+   71 gapDn<-1+noMom+vwapBelow+vol>200 rank=volXmove TP=0 SL=0 pos=5 exit=med                 58  55%   +2.69%     +48295  19/33 (58%)
+   72 gapDn<-1+noMom+vwapBelow+vol>200 rank=entryVol TP=0 SL=0 pos=5 exit=med                 58  55%   +2.69%     +48295  19/33 (58%)
+   73 gapDn<-1+noMom+vwapBelow+vol>200 rank=body TP=0 SL=0 pos=5 exit=med                     58  55%   +2.69%     +48295  19/33 (58%)
+   74 bigGap>2+2dayDn+vwapFar+vol>200 rank=gapSize TP=0 SL=0 pos=3 exit=short                 96  56%   +2.69%     +52234  25/41 (61%)
+   75 gapDn<-1+2dayDn+vwapAbove+vol>200 rank=volXmove TP=0 SL=0 pos=8 exit=long              195  51%   +2.68%     +77693  26/40 (65%)
+   76 bigGap>2+2dayDn+vwapFar+vol>200 rank=volRate TP=0 SL=0 pos=3 exit=med                   96  57%   +2.68%     +51028  26/41 (63%)
+   77 gapDn<-1+noMom+vwapBelow+vol>200 rank=move TP=0 SL=0 pos=5 exit=med                     58  55%   +2.68%     +47990  19/33 (58%)
+   78 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapSize TP=0 SL=0 pos=5 exit=med                  58  55%   +2.68%     +47990  19/33 (58%)
+   79 gapDn<-1+noMom+vwapBelow+vol>200 rank=gapDnSize TP=0 SL=0 pos=5 exit=med                58  55%   +2.68%     +47990  19/33 (58%)
+   80 gapDn<-1+noMom+vwapBelow+vol>200 rank=entryVol TP=0 SL=0 pos=3 exit=med                 52  56%   +2.67%     +44550  19/33 (58%)
+
+  Total tested: 428539 valid combos in 544.1s
+  229956 profitable BUY configs found
+  8494 configs with >= 1% daily ROC
+  408 configs with >= 2% daily ROC
+
+  Results saved to docs/deep-buy-analysis-results.md

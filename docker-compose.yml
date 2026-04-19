@@ -1,0 +1,54 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    ports: ["8123:8123", "9000:9000"]
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./init:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      retries: 20
+      timeout: 3s
+      start_period: 30s
+
+  engine:
+    build:
+      context: .
+      dockerfile: engine/Dockerfile
+    ports: ["8080:8080"]
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - DHAN_BASE_URL=${DHAN_BASE_URL:-https://api.dhan.co/v2}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
+      - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
+      - DHAN_ORDERS_ENDPOINT=${DHAN_ORDERS_ENDPOINT:-/orders}
+      - DHAN_POSITIONS_ENDPOINT=${DHAN_POSITIONS_ENDPOINT:-/positions}
+      - DEBUG=${DEBUG:-false}
+      - WS_SUBSCRIBE_FNO_OI=${WS_SUBSCRIBE_FNO_OI:-false}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/status"]
+      interval: 5s
+      retries: 30
+      timeout: 3s
+      start_period: 90s
+
+  ui:
+    build: ./ui
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    depends_on:
+      engine:
+        condition: service_healthy
+
+volumes:
+  clickhouse_data:

@@ -1,0 +1,31 @@
+# Git
+.git
+
+# Rust build artifacts
+engine/target
+
+# UI (not needed for engine build)
+ui/node_modules
+ui/dist
+ui/.vite
+
+# Huge data files (keep only small JSON configs needed at compile time)
+data/candles
+data/candles_new
+data/*.ndjson
+data/*.parquet
+data/quant-results
+
+# Analysis / docs / deploy scripts
+analysis
+docs
+deploy
+scripts
+backtest-config.json
+
+# Logs
+*.log
+
+# Environment
+.env*
+!.env.example
