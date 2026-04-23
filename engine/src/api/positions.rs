@@ -7,11 +7,26 @@ use std::collections::HashMap;
 /// Never fails the whole response — each account is independent.
 pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
     #[derive(clickhouse::Row, serde::Deserialize)]
-    struct AccRow { name: String, client_id: String, access_token: String, broker: String, api_key: String }
+    struct AccRow {
+        name: String,
+        client_id: String,
+        access_token: String,
+        broker: String,
+        api_key: String,
+        enabled: u8,
+    }
 
     let accounts = state.ch.query(
-        "SELECT name, client_id, access_token, broker, api_key FROM trading.accounts FINAL WHERE enabled = 1"
+        "SELECT name, client_id, access_token, broker, api_key, enabled \
+         FROM trading.accounts \
+         ORDER BY inserted_at DESC"
     ).fetch_all::<AccRow>().await.unwrap_or_default();
+
+    let mut accounts_by_client: std::collections::HashMap<String, AccRow> = std::collections::HashMap::new();
+    for acc in accounts {
+        if acc.enabled != 1 { continue; }
+        accounts_by_client.entry(acc.client_id.clone()).or_insert(acc);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -20,7 +35,7 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
 
     let mut results = vec![];
 
-    for acc in accounts {
+    for (_, acc) in accounts_by_client {
         if acc.broker == "ZERODHA" {
             // ── Zerodha: Kite Connect positions + margins ──
             let auth = format!("token {}:{}", acc.api_key, acc.access_token);

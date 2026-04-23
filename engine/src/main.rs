@@ -1,71 +1,45 @@
 mod config;
 mod types;
 mod dhan;
-mod zerodha;
-mod db;
-mod derived;
-mod exit_manager;
-mod order_executor;
-mod ws_feed;
-mod poller;
 mod api;
 
+use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("engine=info".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("engine=info".parse()?),
+        )
         .init();
 
     let config = config::Config::from_env()?;
-    tracing::info!("dhan-trader engine starting (gap15 strategy)");
+    tracing::info!("swing-atlas engine starting");
 
-    // DB setup
-    let ch = db::clickhouse::create_client(&config.clickhouse_url);
-    tracing::info!("[INIT] Waiting for ClickHouse at {}...", config.clickhouse_url);
-    db::clickhouse::wait_healthy(&ch).await?;
+    let ch = clickhouse::Client::default()
+        .with_url(&config.clickhouse_url)
+        .with_database("trading");
+
+    tracing::info!("[INIT] ClickHouse URL: {}", config.clickhouse_url);
+    wait_for_clickhouse(&ch).await?;
     tracing::info!("[INIT] ClickHouse healthy");
-    db::watchlist::migrate_gap15_schema(&ch).await;
-    db::watchlist::seed_gap15_config_if_empty(&ch).await?;
-    db::watchlist::seed_tier_state_if_empty(&ch).await?;
-    db::watchlist::migrate_volume_group_schema(&ch).await;
-    tracing::info!("[INIT] Schema migrated, config seeded");
 
-    // Scrip master
-    tracing::info!("[INIT] Syncing scrip master...");
-    dhan::scrip_master::sync_if_needed(&ch, &config).await?;
-    tracing::info!("[INIT] Scrip master sync complete");
+    api::serve(ch, config).await
+}
 
-    // Load fired_today from DB
-    let fired_today = db::signals::load_fired_today(&ch).await?;
-    tracing::info!("[INIT] Loaded {} fired-today symbols from DB", fired_today.len());
-    let fired_today = std::sync::Arc::new(tokio::sync::Mutex::new(fired_today));
-
-    // WebSocket broadcast channel
-    let (ws_tx, _) = tokio::sync::broadcast::channel(256);
-    let ws_tx = std::sync::Arc::new(ws_tx);
-
-    // Start API server
-    let api_handle = {
-        let ch = ch.clone();
-        let ws_tx = ws_tx.clone();
-        let config = config.clone();
-        tokio::spawn(async move {
-            api::serve(ch, ws_tx, config).await
-        })
-    };
-
-    // Start poller
-    let poller_handle = tokio::spawn(
-        poller::run(ch.clone(), config.clone(), fired_today, ws_tx.clone())
-    );
-
-    tokio::select! {
-        r = api_handle => { tracing::error!("API exited: {:?}", r); }
-        r = poller_handle => { tracing::error!("Poller exited: {:?}", r); }
+/// Poll ClickHouse /ping until it responds (max 30 attempts, 2.5 min total).
+async fn wait_for_clickhouse(client: &clickhouse::Client) -> Result<()> {
+    for attempt in 1..=30 {
+        match client.query("SELECT 1").fetch_one::<u8>().await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!("ClickHouse not ready (attempt {}/30): {}", attempt, e);
+                if attempt < 30 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
     }
-
-    Ok(())
+    anyhow::bail!("ClickHouse did not become healthy after 30 attempts")
 }

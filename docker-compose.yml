@@ -27,16 +27,12 @@ services:
       - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
-      - DHAN_ORDERS_ENDPOINT=${DHAN_ORDERS_ENDPOINT:-/orders}
-      - DHAN_POSITIONS_ENDPOINT=${DHAN_POSITIONS_ENDPOINT:-/positions}
       - DEBUG=${DEBUG:-false}
-      - WS_SUBSCRIBE_FNO_OI=${WS_SUBSCRIBE_FNO_OI:-false}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     depends_on:
       clickhouse:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/status"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/swing/broker-status"]
       interval: 5s
       retries: 30
       timeout: 3s

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use crate::dhan::client::DhanClient;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct QuoteOhlc {
     #[serde(default)] pub open: f32,
     #[serde(default)] pub high: f32,
@@ -14,20 +14,20 @@ pub struct QuoteOhlc {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct DepthLevel {
     #[serde(default)] pub price: f32,
     #[serde(default)] pub quantity: u32,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Depth {
     #[serde(default)] pub buy: Vec<DepthLevel>,
     #[serde(default)] pub sell: Vec<DepthLevel>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct QuoteItem {
     #[serde(default)] pub last_price: f32,
     #[serde(default)] pub ohlc: QuoteOhlc,
