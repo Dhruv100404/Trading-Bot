@@ -1,6 +1,5 @@
 use axum::{extract::State, Json};
 use crate::api::AppState;
-use std::collections::HashMap;
 
 /// Fetch live positions + fund balance from Dhan/Zerodha for ALL enabled accounts.
 /// Returns per-account results with error field if API call fails (expired token etc).
@@ -101,9 +100,19 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             }));
         } else {
             // ── Dhan ──
+            let access_token = if !state.config.dhan_access_token.is_empty() {
+                &state.config.dhan_access_token
+            } else {
+                &acc.access_token
+            };
+            let client_id = if !state.config.dhan_client_id.is_empty() {
+                &state.config.dhan_client_id
+            } else {
+                &acc.client_id
+            };
             let dhan_headers = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
-                req.header("access-token", &acc.access_token)
-                   .header("client-id", &acc.client_id)
+                req.header("access-token", access_token)
+                   .header("client-id", client_id)
             };
 
             let (positions, pos_error) = match dhan_headers(client.get("https://api.dhan.co/v2/positions")).send().await {
@@ -143,7 +152,7 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             };
 
             results.push(serde_json::json!({
-                "client_id": acc.client_id,
+                "client_id": client_id,
                 "name": acc.name,
                 "broker": "DHAN",
                 "balance": balance,

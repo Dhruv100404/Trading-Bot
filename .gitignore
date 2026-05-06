@@ -2,6 +2,8 @@
 !.env.example
 target/
 node_modules/
+ui/dist/
+ui/.vite/
 *.o
 *.d
 data/
@@ -28,6 +30,7 @@ venv/
 
 .claude/
 .kilo/
+docs/quant_research_outputs/
 
 *.csv
 

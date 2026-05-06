@@ -108,6 +108,30 @@ CREATE TABLE IF NOT EXISTS trading.orders (
 PARTITION BY toYYYYMM(trading_date)
 ORDER BY (trading_date, signal_id, account_client_id, order_type);
 
+CREATE TABLE IF NOT EXISTS trading.paper_trades (
+    symbol            String,
+    company_name      String,
+    setup_family      String,
+    bias              String DEFAULT 'Long',
+    entry_price       Float64,
+    quantity          UInt32 DEFAULT 1,
+    stop_loss         Float64,
+    target_price      Float64,
+    planned_at        DateTime DEFAULT now(),
+    max_sessions      UInt16 DEFAULT 10,
+    capital_allocated Float64 DEFAULT 50000,
+    expected_hold     String DEFAULT '',
+    thesis            String DEFAULT '',
+    notes             String DEFAULT '',
+    exit_price        Nullable(Float64),
+    closed_at         Nullable(DateTime),
+    close_reason      String DEFAULT '',
+    realized_pnl      Float64 DEFAULT 0,
+    enabled           UInt8 DEFAULT 1,
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+ORDER BY symbol;
+
 CREATE TABLE IF NOT EXISTS trading.watchlist (
     security_id       String,
     symbol            String,

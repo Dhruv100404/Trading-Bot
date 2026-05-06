@@ -7,6 +7,7 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./init:/docker-entrypoint-initdb.d
+      - ./parquets:/var/lib/clickhouse/user_files/parquets:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
@@ -28,6 +29,8 @@ services:
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
       - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./strategies:/app/strategies:ro
     depends_on:
       clickhouse:
         condition: service_healthy

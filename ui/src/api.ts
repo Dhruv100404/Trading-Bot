@@ -19,6 +19,19 @@ export interface MarketRegime {
   breadth_ratio: number
 }
 
+export interface LiveSignal {
+  status: 'ENTRY_NOW' | 'WATCH' | 'WAIT_FOR_TRIGGER' | 'INVALIDATED' | 'NO_TRADE' | string
+  label: string
+  reason: string
+  strategy_id: string
+  strategy_label: string
+  strategy_status: string
+  setup_family: string
+  score: number
+  as_of: string
+  trigger_price: number | null
+}
+
 export interface SwingCandidate {
   symbol: string
   company_name: string
@@ -41,6 +54,7 @@ export interface SwingCandidate {
   reasons: string[]
   risks: string[]
   source: string
+  live_signal: LiveSignal
 }
 
 export interface SetupMix {
@@ -75,6 +89,61 @@ export interface SwingCandidateResponse {
   message: string | null
 }
 
+export interface HistoricalCandle {
+  date: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+
+export interface HistoricalSummary {
+  latest_close: number
+  change_pct_1m: number
+  change_pct_3m: number
+  change_pct_1y: number
+  high_52w: number
+  low_52w: number
+  avg_volume_20d: number
+}
+
+export interface SymbolHistoryResponse {
+  updated_at: string
+  symbol: string
+  range: string
+  candles: HistoricalCandle[]
+  summary: HistoricalSummary | null
+  message: string | null
+}
+
+export interface HistoricalScreenerRow {
+  symbol: string
+  as_of: string
+  setup_family: string
+  strategy_id: string
+  strategy_label: string
+  strategy_status: string
+  score: number
+  trend_label: string
+  close: number
+  sma20: number
+  sma50: number
+  avg_volume20: number
+  volume_ratio: number
+  distance_to_20d_high_pct: number
+  distance_to_52w_high_pct: number
+  range_position_pct: number
+}
+
+export interface HistoricalScreenerResponse {
+  updated_at: string
+  range: string
+  total_rows: number
+  rows: HistoricalScreenerRow[]
+  message: string | null
+}
+
 export interface BrokerAccountBalance {
   availabelBalance?: number
   utilizedAmount?: number
@@ -101,12 +170,171 @@ export interface BrokerAccountSnapshot {
   error?: string | null
 }
 
+export interface PaperTrade {
+  symbol: string
+  company_name: string
+  setup_family: string
+  bias: string
+  entry_price: number
+  quantity: number
+  stop_loss: number
+  target_price: number
+  planned_at: string
+  max_sessions: number
+  capital_allocated: number
+  expected_hold: string
+  thesis: string
+  notes: string
+  exit_price: number | null
+  closed_at: string | null
+  close_reason: string
+  realized_pnl: number
+  current_price: number
+  current_value: number
+  unrealized_pnl: number
+  unrealized_pnl_pct: number
+  quote_source: string
+  quote_updated_at: string
+  enabled: number
+}
+
+export type PaperTradeInput = Omit<
+  PaperTrade,
+  | 'enabled'
+  | 'planned_at'
+  | 'exit_price'
+  | 'closed_at'
+  | 'close_reason'
+  | 'realized_pnl'
+  | 'current_price'
+  | 'current_value'
+  | 'unrealized_pnl'
+  | 'unrealized_pnl_pct'
+  | 'quote_source'
+  | 'quote_updated_at'
+>
+
+export interface PaperBudget {
+  total_budget: number
+  allocated_budget: number
+  available_budget: number
+}
+
+export interface BacktestRunSummary {
+  strategy_id: string
+  strategy_name: string
+  total_trades: number
+  win_rate: number
+  avg_return_pct: number
+  total_pnl: number
+  deployed_return_pct: number
+  avg_hold_sessions: number
+  tp_exits: number
+  sl_exits: number
+  time_exits: number
+  from_date: string
+  to_date: string
+}
+
+export interface BacktestYearlyReturn {
+  strategy_id: string
+  year: number
+  trades: number
+  win_rate: number
+  avg_return_pct: number
+  pnl: number
+  return_pct: number
+}
+
+export interface BacktestMonthlyReturn {
+  strategy_id: string
+  year: number
+  month: number
+  month_label: string
+  trades: number
+  win_rate: number
+  pnl: number
+  return_pct: number
+}
+
+export interface BacktestSymbolResult {
+  strategy_id: string
+  symbol: string
+  trades: number
+  win_rate: number
+  pnl: number
+  avg_return_pct: number
+}
+
+export interface BacktestDayQuality {
+  strategy_id: string
+  trading_days: number
+  positive_days_pct: number
+  worst_day: number
+  best_day: number
+  max_drawdown_rs: number
+}
+
+export interface BacktestStrategyDiagnostic {
+  strategy_id: string
+  method_family: string
+  total_trades: number
+  total_pnl: number
+  win_rate: number
+  profit_factor: number
+  expectancy_pct: number
+  positive_months_pct: number
+  median_monthly_pnl: number
+  worst_month: number
+  best_month: number
+  max_drawdown_rs: number
+  stability_score: number
+  status: string
+}
+
+export interface BacktestTradeLogRow {
+  strategy_id: string
+  symbol: string
+  entry_date: string
+  exit_date: string
+  setup_family: string
+  entry_price: number
+  exit_price: number
+  quantity: number
+  pnl: number
+  return_pct: number
+  exit_reason: string
+  hold_sessions: number
+  score: number
+}
+
+export interface BacktestDashboardResponse {
+  run_id: string
+  updated_at: string
+  summaries: BacktestRunSummary[]
+  yearly_returns: BacktestYearlyReturn[]
+  monthly_returns: BacktestMonthlyReturn[]
+  diagnostics: BacktestStrategyDiagnostic[]
+  winners: BacktestSymbolResult[]
+  losers: BacktestSymbolResult[]
+  day_quality: BacktestDayQuality[]
+  trades: BacktestTradeLogRow[]
+}
+
+export interface BacktestRunResponse {
+  ok: boolean
+  run_id: string
+  message: string
+  dashboard: BacktestDashboardResponse
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, options)
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`API error ${res.status}: ${text}`)
   }
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
@@ -122,6 +350,25 @@ export async function getSwingCandidate(symbol: string): Promise<SwingCandidateR
   return apiFetch<SwingCandidateResponse>(`/api/swing/candidates/${encodeURIComponent(symbol)}`)
 }
 
+export async function getSwingHistory(symbol: string, range = '1y'): Promise<SymbolHistoryResponse> {
+  return apiFetch<SymbolHistoryResponse>(`/api/swing/history/${encodeURIComponent(symbol)}?range=${encodeURIComponent(range)}`)
+}
+
+export async function getHistoricalScreener(params?: {
+  limit?: number
+  setup?: string
+  minPrice?: number
+  minAvgVolume?: number
+}): Promise<HistoricalScreenerResponse> {
+  const search = new URLSearchParams()
+  if (params?.limit) search.set('limit', String(params.limit))
+  if (params?.setup) search.set('setup', params.setup)
+  if (params?.minPrice) search.set('min_price', String(params.minPrice))
+  if (params?.minAvgVolume) search.set('min_avg_volume', String(params.minAvgVolume))
+  const query = search.toString()
+  return apiFetch<HistoricalScreenerResponse>(`/api/swing/historical-screener${query ? `?${query}` : ''}`)
+}
+
 export async function getBrokerStatus(): Promise<BrokerStatus> {
   return apiFetch<BrokerStatus>('/api/swing/broker-status')
 }
@@ -129,4 +376,56 @@ export async function getBrokerStatus(): Promise<BrokerStatus> {
 export async function getBrokerAccounts(): Promise<BrokerAccountSnapshot[]> {
   const data = await apiFetch<{ accounts: BrokerAccountSnapshot[] }>('/api/positions')
   return data.accounts ?? []
+}
+
+export async function getPaperTrades(): Promise<PaperTrade[]> {
+  const data = await apiFetch<{ trades: PaperTrade[] }>('/api/paper-trades')
+  return data.trades ?? []
+}
+
+export async function getPaperBudget(): Promise<PaperBudget> {
+  return apiFetch<PaperBudget>('/api/paper-budget')
+}
+
+export async function savePaperBudget(totalBudget: number): Promise<PaperBudget> {
+  return apiFetch<PaperBudget>('/api/paper-budget', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ total_budget: totalBudget }),
+  })
+}
+
+export async function savePaperTrade(trade: PaperTradeInput): Promise<PaperTrade> {
+  return apiFetch<PaperTrade>('/api/paper-trades', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(trade),
+  })
+}
+
+export async function closePaperTrade(symbol: string, payload: {
+  exit_price: number
+  close_reason?: string
+}): Promise<PaperTrade> {
+  return apiFetch<PaperTrade>(`/api/paper-trades/${encodeURIComponent(symbol)}/close`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deletePaperTrade(symbol: string): Promise<void> {
+  await apiFetch<unknown>(`/api/paper-trades/${encodeURIComponent(symbol)}`, {
+    method: 'DELETE',
+  })
+}
+
+export async function getBacktestDashboard(): Promise<BacktestDashboardResponse> {
+  return apiFetch<BacktestDashboardResponse>('/api/backtests/dashboard')
+}
+
+export async function runBacktest(): Promise<BacktestRunResponse> {
+  return apiFetch<BacktestRunResponse>('/api/backtests/run', {
+    method: 'POST',
+  })
 }

@@ -1,0 +1,47 @@
+{
+  "id": "atr-stretch-liquid-only-v1",
+  "name": "ATR Stretch Liquid Only V1",
+  "description": "Paper-test watchlist strategy from second-pass swing research: mean reversion after a deep ATR stretch, restricted to liquid stocks only.",
+  "enabled": false,
+  "status": "paper-test-only",
+  "research_summary": {
+    "source": "docs/quant_research_outputs/second_pass_swing/final_report.md",
+    "label": "watchlist",
+    "base_profit_factor": 1.464,
+    "stress_profit_factor": 1.36,
+    "out_of_sample_profit_factor": 1.061,
+    "validation_profit_factor": 1.857,
+    "trades": 1881,
+    "walk_forward_positive_test_windows": "11/16",
+    "warning": "2026 remains weak: 79 trades, PF 0.750, expectancy -0.839%. Keep this paper-test only until forward results improve."
+  },
+  "universe": {
+    "source": "watchlist",
+    "min_price": 50,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "ATR Stretch Liquid Only",
+    "entry_price": "next_open",
+    "rules": [
+      "close > SMA(200)",
+      "EMA(20) - close > 2.5 * ATR(14)",
+      "RSI(14) < 35",
+      "close >= 50",
+      "volume20 >= 100000",
+      "current volume > 0"
+    ]
+  },
+  "exit": {
+    "stop_atr": 1.4,
+    "target_atr": 2.0,
+    "max_hold_sessions": 7,
+    "exit_price": "conservative_ohlc",
+    "same_day_conflict": "stop_first"
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 5,
+    "paper_test_only": true
+  }
+}

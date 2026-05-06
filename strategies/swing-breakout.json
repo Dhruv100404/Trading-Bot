@@ -1,0 +1,27 @@
+{
+  "id": "swing-breakout-v1",
+  "name": "Swing Breakout V1",
+  "description": "Momentum continuation setup using trend, 20-day breakout proximity, and volume expansion.",
+  "enabled": true,
+  "universe": {
+    "source": "watchlist",
+    "min_price": 50,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "Breakout Setup",
+    "min_score": 85,
+    "entry_price": "next_open"
+  },
+  "exit": {
+    "take_profit_pct": 8,
+    "stop_loss_pct": 4,
+    "max_hold_sessions": 10,
+    "exit_price": "close",
+    "same_day_conflict": "stop_first"
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 5
+  }
+}
