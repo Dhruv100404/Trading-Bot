@@ -218,6 +218,38 @@ pub struct HistoricalScreenerResponse {
     message: Option<String>,
 }
 
+#[derive(Serialize, Clone)]
+pub struct BambooLatestSignal {
+    strategy: String,
+    symbol: String,
+    signal_date: String,
+    planned_entry: String,
+    close: f64,
+    stop: f64,
+    target_from_close: f64,
+    risk_multiple: f64,
+    risk_pct_vs_close: f64,
+    relvol: f64,
+    range_position_52w: f64,
+    ema20_dist_atr: f64,
+    prior_high20: f64,
+    prior_high55: f64,
+    gap_pct: f64,
+    close_loc: f64,
+    rank_score: f64,
+}
+
+#[derive(Serialize)]
+pub struct BambooLatestResponse {
+    updated_at: String,
+    signal_date: Option<String>,
+    total_rows: usize,
+    unique_symbols: usize,
+    top_signals: Vec<BambooLatestSignal>,
+    all_signals: Vec<BambooLatestSignal>,
+    message: Option<String>,
+}
+
 #[derive(Clone)]
 struct ResolvedDhanCredentials {
     access_token: String,
@@ -435,6 +467,41 @@ pub async fn historical_screener(
             message: Some(format!("Historical screener query failed: {}", err)),
         }),
     }
+}
+
+pub async fn bamboo_latest() -> Json<BambooLatestResponse> {
+    let all_path = "docs/quant_research_outputs/bamboo_mtf_breakout_latest/latest_signals.csv";
+    let top_path = "docs/quant_research_outputs/bamboo_mtf_breakout_latest/top_latest_signals.csv";
+    let all_signals = read_bamboo_signal_csv(all_path).unwrap_or_default();
+    let top_signals = read_bamboo_signal_csv(top_path).unwrap_or_else(|_| {
+        let mut fallback = all_signals.clone();
+        fallback.sort_by(|a, b| b.rank_score.total_cmp(&a.rank_score));
+        fallback.truncate(4);
+        fallback
+    });
+    let mut symbols = std::collections::HashSet::new();
+    for signal in &all_signals {
+        symbols.insert(signal.symbol.clone());
+    }
+    let signal_date = all_signals
+        .first()
+        .map(|signal| signal.signal_date.clone())
+        .or_else(|| top_signals.first().map(|signal| signal.signal_date.clone()));
+    let message = if all_signals.is_empty() && top_signals.is_empty() {
+        Some("No Bamboo latest signal file was found yet. Run `python scripts\\bamboo_mtf_backtest.py --out-dir docs\\quant_research_outputs\\bamboo_mtf_breakout_latest`.".to_string())
+    } else {
+        None
+    };
+
+    Json(BambooLatestResponse {
+        updated_at: crate::types::now_ist().to_rfc3339(),
+        signal_date,
+        total_rows: all_signals.len(),
+        unique_symbols: symbols.len(),
+        top_signals,
+        all_signals,
+        message,
+    })
 }
 
 async fn build_dashboard_bundle(
@@ -2201,6 +2268,55 @@ fn matches_setup_filter(row: &HistoricalScreenerRow, setup_filter: &str) -> bool
         "trend" => row.setup_family == "Trend Filter",
         _ => true,
     }
+}
+
+fn read_bamboo_signal_csv(path: &str) -> anyhow::Result<Vec<BambooLatestSignal>> {
+    let content = fs::read_to_string(path)?;
+    let mut lines = content.lines();
+    let Some(header_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let headers = header_line.split(',').map(|value| value.trim().to_string()).collect::<Vec<_>>();
+    let mut rows = Vec::new();
+
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let values = line.split(',').map(|value| value.trim()).collect::<Vec<_>>();
+        let get = |name: &str| -> &str {
+            headers
+                .iter()
+                .position(|header| header == name)
+                .and_then(|index| values.get(index).copied())
+                .unwrap_or("")
+        };
+        rows.push(BambooLatestSignal {
+            strategy: get("strategy").to_string(),
+            symbol: get("symbol").to_string(),
+            signal_date: get("signal_date").to_string(),
+            planned_entry: get("planned_entry").to_string(),
+            close: parse_csv_f64(get("close")),
+            stop: parse_csv_f64(get("stop")),
+            target_from_close: parse_csv_f64(get("target_from_close")),
+            risk_multiple: parse_csv_f64(get("risk_multiple")),
+            risk_pct_vs_close: parse_csv_f64(get("risk_pct_vs_close")),
+            relvol: parse_csv_f64(get("relvol")),
+            range_position_52w: parse_csv_f64(get("range_position_52w")),
+            ema20_dist_atr: parse_csv_f64(get("ema20_dist_atr")),
+            prior_high20: parse_csv_f64(get("prior_high20")),
+            prior_high55: parse_csv_f64(get("prior_high55")),
+            gap_pct: parse_csv_f64(get("gap_pct")),
+            close_loc: parse_csv_f64(get("close_loc")),
+            rank_score: parse_csv_f64(get("rank_score")),
+        });
+    }
+
+    Ok(rows)
+}
+
+fn parse_csv_f64(raw: &str) -> f64 {
+    raw.parse::<f64>().unwrap_or(0.0)
 }
 
 fn is_nse_trading_day_now() -> bool {

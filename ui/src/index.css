@@ -2127,6 +2127,83 @@
     line-height: 1.5;
   }
 
+  .bamboo-signal-table {
+    display: grid;
+    gap: 0;
+    margin: 0 18px 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .bamboo-signal-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(190px, 1.3fr) repeat(5, minmax(86px, 0.62fr)) minmax(92px, 0.48fr);
+    gap: 10px;
+    align-items: center;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--text);
+    padding: 11px 12px;
+    text-align: left;
+  }
+
+  .bamboo-signal-row:last-child {
+    border-bottom: 0;
+  }
+
+  .bamboo-signal-row:hover,
+  .bamboo-signal-active {
+    background: var(--accent-soft);
+  }
+
+  .bamboo-signal-head {
+    color: var(--subtle);
+    background: var(--surface-strong);
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .bamboo-signal-head:hover {
+    background: var(--surface-strong);
+  }
+
+  .bamboo-signal-row strong small {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .bamboo-mini-list {
+    display: grid;
+    gap: 7px;
+    margin-top: 12px;
+  }
+
+  .bamboo-mini-list button {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 10px;
+  }
+
+  .bamboo-mini-list button:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
   .strategy-research-panel {
     padding: 0 18px 18px;
   }

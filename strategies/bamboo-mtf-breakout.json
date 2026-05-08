@@ -1,0 +1,38 @@
+{
+  "id": "bamboo-mtf-breakout-v1",
+  "name": "Bamboo MTF Breakout V1",
+  "description": "Vijay/Bamboo-style multi-timeframe swing breakout: long-term base breakout first, then daily prior swing-high breakout with breakout-candle-low stop and R-multiple targets.",
+  "enabled": false,
+  "status": "research-only",
+  "research_script": "scripts/bamboo_mtf_backtest.py",
+  "universe": {
+    "source": "watchlist/parquet-history",
+    "min_price": 50,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "Bamboo MTF Breakout",
+    "entry_price": "next_open",
+    "rules": [
+      "close > SMA(50)",
+      "close > SMA(200)",
+      "close breaks a daily prior swing-high proxy",
+      "higher-timeframe/base breakout proxy is active",
+      "price is in the upper 25% of its 52-week range",
+      "volume ratio >= 1.1",
+      "close location >= 65% of candle range"
+    ]
+  },
+  "exit": {
+    "stop": "signal_candle_low",
+    "target": "2R or 3R depending on variant",
+    "max_hold_sessions": 20,
+    "exit_price": "conservative_ohlc",
+    "same_day_conflict": "stop_first"
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 10,
+    "paper_test_only": true
+  }
+}

@@ -25,6 +25,7 @@ import {
 import {
   getBrokerAccounts,
   getBacktestDashboard,
+  getBambooLatest,
   getHistoricalScreener,
   closePaperTrade,
   deletePaperTrade,
@@ -39,6 +40,8 @@ import {
   type BrokerAccountSnapshot,
   type BrokerStatus,
   type BacktestDashboardResponse,
+  type BambooLatestResponse,
+  type BambooLatestSignal,
   type HistoricalScreenerResponse,
   type HistoricalScreenerRow,
   type LiveSignal,
@@ -91,6 +94,19 @@ interface ResearchStrategyCard {
 }
 
 const RESEARCH_STRATEGIES: ResearchStrategyCard[] = [
+  {
+    name: 'Bamboo MTF Breakout',
+    status: 'Research only',
+    tone: 'danger',
+    rule: 'Long-term base breakout proxy first, then daily swing-high breakout. Stop is signal candle low; targets are 2R or 3R depending on the variant.',
+    trades: 1778,
+    monthly: 34.5,
+    winRate: 34.42,
+    profitFactor: 1.051,
+    expectancy: 0.169,
+    oos: 'Best variant was bamboo_2y_base_breakout_3r, but out-of-sample expectancy stayed negative.',
+    warning: 'Show latest raw signals for study only. Do not promote to live entries until new filters pass validation.',
+  },
   {
     name: 'ATR Stretch Liquid Only',
     status: 'Paper-test watchlist',
@@ -314,6 +330,54 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
       setup_family: row.setup_family,
       score: row.score,
       as_of: row.as_of,
+    }),
+  }
+}
+
+function createCandidateFromBambooSignal(signal: BambooLatestSignal): SwingCandidate {
+  const risk = Math.max(signal.close - signal.stop, 0.01)
+  const reward = Math.max(signal.target_from_close - signal.close, 0)
+  const score = Math.round(Math.min(92, Math.max(65, 70 + signal.relvol * 5 + Math.min(signal.range_position_52w, 1.2) * 8 - signal.risk_pct_vs_close)))
+  return {
+    symbol: signal.symbol,
+    company_name: signal.symbol,
+    setup_family: 'Bamboo MTF Breakout',
+    bias: 'Long',
+    score,
+    confidence: 'Research Signal',
+    regime_fit: Math.max(55, Math.min(90, score - 4)),
+    risk_reward: Number((reward / risk).toFixed(2)),
+    last_price: signal.close,
+    day_change_pct: 0,
+    open_gap_pct: signal.gap_pct,
+    distance_to_high_pct: Number((((signal.prior_high20 - signal.close) / Math.max(signal.prior_high20, 0.01)) * 100).toFixed(2)),
+    liquidity_bucket: 'RESEARCH',
+    entry_zone: `Next open / live confirmation above Rs ${signal.prior_high20.toFixed(2)}`,
+    stop_loss: signal.stop,
+    target_price: signal.target_from_close,
+    expected_hold: signal.risk_multiple >= 3 ? 'Up to 20 sessions' : 'Up to 15 sessions',
+    thesis: `${signal.symbol} matched the Bamboo multi-timeframe breakout research rules on ${signal.signal_date}: long-term resistance proxy cleared, daily prior high broken, and volume expanded to ${signal.relvol.toFixed(2)}x.`,
+    reasons: [
+      `Prior 20-day high trigger: Rs ${signal.prior_high20.toFixed(2)}.`,
+      `Signal candle close location: ${(signal.close_loc * 100).toFixed(1)}% of range.`,
+      `52-week range position: ${(signal.range_position_52w * 100).toFixed(1)}%.`,
+    ],
+    risks: [
+      `Research-only setup. Latest Bamboo variants failed robustness gates overall.`,
+      `Signal-candle-low stop is Rs ${signal.stop.toFixed(2)}, about ${signal.risk_pct_vs_close.toFixed(2)}% below close.`,
+    ],
+    source: 'bamboo-research',
+    live_signal: defaultLiveSignal({
+      status: 'WATCH',
+      label: 'Research Only',
+      reason: 'Bamboo signal is visible for study/paper review only; the strategy is not approved for fresh live entries.',
+      strategy_id: signal.strategy,
+      strategy_label: 'Bamboo MTF Breakout',
+      strategy_status: 'Research Only',
+      setup_family: 'Bamboo MTF Breakout',
+      score,
+      as_of: signal.signal_date,
+      trigger_price: signal.prior_high20,
     }),
   }
 }
@@ -1039,11 +1103,13 @@ function HomeView({
 function ScannerView({
   scanner,
   historicalScreener,
+  bambooLatest,
   selectedSymbol,
   onSelect,
 }: {
   scanner: SwingScannerResponse | null
   historicalScreener: HistoricalScreenerResponse | null
+  bambooLatest: BambooLatestResponse | null
   selectedSymbol: string | null
   onSelect: (symbol: string) => void
 }) {
@@ -1081,9 +1147,65 @@ function ScannerView({
   const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
 
   if (!scanner || !historicalScreener) return <PageSkeleton />
+  const bambooSignals = bambooLatest?.top_signals ?? []
 
   return (
     <div className="page-stack">
+      <Surface>
+        <div className="section-head scanner-toolbar">
+          <div>
+            <span className="eyebrow">Bamboo MTF Breakout</span>
+            <h2>Latest raw Vijay-style research signals</h2>
+          </div>
+          <div className="toolbar-right screener-toolbar-meta">
+            <div className="mini-chip">
+              <Target size={14} />
+              <span>{bambooLatest?.unique_symbols ?? 0} unique stocks</span>
+            </div>
+            <div className="mini-chip">
+              <Database size={14} />
+              <span>Signal date {bambooLatest?.signal_date ?? 'not available'}</span>
+            </div>
+          </div>
+        </div>
+        {bambooSignals.length > 0 ? (
+          <div className="bamboo-signal-table">
+            <div className="bamboo-signal-row bamboo-signal-head">
+              <span>Stock</span>
+              <span>Close</span>
+              <span>Stop</span>
+              <span>Target</span>
+              <span>Risk</span>
+              <span>Vol</span>
+              <span>Action</span>
+            </div>
+            {bambooSignals.map((signal) => (
+              <button
+                key={`${signal.strategy}-${signal.symbol}`}
+                type="button"
+                className={signal.symbol === selectedSymbol ? 'bamboo-signal-row bamboo-signal-active' : 'bamboo-signal-row'}
+                onClick={() => onSelect(signal.symbol)}
+              >
+                <strong>{signal.symbol}<small>{signal.strategy.replace(/_/g, ' ')}</small></strong>
+                <span>{currency(signal.close)}</span>
+                <span>{currency(signal.stop)}</span>
+                <span>{currency(signal.target_from_close)}</span>
+                <span className={signal.risk_pct_vs_close <= 4 ? 'tone-positive' : signal.risk_pct_vs_close <= 8 ? 'tone-warning' : 'tone-danger'}>
+                  {signal.risk_pct_vs_close.toFixed(2)}%
+                </span>
+                <span>{signal.relvol.toFixed(2)}x</span>
+                <span className="watch-signal-pill signal-watch">Research</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-table">
+            <CircleAlert size={18} />
+            <p>{bambooLatest?.message ?? 'No Bamboo signals are available yet.'}</p>
+          </div>
+        )}
+      </Surface>
+
       <Surface>
         <div className="section-head scanner-toolbar">
           <div>
@@ -1814,7 +1936,15 @@ function BacktestSymbolList({
   )
 }
 
-function ResearchView({ setupMix }: { setupMix: SetupMix[] }) {
+function ResearchView({
+  setupMix,
+  bambooLatest,
+  onSelect,
+}: {
+  setupMix: SetupMix[]
+  bambooLatest: BambooLatestResponse | null
+  onSelect: (symbol: string) => void
+}) {
   return (
     <div className="page-stack">
       <Surface>
@@ -1868,6 +1998,21 @@ function ResearchView({ setupMix }: { setupMix: SetupMix[] }) {
         </div>
 
         <div className="research-grid">
+          <Surface className="inner-surface research-card bamboo-latest-card">
+            <span className="micro-label">Bamboo Latest Signals</span>
+            <strong>{bambooLatest?.unique_symbols ?? 0} unique stocks from {bambooLatest?.signal_date ?? 'latest run'}</strong>
+            <p>Raw multi-timeframe breakout signals are visible for research and paper review only.</p>
+            {(bambooLatest?.top_signals ?? []).length > 0 && (
+              <div className="bamboo-mini-list">
+                {bambooLatest?.top_signals.map((signal) => (
+                  <button key={`${signal.strategy}-${signal.symbol}`} type="button" onClick={() => onSelect(signal.symbol)}>
+                    <span>{signal.symbol}</span>
+                    <strong>{signal.risk_pct_vs_close.toFixed(2)}% risk</strong>
+                  </button>
+                ))}
+              </div>
+            )}
+          </Surface>
           {setupMix.map((mix) => (
             <Surface key={mix.family} className="inner-surface research-card">
               <span className="micro-label">{mix.family}</span>
@@ -2043,6 +2188,7 @@ export default function App() {
   const [home, setHome] = useState<SwingHomeResponse | null>(null)
   const [scanner, setScanner] = useState<SwingScannerResponse | null>(null)
   const [historicalScreener, setHistoricalScreener] = useState<HistoricalScreenerResponse | null>(null)
+  const [bambooLatest, setBambooLatest] = useState<BambooLatestResponse | null>(null)
   const [accounts, setAccounts] = useState<BrokerAccountSnapshot[]>([])
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([])
   const [paperBudget, setPaperBudget] = useState<PaperBudget | null>(null)
@@ -2084,10 +2230,11 @@ export default function App() {
     setRefreshing(true)
     setError('')
     try {
-      const [homeData, scannerData, screenerData, accountData, paperTradeData, paperBudgetData, backtestData] = await Promise.all([
+      const [homeData, scannerData, screenerData, bambooData, accountData, paperTradeData, paperBudgetData, backtestData] = await Promise.all([
         getSwingHome(),
         getSwingScanner(28),
         getHistoricalScreener({ limit: 80, setup: 'all', minPrice: 80, minAvgVolume: 100000 }),
+        getBambooLatest().catch(() => null),
         getBrokerAccounts().catch(() => []),
         getPaperTrades().catch(() => []),
         getPaperBudget().catch(() => null),
@@ -2097,6 +2244,7 @@ export default function App() {
         setHome(homeData)
         setScanner(scannerData)
         setHistoricalScreener(screenerData)
+        setBambooLatest(bambooData)
         setAccounts(accountData)
         setPaperTrades(paperTradeData)
         setPaperBudget(paperBudgetData)
@@ -2104,6 +2252,7 @@ export default function App() {
         const defaultSymbol =
           selectedSymbol ??
           screenerData.rows[0]?.symbol ??
+          bambooData?.top_signals[0]?.symbol ??
           homeData.top_candidates[0]?.symbol ??
           scannerData.candidates[0]?.symbol ??
           watchlist[0]?.symbol ??
@@ -2276,9 +2425,14 @@ export default function App() {
   const updatedAt = home?.updated_at ?? scanner?.updated_at ?? null
   const selectedHistoricalRow =
     historicalScreener?.rows.find((row) => row.symbol === selectedSymbol) ?? null
+  const selectedBambooSignal =
+    bambooLatest?.all_signals.find((signal) => signal.symbol === selectedSymbol) ??
+    bambooLatest?.top_signals.find((signal) => signal.symbol === selectedSymbol) ??
+    null
   const selectedActionCandidate =
     detailCandidate ??
     (selectedHistoricalRow ? createCandidateFromHistoricalRow(selectedHistoricalRow) : null) ??
+    (selectedBambooSignal ? createCandidateFromBambooSignal(selectedBambooSignal) : null) ??
     (paperTrades.find((trade) => trade.symbol === selectedSymbol)
       ? createCandidateFromPaperTrade(paperTrades.find((trade) => trade.symbol === selectedSymbol) as PaperTrade)
       : null)
@@ -2426,6 +2580,7 @@ export default function App() {
               <ScannerView
                 scanner={scanner}
                 historicalScreener={historicalScreener}
+                bambooLatest={bambooLatest}
                 selectedSymbol={selectedSymbol}
                 onSelect={openStock}
               />
@@ -2451,7 +2606,7 @@ export default function App() {
               />
             )}
             {view === 'backtests' && <BacktestsView dashboard={backtests} running={runningBacktest} onRun={runBacktestNow} />}
-            {view === 'research' && <ResearchView setupMix={home?.setup_mix ?? []} />}
+            {view === 'research' && <ResearchView setupMix={home?.setup_mix ?? []} bambooLatest={bambooLatest} onSelect={openStock} />}
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}
             {view === 'stock' && (
               <StockDetailView

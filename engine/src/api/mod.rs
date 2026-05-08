@@ -51,6 +51,7 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         .route("/api/paper-trades/:symbol",     delete(paper::remove))
         .route("/api/swing/home",               get(swing::home))
         .route("/api/swing/scanner",            get(swing::scanner))
+        .route("/api/swing/bamboo/latest",      get(swing::bamboo_latest))
         .route("/api/swing/historical-screener", get(swing::historical_screener))
         .route("/api/swing/history/:symbol",    get(swing::history))
         .route("/api/swing/candidates/:symbol", get(swing::candidate_detail))

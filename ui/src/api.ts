@@ -144,6 +144,36 @@ export interface HistoricalScreenerResponse {
   message: string | null
 }
 
+export interface BambooLatestSignal {
+  strategy: string
+  symbol: string
+  signal_date: string
+  planned_entry: string
+  close: number
+  stop: number
+  target_from_close: number
+  risk_multiple: number
+  risk_pct_vs_close: number
+  relvol: number
+  range_position_52w: number
+  ema20_dist_atr: number
+  prior_high20: number
+  prior_high55: number
+  gap_pct: number
+  close_loc: number
+  rank_score: number
+}
+
+export interface BambooLatestResponse {
+  updated_at: string
+  signal_date: string | null
+  total_rows: number
+  unique_symbols: number
+  top_signals: BambooLatestSignal[]
+  all_signals: BambooLatestSignal[]
+  message: string | null
+}
+
 export interface BrokerAccountBalance {
   availabelBalance?: number
   utilizedAmount?: number
@@ -367,6 +397,10 @@ export async function getHistoricalScreener(params?: {
   if (params?.minAvgVolume) search.set('min_avg_volume', String(params.minAvgVolume))
   const query = search.toString()
   return apiFetch<HistoricalScreenerResponse>(`/api/swing/historical-screener${query ? `?${query}` : ''}`)
+}
+
+export async function getBambooLatest(): Promise<BambooLatestResponse> {
+  return apiFetch<BambooLatestResponse>('/api/swing/bamboo/latest')
 }
 
 export async function getBrokerStatus(): Promise<BrokerStatus> {
