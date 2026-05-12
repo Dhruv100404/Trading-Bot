@@ -8,6 +8,9 @@ import {
   Bookmark,
   BrainCircuit,
   BriefcaseBusiness,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   Compass,
   Database,
@@ -25,8 +28,8 @@ import {
 import {
   getBrokerAccounts,
   getBacktestDashboard,
+  getBacktestDatewise,
   getBambooLatest,
-  getHistoricalScreener,
   closePaperTrade,
   deletePaperTrade,
   getPaperBudget,
@@ -35,15 +38,24 @@ import {
   getSwingHistory,
   getSwingHome,
   getSwingScanner,
+  refreshBacktestCache,
+  refreshFeatureCache,
   runBacktest,
   savePaperTrade,
+  stageFreshSignals,
   type BrokerAccountSnapshot,
   type BrokerStatus,
   type BacktestDashboardResponse,
+  type BacktestCacheStatus,
+  type BacktestDatewiseResponse,
+  type BacktestDayQuality,
+  type BacktestRunSummary,
+  type BacktestStrategyDiagnostic,
   type BambooLatestResponse,
   type BambooLatestSignal,
   type HistoricalScreenerResponse,
   type HistoricalScreenerRow,
+  type FreshSignalsResponse,
   type LiveSignal,
   type PaperTrade,
   type PaperBudget,
@@ -56,6 +68,7 @@ import {
 
 type View = 'home' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'research' | 'settings' | 'stock'
 type HistoryRange = '3m' | '6m' | '1y' | '3y' | '5y'
+type PaperDeskTab = 'open' | 'closed' | 'weekly' | 'strategy' | 'intake'
 
 interface NavItem {
   id: View
@@ -76,8 +89,98 @@ const NAV_ITEMS: NavItem[] = [
 
 const WATCHLIST_STORAGE_KEY = 'swing-watchlist'
 const PAPER_CAPITAL_PER_STOCK = 50000
+const PAPER_HOLD_SESSIONS = 5
+const AUTO_PAPER_MAX_SUGGESTIONS = 7
+const NSE_HOLIDAYS = new Set([
+  '2025-01-26', '2025-02-26', '2025-03-14', '2025-03-31', '2025-04-10', '2025-04-14',
+  '2025-04-18', '2025-05-01', '2025-06-26', '2025-07-06', '2025-08-15', '2025-08-16',
+  '2025-08-27', '2025-10-02', '2025-10-21', '2025-10-22', '2025-11-05', '2025-11-26',
+  '2025-12-25',
+  '2026-01-15', '2026-01-26', '2026-03-03', '2026-03-14', '2026-03-26', '2026-03-30',
+  '2026-03-31', '2026-04-03', '2026-04-14', '2026-05-01', '2026-05-28', '2026-06-26',
+  '2026-09-14', '2026-10-02', '2026-10-20', '2026-11-10', '2026-11-24', '2026-12-25',
+])
 
 type Tone = 'positive' | 'warning' | 'danger' | 'neutral'
+
+interface BacktestPaperRule {
+  stopLossPct: number
+  takeProfitPct: number
+  source: string
+}
+
+const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
+  'near-52w-high-v1': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'built-in near-52w-high rule',
+  },
+  'near-52w-high-runner-v2': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'near-52w-high backtest family',
+  },
+  'near-52w-high-volume-v3': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'near-52w-high backtest family',
+  },
+  'near-52w-high-tight-v2': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'near-52w-high backtest family',
+  },
+  'momentum-core-v1': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'near-52w-high backtest family',
+  },
+  'pullback-20dma-v1': {
+    stopLossPct: 3,
+    takeProfitPct: 6,
+    source: 'built-in pullback-20dma rule',
+  },
+  'pullback-quality-v2': {
+    stopLossPct: 3,
+    takeProfitPct: 6,
+    source: 'pullback-20dma backtest family',
+  },
+  'rsi10-pullback-reversion-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 4,
+    source: 'built-in RSI10 pullback rule',
+  },
+  'swing-breakout-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 8,
+    source: 'built-in swing-breakout rule',
+  },
+  'breakout-volume-v2': {
+    stopLossPct: 4,
+    takeProfitPct: 8,
+    source: 'swing-breakout backtest family',
+  },
+  'failed-breakdown-reclaim-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 7,
+    source: 'daily failed-breakdown reclaim model',
+  },
+  'compression-breakout-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 8,
+    source: 'compression breakout model',
+  },
+  'breakout-continuation-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 8,
+    source: 'breakout continuation model',
+  },
+  'rs-leader-continuation-v1': {
+    stopLossPct: 5,
+    takeProfitPct: 10,
+    source: 'relative-strength continuation model',
+  },
+}
 
 interface ResearchStrategyCard {
   name: string
@@ -95,6 +198,58 @@ interface ResearchStrategyCard {
 
 const RESEARCH_STRATEGIES: ResearchStrategyCard[] = [
   {
+    name: 'Regime Mean Reversion',
+    status: 'Watchlist from regime suite',
+    tone: 'positive',
+    rule: 'Liquid long-term uptrend stock, non-trending ADX-below-30 regime, z-score below -2.5, more than 1.5 ATR under EMA20, RSI14 below 30, and no severe gap.',
+    trades: 108,
+    monthly: 2.0,
+    winRate: 62.04,
+    profitFactor: 2.766,
+    expectancy: 2.453,
+    oos: 'Passed summary gates: OOS PF 1.591 with +1.067% OOS expectancy.',
+    warning: 'Sample is still small, especially OOS with 13 trades. Keep it paper/watchlist only until walk-forward and forward paper trades confirm.',
+  },
+  {
+    name: 'Regime Trend Breakout',
+    status: 'Rejected baseline',
+    tone: 'danger',
+    rule: 'Liquid RS leader in trending regime breaks a 20-day high with above-average volume, constructive breadth, strong close location, and no high-volatility flag.',
+    trades: 417,
+    monthly: 7.8,
+    winRate: 40.05,
+    profitFactor: 1.019,
+    expectancy: 0.070,
+    oos: 'Rejected: OOS PF 0.917 and stress-cost PF below the gate.',
+    warning: 'Useful as a tested regime baseline, but not good enough to promote into fresh signals yet.',
+  },
+  {
+    name: 'Breakout + Volume Confirmation',
+    status: 'Rejected baseline',
+    tone: 'danger',
+    rule: 'Liquid trending stock clears a prior 55-day high with 2.6x relative volume, ATR expansion, RS leadership, and a very strong close location.',
+    trades: 562,
+    monthly: 10.6,
+    winRate: 40.21,
+    profitFactor: 1.009,
+    expectancy: 0.040,
+    oos: 'Rejected: OOS PF 0.733 and -1.100% OOS expectancy.',
+    warning: 'The dataset is not rewarding this breakout shape after costs; keep it as research evidence only.',
+  },
+  {
+    name: 'Multi-Factor Score',
+    status: 'Rejected baseline',
+    tone: 'danger',
+    rule: 'Liquid 20-day high breakout with momentum, trend, volume, RSI/z-score, and close-location score at least 9 after risk penalties.',
+    trades: 1643,
+    monthly: 30.8,
+    winRate: 38.41,
+    profitFactor: 0.875,
+    expectancy: -0.387,
+    oos: 'Rejected: negative expectancy in base, validation, and OOS splits.',
+    warning: 'The scoring idea is directionally useful, but this first threshold model is too broad for promotion.',
+  },
+  {
     name: 'Bamboo MTF Breakout',
     status: 'Research only',
     tone: 'danger',
@@ -106,6 +261,19 @@ const RESEARCH_STRATEGIES: ResearchStrategyCard[] = [
     expectancy: 0.169,
     oos: 'Best variant was bamboo_2y_base_breakout_3r, but out-of-sample expectancy stayed negative.',
     warning: 'Show latest raw signals for study only. Do not promote to live entries until new filters pass validation.',
+  },
+  {
+    name: 'RSI10 Pullback Reversion',
+    status: 'New research',
+    tone: 'warning',
+    rule: 'Long only when the stock is above SMA200 and RSI10 closes below 30; original rule exits when RSI10 crosses above 40 or after 10 trading days.',
+    trades: 0,
+    monthly: 0,
+    winRate: 0,
+    profitFactor: 0,
+    expectancy: 0,
+    oos: 'Added from the shared YouTube training link and adapted from broad-market rules to NSE individual-stock screening.',
+    warning: 'Needs local backtest validation before treating it as approved live edge. Paper proxy uses 4% target, 4% stop, and 5 trading-session tracking.',
   },
   {
     name: 'ATR Stretch Liquid Only',
@@ -206,6 +374,10 @@ function currency(value: number) {
   return `Rs ${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
+function errorMessage(err: unknown) {
+  return String(err).replace(/^Error:\s*/, '')
+}
+
 function compactDate(value: string | null | undefined) {
   if (!value) return 'Not available'
   const date = new Date(value)
@@ -250,7 +422,10 @@ function signalTone(status: LiveSignal['status']): Tone {
 }
 
 function canSendToPaper(candidate: SwingCandidate) {
-  return candidate.live_signal?.status === 'ENTRY_NOW'
+  return candidate.last_price > 0
+    && candidate.stop_loss > 0
+    && candidate.stop_loss < candidate.last_price
+    && candidate.target_price > candidate.last_price
 }
 
 function signalClass(status: LiveSignal['status']) {
@@ -287,9 +462,16 @@ function removeCandidate(list: SwingCandidate[], symbol: string) {
 
 void [upsertCandidate, removeCandidate]
 
+function ruleForStrategy(strategyId: string) {
+  return BACKTEST_PAPER_RULES[strategyId] ?? null
+}
+
 function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCandidate {
-  const stopLoss = Number((row.sma50 * 0.99).toFixed(2))
-  const targetPrice = Number((row.close * 1.1).toFixed(2))
+  const rule = ruleForStrategy(row.strategy_id)
+  const stopLossPct = rule?.stopLossPct ?? 0
+  const takeProfitPct = rule?.takeProfitPct ?? 0
+  const stopLoss = row.stop_loss > 0 ? row.stop_loss : rule ? Number((row.close * (1 - stopLossPct / 100)).toFixed(2)) : 0
+  const targetPrice = row.target_price > row.close ? row.target_price : rule ? Number((row.close * (1 + takeProfitPct / 100)).toFixed(2)) : row.close
   const strategyLabel = row.strategy_label && row.strategy_label !== 'Unlinked Screen' ? row.strategy_label : row.setup_family
   return {
     symbol: row.symbol,
@@ -299,25 +481,27 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
     score: row.score,
     confidence: row.score >= 88 ? 'High Conviction' : row.score >= 78 ? 'Actionable' : 'Watchlist',
     regime_fit: Math.min(95, Math.max(55, row.score - 4)),
-    risk_reward: Number((((targetPrice - row.close) / Math.max(row.close - stopLoss, 0.01))).toFixed(2)),
+    risk_reward: row.risk_reward > 0 ? row.risk_reward : rule ? Number((((targetPrice - row.close) / Math.max(row.close - stopLoss, 0.01))).toFixed(2)) : 0,
     last_price: row.close,
     day_change_pct: 0,
-    open_gap_pct: 0,
+    open_gap_pct: row.gap_pct,
     distance_to_high_pct: row.distance_to_20d_high_pct,
     liquidity_bucket: row.avg_volume20 >= 1_000_000 ? 'LARGE' : row.avg_volume20 >= 250_000 ? 'MID' : 'SMALL',
-    entry_zone: `Rs ${(row.close * 0.995).toFixed(2)} - Rs ${(row.close * 1.01).toFixed(2)}`,
+    entry_zone: row.planned_entry || `Backtest proxy close ${currency(row.close)}`,
     stop_loss: stopLoss,
     target_price: targetPrice,
-    expected_hold: row.setup_family === 'Pullback To 20 DMA' ? '5-10 sessions' : '8-15 sessions',
-    thesis: `${row.symbol} is ranking well in the parquet screener under ${strategyLabel} because its trend structure, position vs highs, and participation profile still look constructive.`,
+    expected_hold: `${PAPER_HOLD_SESSIONS} trading sessions`,
+    thesis: `${row.symbol} is staged only because the latest parquet screener row maps to the backtest-tracked ${strategyLabel} strategy status: ${row.strategy_status}.`,
     reasons: [
+      rule ? `Exit model uses ${rule.source}: ${stopLossPct}% stop, ${takeProfitPct}% target, capped at ${PAPER_HOLD_SESSIONS} trading sessions.` : 'No strategy config was found for this row, so it is review-only unless a stop is supplied.',
       `${row.symbol} is ${row.distance_to_20d_high_pct.toFixed(2)}% away from the 20-day high.`,
       `Volume ratio is ${row.volume_ratio.toFixed(2)}x against the 20-day average.`,
+      `ATR is ${row.atr_pct.toFixed(2)}% of close; RS60 rank is ${row.rs60_rank.toFixed(0)}.`,
       `Trend profile is ${row.trend_label}; strategy lab status is ${row.strategy_status}.`,
     ],
     risks: [
-      `If price loses the 50-day structure near Rs ${stopLoss.toFixed(2)}, the setup quality drops fast.`,
-      'Historical trend strength does not guarantee a clean follow-through in the next few sessions.',
+      `Stop is fixed at ${currency(stopLoss)} from the configured backtest rule.`,
+      'Paper staging is evidence-gathering only; backtested behavior can fail in forward trading.',
     ],
     source: 'parquet-screener',
     live_signal: defaultLiveSignal({
@@ -434,6 +618,32 @@ function tradeReturnPct(pnl: number, trade: PaperTrade) {
   return invested > 0 ? (pnl / invested) * 100 : 0
 }
 
+function riskAmount(trade: PaperTrade) {
+  return Math.max(trade.entry_price - trade.stop_loss, 0) * trade.quantity
+}
+
+function sessionsRemaining(trade: PaperTrade) {
+  return Math.max(0, trade.max_sessions - tradingSessionsElapsed(trade.planned_at))
+}
+
+function paperSourceLabel(trade: PaperTrade) {
+  if (isSystemPaperTrade(trade)) return 'System intake'
+  if (trade.notes.includes('Manual paper-stage')) return 'Manual'
+  return trade.setup_family || 'Paper'
+}
+
+function isSystemPaperTrade(trade: PaperTrade) {
+  return trade.notes.includes('Auto-staged')
+}
+
+function paperSignalDate(trade: PaperTrade) {
+  return trade.notes.match(/signal_date=([0-9-]+)/)?.[1] ?? null
+}
+
+function paperStrategyId(trade: PaperTrade) {
+  return trade.notes.match(/strategy=([A-Za-z0-9_-]+)/)?.[1] ?? null
+}
+
 function isLivePaperQuote(trade: PaperTrade) {
   return trade.quote_source === 'dhan-live'
 }
@@ -450,22 +660,76 @@ function paperQuoteLabel(trade: PaperTrade) {
   return 'Entry only'
 }
 
-function maxSessionsFromHold(text: string) {
-  const matches = text.match(/\d+/g)?.map(Number) ?? []
-  return Math.max(1, matches.length ? Math.max(...matches) : 10)
-}
-
-function sessionsElapsed(plannedAt?: string | null) {
+function tradingSessionsElapsed(plannedAt?: string | null) {
   if (!plannedAt) return 0
   const planned = new Date(plannedAt)
   if (Number.isNaN(planned.getTime())) return 0
-  const now = new Date()
-  const oneDay = 24 * 60 * 60 * 1000
-  return Math.max(0, Math.floor((now.getTime() - planned.getTime()) / oneDay))
+
+  let sessions = 0
+  const cursor = new Date(planned)
+  cursor.setHours(0, 0, 0, 0)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+
+  while (cursor <= today) {
+    if (!isNseHoliday(cursor)) sessions += 1
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return sessions
+}
+
+function isNseHoliday(date: Date) {
+  const day = date.getDay()
+  if (day === 0 || day === 6) return true
+  return NSE_HOLIDAYS.has(localIsoDate(date))
+}
+
+function localIsoDate(date: Date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function isTradeExpired(trade: PaperTrade) {
-  return trade.enabled === 1 && sessionsElapsed(trade.planned_at) >= trade.max_sessions
+  return trade.enabled === 1 && tradingSessionsElapsed(trade.planned_at) >= trade.max_sessions
+}
+
+function isTradeStopped(trade: PaperTrade) {
+  return trade.enabled === 1 && trade.stop_loss > 0 && trade.current_price > 0 && trade.current_price <= trade.stop_loss
+}
+
+function isTradeTargetHit(trade: PaperTrade) {
+  return trade.enabled === 1 && trade.target_price > 0 && trade.current_price > 0 && trade.current_price >= trade.target_price
+}
+
+function paperTradePayloadFromCandidate(candidate: SwingCandidate, sourceNote = '') {
+  const entryPrice = Math.max(candidate.last_price, 0.01)
+  const stopLoss = candidate.stop_loss
+  const targetPrice = candidate.target_price
+  const quantity = quantityForCapital(entryPrice)
+
+  return {
+    symbol: candidate.symbol,
+    company_name: candidate.company_name,
+    setup_family: candidate.setup_family,
+    bias: candidate.bias,
+    entry_price: entryPrice,
+    quantity,
+    max_sessions: PAPER_HOLD_SESSIONS,
+    capital_allocated: PAPER_CAPITAL_PER_STOCK,
+    stop_loss: stopLoss,
+    target_price: targetPrice,
+    expected_hold: `${PAPER_HOLD_SESSIONS} trading sessions`,
+    thesis: candidate.thesis,
+    notes: [
+      sourceNote,
+      `signal_date=${candidate.live_signal.as_of}`,
+      `strategy=${candidate.live_signal.strategy_id}`,
+      `strategy_status=${candidate.live_signal.strategy_status}`,
+      ...candidate.reasons,
+    ].filter(Boolean).join(' '),
+  }
 }
 
 function paperTradePayloadFromTrade(trade: PaperTrade, overrides: Partial<Pick<PaperTrade, 'quantity' | 'capital_allocated'>> = {}) {
@@ -722,7 +986,7 @@ function DetailPanel({
             className="primary-button"
             onClick={() => onQueue(resolvedCandidate)}
             disabled={!paperReady}
-            title={paperReady ? 'Send this live entry to Paper Desk' : liveSignal.reason}
+            title={paperReady ? 'Send this setup to Paper Desk for 7 trading sessions' : 'Needs a valid stop loss before paper trading'}
           >
             <WalletCards size={14} />
             <span>{queued ? 'Refresh Paper Plan' : 'Send To Paper Desk'}</span>
@@ -1103,51 +1367,98 @@ function HomeView({
 function ScannerView({
   scanner,
   historicalScreener,
+  freshSignals,
   bambooLatest,
   selectedSymbol,
   onSelect,
+  onStageFresh,
+  onRefreshCache,
+  stagingFresh,
+  refreshingCache,
 }: {
   scanner: SwingScannerResponse | null
   historicalScreener: HistoricalScreenerResponse | null
+  freshSignals: FreshSignalsResponse | null
   bambooLatest: BambooLatestResponse | null
   selectedSymbol: string | null
   onSelect: (symbol: string) => void
+  onStageFresh: () => void
+  onRefreshCache: () => void
+  stagingFresh: boolean
+  refreshingCache: boolean
 }) {
   const [search, setSearch] = useState('')
   const [familyFilter, setFamilyFilter] = useState<string>('All')
+  const [strategyFilter, setStrategyFilter] = useState<string>('Fresh')
   const [page, setPage] = useState(1)
   const pageSize = 12
   const deferredSearch = useDeferredValue(search)
 
   const families = useMemo(() => {
     const options = new Set<string>(['All'])
-    historicalScreener?.rows.forEach((row) => options.add(row.setup_family))
+    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
+    sourceRows.forEach((row) => options.add(row.setup_family))
     return Array.from(options)
-  }, [historicalScreener])
+  }, [freshSignals, historicalScreener])
+
+  const strategies = useMemo(() => {
+    const options = new Map<string, string>([['Fresh', 'Fresh signals'], ['All', 'All strategies']])
+    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
+    sourceRows.forEach((row) => {
+      options.set(row.strategy_id, row.strategy_label)
+    })
+    return Array.from(options.entries()).map(([id, label]) => ({ id, label }))
+  }, [freshSignals, historicalScreener])
 
   const filtered = useMemo(() => {
     const term = deferredSearch.trim().toLowerCase()
-    return (historicalScreener?.rows ?? []).filter((row) => {
+    const sourceRows = freshSignals?.rows ?? []
+    return sourceRows.filter((row) => {
       const matchesFamily = familyFilter === 'All' || row.setup_family === familyFilter
+      const matchesStrategy = strategyFilter === 'All'
+        || (strategyFilter === 'Fresh' ? ['Research', 'Watch'].includes(row.strategy_status) : row.strategy_id === strategyFilter)
       const matchesSearch =
         !term ||
         row.symbol.toLowerCase().includes(term)
         || row.strategy_label.toLowerCase().includes(term)
         || row.strategy_status.toLowerCase().includes(term)
-      return matchesFamily && matchesSearch
+      return matchesFamily && matchesStrategy && matchesSearch
     })
-  }, [deferredSearch, familyFilter, historicalScreener])
+  }, [deferredSearch, familyFilter, freshSignals, strategyFilter])
 
   useEffect(() => {
     setPage(1)
-  }, [deferredSearch, familyFilter])
+  }, [deferredSearch, familyFilter, strategyFilter])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
   const safePage = Math.min(page, totalPages)
   const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
 
-  if (!scanner || !historicalScreener) return <PageSkeleton />
+  if (!scanner || !historicalScreener) {
+    return (
+      <div className="page-stack">
+        <Surface>
+          <div className="empty-action-panel">
+            <Radar size={22} />
+            <div>
+              <span className="eyebrow">Scanner</span>
+              <h2>Load scanner data when you need it</h2>
+              <p>Fresh signal staging now runs only from the scanner button, not automatically on app open.</p>
+              <div className="empty-action-buttons">
+                <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache}>
+                  <Database size={14} />
+                  <span>{refreshingCache ? 'Refreshing Cache' : 'Refresh Feature Cache'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </Surface>
+      </div>
+    )
+  }
   const bambooSignals = bambooLatest?.top_signals ?? []
+  const freshSignalCount = freshSignals?.new_rows ?? 0
+  const latestSignalDate = freshSignals?.signal_date ?? historicalScreener.signal_date ?? historicalScreener.rows[0]?.as_of ?? 'not available'
 
   return (
     <div className="page-stack">
@@ -1210,7 +1521,7 @@ function ScannerView({
         <div className="section-head scanner-toolbar">
           <div>
             <span className="eyebrow">Historical Screener</span>
-              <h2>Backtested rules plus live Dhan overlay drive the entry signal</h2>
+              <h2>New unique signals from {latestSignalDate}</h2>
           </div>
           <div className="toolbar-right screener-toolbar-meta">
             <div className="mini-chip">
@@ -1227,17 +1538,38 @@ function ScannerView({
               className="text-input"
               placeholder="Search symbol"
             />
+            <button type="button" className="primary-button" onClick={onStageFresh} disabled={stagingFresh}>
+              <RefreshCw size={14} className={stagingFresh ? 'spin' : ''} />
+              <span>{stagingFresh ? 'Staging' : 'Stage Fresh Signals'}</span>
+            </button>
+            <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache}>
+              <Database size={14} />
+              <span>{refreshingCache ? 'Caching' : 'Refresh Cache'}</span>
+            </button>
           </div>
         </div>
 
         <div className="scanner-summary-strip">
-          <CandidateStat label="Rows From History" value={String(historicalScreener.total_rows)} />
-          <CandidateStat label="Scanner Candidates" value={String(scanner.total_candidates)} tone="positive" />
-          <CandidateStat label="Data As Of" value={compactDate(historicalScreener.updated_at)} />
-          <CandidateStat label="Quote Layer" value={scanner.live_data ? 'Live' : 'Historical'} tone={scanner.live_data ? 'positive' : 'warning'} />
+          <CandidateStat label="New Signals" value={String(freshSignalCount)} tone={freshSignalCount > 0 ? 'positive' : 'neutral'} />
+          <CandidateStat label="Auto-Staged" value={String(freshSignals?.staged_rows ?? 0)} tone={(freshSignals?.staged_rows ?? 0) > 0 ? 'positive' : 'neutral'} />
+          <CandidateStat label="Already Seen" value={String(freshSignals?.seen_rows ?? 0)} tone={(freshSignals?.seen_rows ?? 0) > 0 ? 'warning' : 'neutral'} />
+          <CandidateStat label="Last Data Date" value={latestSignalDate} />
         </div>
 
         <div className="filter-strip">
+          {strategies.map((strategy) => (
+            <button
+              key={strategy.id}
+              type="button"
+              onClick={() => setStrategyFilter(strategy.id)}
+              className={strategyFilter === strategy.id ? 'filter-chip filter-chip-active' : 'filter-chip'}
+            >
+              {strategy.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="filter-strip compact-filter-strip">
           {families.map((family) => (
             <button
               key={family}
@@ -1280,7 +1612,7 @@ function ScannerView({
             {filtered.length === 0 && (
               <div className="empty-table">
                 <CircleAlert size={18} />
-                <p>No candidates matched the current filters.</p>
+                <p>{freshSignals?.message ?? 'No new unique signals matched the current filters. Existing names are tracked in Paper Desk instead of being shown again.'}</p>
               </div>
             )}
           </div>
@@ -1408,7 +1740,7 @@ function WatchlistView({
                           className={queued ? 'ghost-button active-ghost' : 'primary-button'}
                           onClick={() => onQueue(candidate)}
                           disabled={!ready}
-                          title={ready ? 'Send this live entry to Paper Desk' : signal.reason}
+                          title={ready ? 'Send this setup to Paper Desk for 7 trading sessions' : 'Needs a valid stop loss before paper trading'}
                         >
                           <WalletCards size={14} />
                           <span>{queued ? 'Queued' : 'Paper'}</span>
@@ -1460,23 +1792,191 @@ function PortfolioView({
   const hasReferencePrices = paperTrades.some(isReferencePaperQuote)
   const pnlLabel = hasLivePrices ? 'Open P&L' : 'Reference P&L'
   const priceColumnLabel = hasLivePrices ? 'Current' : 'Last close'
+  const totalOpenRisk = paperTrades.reduce((sum, trade) => sum + riskAmount(trade), 0)
+  const budgetUsePct = totalBudget > 0 ? Math.min(100, (allocatedBudget / totalBudget) * 100) : 0
+  const stoppedCount = paperTrades.filter(isTradeStopped).length
+  const expiringCount = paperTrades.filter((trade) => sessionsRemaining(trade) <= 1).length
+  const systemOpenTrades = paperTrades.filter(isSystemPaperTrade)
+  const manualOpenTrades = paperTrades.filter((trade) => !isSystemPaperTrade(trade))
+  const systemClosedTrades = closedTrades.filter(isSystemPaperTrade)
+  const manualClosedTrades = closedTrades.filter((trade) => !isSystemPaperTrade(trade))
+  const systemOpenPnl = systemOpenTrades.reduce((sum, trade) => sum + trade.unrealized_pnl, 0)
+  const manualOpenPnl = manualOpenTrades.reduce((sum, trade) => sum + trade.unrealized_pnl, 0)
+  const systemClosedPnl = systemClosedTrades.reduce((sum, trade) => sum + trade.realized_pnl, 0)
+  const manualClosedPnl = manualClosedTrades.reduce((sum, trade) => sum + trade.realized_pnl, 0)
+  const systemSignalDates = systemOpenTrades
+    .map(paperSignalDate)
+    .filter((date): date is string => date !== null)
+    .sort()
+  const latestSystemSignal = systemSignalDates[systemSignalDates.length - 1] ?? 'none'
+  const weeklyStrategyRows = buildWeeklyStrategyRows([...paperTrades, ...closedTrades])
+  const [paperSourceFilter, setPaperSourceFilter] = useState('all')
+  const [paperStatusFilter, setPaperStatusFilter] = useState('all')
+  const [paperStrategyFilter, setPaperStrategyFilter] = useState('all')
+  const [paperSort, setPaperSort] = useState('attention')
+  const [paperSearch, setPaperSearch] = useState('')
+  const [activePaperTab, setActivePaperTab] = useState<PaperDeskTab>('open')
+  const [openPage, setOpenPage] = useState(1)
+  const [closedPage, setClosedPage] = useState(1)
+  const [weeklyPage, setWeeklyPage] = useState(1)
+  const [strategyPage, setStrategyPage] = useState(1)
+  const [intakePage, setIntakePage] = useState(1)
+  const [paperPageSize, setPaperPageSize] = useState(10)
+  const paperStrategyOptions = useMemo(() => {
+    const options = new Map<string, string>()
+    ;[...paperTrades, ...closedTrades].forEach((trade) => {
+      const id = paperStrategyId(trade) ?? trade.setup_family
+      options.set(id, trade.setup_family || strategyLabel(id))
+    })
+    return Array.from(options.entries()).sort((a, b) => a[1].localeCompare(b[1]))
+  }, [closedTrades, paperTrades])
+  const visiblePaperTrades = useMemo(() => {
+    const term = paperSearch.trim().toLowerCase()
+    return paperTrades
+      .filter((trade) => {
+        const source = isSystemPaperTrade(trade) ? 'system' : 'manual'
+        const strategyId = paperStrategyId(trade) ?? trade.setup_family
+        const remaining = sessionsRemaining(trade)
+        const matchesSource = paperSourceFilter === 'all' || paperSourceFilter === source
+        const matchesStrategy = paperStrategyFilter === 'all' || paperStrategyFilter === strategyId
+        const matchesStatus =
+          paperStatusFilter === 'all'
+          || (paperStatusFilter === 'attention' && (isTradeStopped(trade) || remaining <= 1))
+          || (paperStatusFilter === 'stopped' && isTradeStopped(trade))
+          || (paperStatusFilter === 'expiring' && remaining <= 1)
+          || (paperStatusFilter === 'winning' && trade.unrealized_pnl >= 0)
+          || (paperStatusFilter === 'losing' && trade.unrealized_pnl < 0)
+        const matchesSearch = !term
+          || trade.symbol.toLowerCase().includes(term)
+          || trade.company_name.toLowerCase().includes(term)
+          || trade.setup_family.toLowerCase().includes(term)
+        return matchesSource && matchesStrategy && matchesStatus && matchesSearch
+      })
+      .sort((a, b) => {
+        if (paperSort === 'pnl-desc') return b.unrealized_pnl - a.unrealized_pnl
+        if (paperSort === 'pnl-asc') return a.unrealized_pnl - b.unrealized_pnl
+        if (paperSort === 'newest') return b.planned_at.localeCompare(a.planned_at)
+        if (paperSort === 'symbol') return a.symbol.localeCompare(b.symbol)
+        const aAttention = (isTradeStopped(a) ? 2 : sessionsRemaining(a) <= 1 ? 1 : 0)
+        const bAttention = (isTradeStopped(b) ? 2 : sessionsRemaining(b) <= 1 ? 1 : 0)
+        return bAttention - aAttention || a.unrealized_pnl - b.unrealized_pnl
+      })
+  }, [paperSearch, paperSort, paperSourceFilter, paperStatusFilter, paperStrategyFilter, paperTrades])
+  const visibleClosedTrades = useMemo(() => {
+    const term = paperSearch.trim().toLowerCase()
+    return closedTrades
+      .filter((trade) => {
+        const source = isSystemPaperTrade(trade) ? 'system' : 'manual'
+        const strategyId = paperStrategyId(trade) ?? trade.setup_family
+        const matchesSource = paperSourceFilter === 'all' || paperSourceFilter === source
+        const matchesStrategy = paperStrategyFilter === 'all' || paperStrategyFilter === strategyId
+        const matchesSearch = !term
+          || trade.symbol.toLowerCase().includes(term)
+          || trade.company_name.toLowerCase().includes(term)
+          || trade.setup_family.toLowerCase().includes(term)
+          || trade.close_reason.toLowerCase().includes(term)
+        return matchesSource && matchesStrategy && matchesSearch
+      })
+      .sort((a, b) => {
+        if (paperSort === 'pnl-desc') return b.realized_pnl - a.realized_pnl
+        if (paperSort === 'pnl-asc') return a.realized_pnl - b.realized_pnl
+        if (paperSort === 'symbol') return a.symbol.localeCompare(b.symbol)
+        return (b.closed_at ?? b.planned_at).localeCompare(a.closed_at ?? a.planned_at)
+      })
+  }, [closedTrades, paperSearch, paperSort, paperSourceFilter, paperStrategyFilter])
+  const filteredWeeklyRows = weeklyStrategyRows.filter((row) => paperStrategyFilter === 'all' || row.strategyId === paperStrategyFilter)
+  const strategyRows = useMemo(
+    () => buildPaperStrategyRows([...paperTrades, ...closedTrades])
+      .filter((row) => paperStrategyFilter === 'all' || row.strategyId === paperStrategyFilter)
+      .filter((row) => {
+        const term = paperSearch.trim().toLowerCase()
+        return !term || row.strategyLabel.toLowerCase().includes(term) || row.strategyId.toLowerCase().includes(term)
+      }),
+    [closedTrades, paperSearch, paperStrategyFilter, paperTrades],
+  )
+  const intakeTrades = useMemo(() => {
+    const term = paperSearch.trim().toLowerCase()
+    return [...paperTrades, ...closedTrades]
+      .filter((trade) => {
+        const source = isSystemPaperTrade(trade) ? 'system' : 'manual'
+        const strategyId = paperStrategyId(trade) ?? trade.setup_family
+        const matchesSource = paperSourceFilter === 'all' || paperSourceFilter === source
+        const matchesStrategy = paperStrategyFilter === 'all' || paperStrategyFilter === strategyId
+        const matchesSearch = !term
+          || trade.symbol.toLowerCase().includes(term)
+          || trade.company_name.toLowerCase().includes(term)
+          || trade.setup_family.toLowerCase().includes(term)
+        return matchesSource && matchesStrategy && matchesSearch
+      })
+      .sort((a, b) => b.planned_at.localeCompare(a.planned_at))
+  }, [closedTrades, paperSearch, paperSourceFilter, paperStrategyFilter, paperTrades])
+  const openPageData = paginateRows(visiblePaperTrades, openPage, paperPageSize)
+  const closedPageData = paginateRows(visibleClosedTrades, closedPage, paperPageSize)
+  const weeklyPageData = paginateRows(filteredWeeklyRows, weeklyPage, paperPageSize)
+  const strategyPageData = paginateRows(strategyRows, strategyPage, paperPageSize)
+  const intakePageData = paginateRows(intakeTrades, intakePage, paperPageSize)
+  useEffect(() => {
+    setOpenPage(1)
+    setClosedPage(1)
+    setWeeklyPage(1)
+    setStrategyPage(1)
+    setIntakePage(1)
+  }, [paperPageSize, paperSearch, paperSort, paperSourceFilter, paperStatusFilter, paperStrategyFilter])
 
   return (
-    <div className="page-stack">
-      <Surface>
-        <div className="section-head">
+    <div className="page-stack paper-desk-page">
+      <Surface className="paper-desk-shell">
+        <div className="paper-desk-hero">
           <div>
             <span className="eyebrow">Paper Desk</span>
-            <h2>Paper positions</h2>
+            <h2>Backtest-gated paper board</h2>
+            <p>Only backtest-tracked rows enter automatically. Every open trade must carry entry, stop, target, and a 5-session trading-week clock.</p>
           </div>
-          <div className="hero-actions">
+          <div className="paper-desk-hero-grid">
             <CandidateStat label="Open" value={String(paperTrades.length)} />
-            <CandidateStat label="Budget" value={currency(totalBudget)} />
-            <CandidateStat label="Allocated" value={currency(allocatedBudget)} />
-            <CandidateStat label="Available" value={currency(availableBudget)} tone={availableBudget >= 0 ? 'positive' : 'danger'} />
             <CandidateStat label={pnlLabel} value={currency(totalPnl)} tone={hasLivePrices ? (totalPnl >= 0 ? 'positive' : 'danger') : 'warning'} />
+            <CandidateStat label="Open Risk" value={currency(totalOpenRisk)} tone={totalOpenRisk > 0 ? 'warning' : 'neutral'} />
             <CandidateStat label="Closed P&L" value={currency(realizedPnl)} tone={realizedPnl >= 0 ? 'positive' : 'danger'} />
           </div>
+        </div>
+
+        <div className="paper-policy-strip">
+          <div>
+            <span className="micro-label">Intake</span>
+            <strong>Newest Research / Watch signals</strong>
+          </div>
+          <div>
+            <span className="micro-label">Hold</span>
+            <strong>{PAPER_HOLD_SESSIONS} trading sessions</strong>
+          </div>
+          <div>
+            <span className="micro-label">Risk</span>
+            <strong>Stop required</strong>
+          </div>
+          <div>
+            <span className="micro-label">Auto exit</span>
+            <strong>Stop or time</strong>
+          </div>
+        </div>
+
+        <div className="paper-analytics-grid">
+          <Surface className="inner-surface source-metric">
+            <span className="micro-label">System Added</span>
+            <strong>{systemOpenTrades.length} open</strong>
+            <small>{currency(systemOpenPnl)} open P&L</small>
+            <small>{currency(systemClosedPnl)} closed P&L</small>
+          </Surface>
+          <Surface className="inner-surface source-metric">
+            <span className="micro-label">Manual Added</span>
+            <strong>{manualOpenTrades.length} open</strong>
+            <small>{currency(manualOpenPnl)} open P&L</small>
+            <small>{currency(manualClosedPnl)} closed P&L</small>
+          </Surface>
+          <Surface className="inner-surface source-metric">
+            <span className="micro-label">Newest Auto Signal</span>
+            <strong>{latestSystemSignal}</strong>
+            <small>same signal date and strategy will not be staged twice</small>
+          </Surface>
         </div>
 
         {hasReferencePrices && !hasLivePrices && (
@@ -1489,14 +1989,13 @@ function PortfolioView({
           </div>
         )}
 
-        <Surface className="inner-surface budget-panel">
+        <div className="paper-capital-panel">
           <div>
-            <span className="eyebrow">Budget</span>
-            <h3>Paper trading budget</h3>
-          </div>
-          <div>
-            <span className="micro-label">Total Budget</span>
-            <strong>{currency(totalBudget)}</strong>
+            <span className="eyebrow">Capital</span>
+            <h3>{currency(totalBudget)}</h3>
+            <div className="budget-meter" aria-label="Budget utilization">
+              <span style={{ width: `${budgetUsePct}%` }} />
+            </div>
           </div>
           <div>
             <span className="micro-label">Allocated</span>
@@ -1506,120 +2005,492 @@ function PortfolioView({
             <span className="micro-label">Available</span>
             <strong className={availableBudget >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(availableBudget)}</strong>
           </div>
-        </Surface>
-
-        {paperTrades.length === 0 ? (
-          <div className="portfolio-empty">
-            <BriefcaseBusiness size={20} />
-            <p>No open paper positions. Add a stock from Scanner or Watchlist.</p>
+          <div>
+            <span className="micro-label">At Stop</span>
+            <strong className={totalOpenRisk > 0 ? 'tone-warning' : ''}>{currency(totalOpenRisk)}</strong>
           </div>
-        ) : (
-          <Surface className="inner-surface paper-table-surface">
-            <div className="paper-table">
-              <div className="paper-table-row paper-table-head">
-                <span>Stock</span>
-                <span>Qty</span>
-                <span>Entry</span>
-                <span>{priceColumnLabel}</span>
-                <span>Budget</span>
-                <span>Value</span>
-                <span>{hasLivePrices ? 'P&L' : 'Ref P&L'}</span>
-                <span>Action</span>
-              </div>
-              {paperTrades.map((trade) => {
-                const pnl = trade.unrealized_pnl
-                return (
-                  <div key={trade.symbol} className="paper-table-row">
-                    <button type="button" className="paper-symbol-cell" onClick={() => onSelect(trade.symbol)}>
-                      <strong>{trade.symbol}</strong>
-                      <span>{trade.company_name}</span>
-                    </button>
-                    <input
-                      key={`${trade.symbol}-qty-${trade.quantity}`}
-                      className="paper-input"
-                      type="number"
-                      min="1"
-                      defaultValue={trade.quantity}
-                      onBlur={(event) => {
-                        const quantity = Math.max(1, Math.floor(Number(event.currentTarget.value) || trade.quantity))
-                        if (quantity !== trade.quantity) onUpdate(trade, { quantity })
-                      }}
-                    />
-                    <strong>{currency(trade.entry_price)}</strong>
-                    <strong>
-                      {currency(trade.current_price)}
-                      <small>{paperQuoteLabel(trade)}</small>
-                    </strong>
-                    <div>
-                      <input
-                        key={`${trade.symbol}-budget-${Math.round(trade.capital_allocated)}`}
-                        className="paper-input amount-input"
-                        type="number"
-                        min={trade.entry_price}
-                        step="100"
-                        defaultValue={Math.round(trade.capital_allocated)}
-                        onBlur={(event) => {
-                          const capital = Math.max(trade.entry_price, Number(event.currentTarget.value) || trade.capital_allocated)
-                          const quantity = quantityForCapital(trade.entry_price, capital)
-                          if (Math.round(capital) !== Math.round(trade.capital_allocated) || quantity !== trade.quantity) {
-                            onUpdate(trade, { capital_allocated: capital, quantity })
-                          }
-                        }}
-                      />
-                      <small>qty from budget</small>
-                    </div>
-                    <strong>{currency(trade.current_value)}</strong>
-                    <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
-                      {currency(pnl)}
-                      <small>{trade.unrealized_pnl_pct.toFixed(2)}%</small>
-                    </strong>
-                    <div className="paper-actions">
-                      <button type="button" className="ghost-button danger-ghost" onClick={() => onRemove(trade.symbol)}>
-                        Remove
-                      </button>
-                    </div>
+          <div>
+            <span className="micro-label">Needs Attention</span>
+            <strong className={stoppedCount > 0 ? 'tone-danger' : expiringCount > 0 ? 'tone-warning' : 'tone-positive'}>
+              {stoppedCount > 0 ? `${stoppedCount} stopped` : `${expiringCount} expiring`}
+            </strong>
+          </div>
+        </div>
+
+        <div className="desk-control-panel">
+          <label>
+            <span>Source</span>
+            <select className="select-input" value={paperSourceFilter} onChange={(event) => setPaperSourceFilter(event.currentTarget.value)}>
+              <option value="all">All sources</option>
+              <option value="system">System added</option>
+              <option value="manual">Manual added</option>
+            </select>
+          </label>
+          <label>
+            <span>Status</span>
+            <select className="select-input" value={paperStatusFilter} onChange={(event) => setPaperStatusFilter(event.currentTarget.value)}>
+              <option value="all">All open</option>
+              <option value="attention">Needs attention</option>
+              <option value="stopped">Stop hit</option>
+              <option value="expiring">Expiring</option>
+              <option value="winning">Winning</option>
+              <option value="losing">Losing</option>
+            </select>
+          </label>
+          <label>
+            <span>Strategy</span>
+            <select className="select-input" value={paperStrategyFilter} onChange={(event) => setPaperStrategyFilter(event.currentTarget.value)}>
+              <option value="all">All strategies</option>
+              {paperStrategyOptions.map(([id, label]) => (
+                <option key={id} value={id}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Sort</span>
+            <select className="select-input" value={paperSort} onChange={(event) => setPaperSort(event.currentTarget.value)}>
+              <option value="attention">Attention first</option>
+              <option value="pnl-desc">Best P&L</option>
+              <option value="pnl-asc">Worst P&L</option>
+              <option value="newest">Newest</option>
+              <option value="symbol">Symbol</option>
+            </select>
+          </label>
+          <label className="wide-control">
+            <span>Search</span>
+            <input className="text-input" value={paperSearch} onChange={(event) => setPaperSearch(event.currentTarget.value)} placeholder="Symbol or strategy" />
+          </label>
+        </div>
+
+        <div className="paper-tab-strip">
+          {[
+            ['open', 'Open Trades', visiblePaperTrades.length],
+            ['closed', 'Closed Trades', visibleClosedTrades.length],
+            ['weekly', 'Weekly Analytics', filteredWeeklyRows.length],
+            ['strategy', 'Strategy View', strategyRows.length],
+            ['intake', 'Intake Log', intakeTrades.length],
+          ].map(([id, label, count]) => (
+            <button
+              key={id}
+              type="button"
+              className={activePaperTab === id ? 'paper-tab paper-tab-active' : 'paper-tab'}
+              onClick={() => setActivePaperTab(id as PaperDeskTab)}
+            >
+              <span>{label}</span>
+              <strong>{count}</strong>
+            </button>
+          ))}
+        </div>
+
+        <div className="paper-tab-body">
+          {activePaperTab === 'open' && (
+            <PaperDeskSection
+              icon={BriefcaseBusiness}
+              eyebrow="Open Trades"
+              title="Active paper positions"
+              countLabel={`${visiblePaperTrades.length} shown`}
+              empty={paperTrades.length === 0 ? 'No open paper positions from the current backtest-gated intake.' : 'No open paper positions match the current filters.'}
+              hasRows={visiblePaperTrades.length > 0}
+            >
+              <div className="paper-table-surface">
+                <div className="paper-table">
+                  <div className="paper-table-row paper-table-head">
+                    <span>Stock</span>
+                    <span>Source</span>
+                    <span>Qty</span>
+                    <span>Entry / Stop</span>
+                    <span>{priceColumnLabel}</span>
+                    <span>Risk</span>
+                    <span>{hasLivePrices ? 'P&L' : 'Ref P&L'}</span>
+                    <span>Clock</span>
                   </div>
-                )
-              })}
-            </div>
-          </Surface>
-        )}
-        {closedTrades.length > 0 && (
-          <Surface className="inner-surface closed-summary">
-            <div className="lane-head">
-              <div>
-                <span className="eyebrow">Closed Summary</span>
-                <h3>What happened after the paper session ended</h3>
+                  {openPageData.rows.map((trade) => {
+                    const pnl = trade.unrealized_pnl
+                    const remaining = sessionsRemaining(trade)
+                    const stopped = isTradeStopped(trade)
+                    return (
+                      <div key={trade.symbol} className={stopped ? 'paper-table-row paper-row-danger' : remaining <= 1 ? 'paper-table-row paper-row-warning' : 'paper-table-row'}>
+                        <button type="button" className="paper-symbol-cell" onClick={() => onSelect(trade.symbol)}>
+                          <strong>{trade.symbol}</strong>
+                          <span>{trade.company_name}</span>
+                        </button>
+                        <span className="paper-source-pill">{paperSourceLabel(trade)}</span>
+                        <input
+                          key={`${trade.symbol}-qty-${trade.quantity}`}
+                          className="paper-input"
+                          type="number"
+                          min="1"
+                          defaultValue={trade.quantity}
+                          onBlur={(event) => {
+                            const quantity = Math.max(1, Math.floor(Number(event.currentTarget.value) || trade.quantity))
+                            if (quantity !== trade.quantity) onUpdate(trade, { quantity })
+                          }}
+                        />
+                        <strong className="paper-price-stack">
+                          {currency(trade.entry_price)}
+                          <small>Stop {currency(trade.stop_loss)}</small>
+                          <small>Target {currency(trade.target_price)}</small>
+                        </strong>
+                        <strong className="paper-price-stack">
+                          {currency(trade.current_price)}
+                          <small>{paperQuoteLabel(trade)}</small>
+                        </strong>
+                        <strong className="paper-price-stack">
+                          {currency(riskAmount(trade))}
+                          <small>{currency(trade.capital_allocated)} allocated</small>
+                        </strong>
+                        <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                          {currency(pnl)}
+                          <small>{trade.unrealized_pnl_pct.toFixed(2)}%</small>
+                        </strong>
+                        <div className="paper-actions">
+                          <strong>{remaining}</strong>
+                          <small>{stopped ? 'stop hit' : 'sessions left'}</small>
+                          <button type="button" className="ghost-button danger-ghost" onClick={() => onRemove(trade.symbol)}>
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
-              <div className="mini-chip">
-                <ListTodo size={14} />
-                <span>{closedTrades.length} closed</span>
-              </div>
-            </div>
-            <div className="closed-trade-list">
-              {closedTrades.slice(0, 8).map((trade) => {
-                const pnl = trade.realized_pnl
-                const exit = trade.exit_price ?? trade.entry_price
-                return (
-                  <div key={`${trade.symbol}-${trade.closed_at ?? trade.close_reason}`} className="closed-trade-row">
-                    <div>
-                      <strong>{trade.symbol}</strong>
-                      <span>{trade.close_reason || 'closed'}{trade.closed_at ? ` | ${compactDate(trade.closed_at)}` : ''}</span>
+              <PaginationControls pageData={openPageData} pageSize={paperPageSize} onPageChange={setOpenPage} onPageSizeChange={setPaperPageSize} />
+            </PaperDeskSection>
+          )}
+
+          {activePaperTab === 'closed' && (
+            <PaperDeskSection
+              icon={ListTodo}
+              eyebrow="Closed Summary"
+              title="What happened after the paper session ended"
+              countLabel={`${visibleClosedTrades.length} closed`}
+              empty="No closed paper trades match the current filters."
+              hasRows={visibleClosedTrades.length > 0}
+            >
+              <div className="closed-trade-list paged-list">
+                {closedPageData.rows.map((trade) => {
+                  const pnl = trade.realized_pnl
+                  const exit = trade.exit_price ?? trade.entry_price
+                  return (
+                    <div key={`${trade.symbol}-${trade.closed_at ?? trade.close_reason}`} className="closed-trade-row">
+                      <div>
+                        <strong>{trade.symbol}</strong>
+                        <span>{trade.close_reason || 'closed'}{trade.closed_at ? ` | ${compactDate(trade.closed_at)}` : ''}</span>
+                      </div>
+                      <span>{paperSourceLabel(trade)}</span>
+                      <span>{currency(trade.entry_price)} to {currency(exit)}</span>
+                      <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                        {currency(pnl)} ({tradeReturnPct(pnl, trade).toFixed(2)}%)
+                      </strong>
                     </div>
-                    <span>{trade.quantity} qty</span>
-                    <span>{currency(trade.entry_price)} to {currency(exit)}</span>
-                    <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
-                      {currency(pnl)} ({tradeReturnPct(pnl, trade).toFixed(2)}%)
+                  )
+                })}
+              </div>
+              <PaginationControls pageData={closedPageData} pageSize={paperPageSize} onPageChange={setClosedPage} onPageSizeChange={setPaperPageSize} />
+            </PaperDeskSection>
+          )}
+
+          {activePaperTab === 'weekly' && (
+            <PaperDeskSection
+              icon={BarChart3}
+              eyebrow="Trading Week Analytics"
+              title="Strategy-wise result after signal tracking"
+              countLabel={`${filteredWeeklyRows.length} strategy weeks`}
+              empty="No weekly strategy rows match the current filters."
+              hasRows={filteredWeeklyRows.length > 0}
+            >
+              <div className="weekly-strategy-table">
+                <div className="weekly-strategy-row weekly-strategy-head">
+                  <span>Week</span>
+                  <span>Strategy</span>
+                  <span>Entries</span>
+                  <span>Active</span>
+                  <span>Closed</span>
+                  <span>W/L</span>
+                  <span>Closed P&L</span>
+                </div>
+                {weeklyPageData.rows.map((row) => (
+                  <div key={`${row.weekStart}-${row.strategyId}`} className="weekly-strategy-row">
+                    <strong>{row.weekStart}</strong>
+                    <span>{row.strategyLabel}</span>
+                    <span>{row.entries}</span>
+                    <span>{row.active}</span>
+                    <span>{row.closed}</span>
+                    <span>{row.wins}/{row.losses}</span>
+                    <strong className={row.closedPnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                      {currency(row.closedPnl)}
+                      <small>{row.closed > 0 ? `${row.avgReturnPct.toFixed(2)}% avg` : 'waiting close'}</small>
                     </strong>
                   </div>
-                )
-              })}
-            </div>
-          </Surface>
-        )}
+                ))}
+              </div>
+              <PaginationControls pageData={weeklyPageData} pageSize={paperPageSize} onPageChange={setWeeklyPage} onPageSizeChange={setPaperPageSize} />
+            </PaperDeskSection>
+          )}
+
+          {activePaperTab === 'strategy' && (
+            <PaperDeskSection
+              icon={Target}
+              eyebrow="Strategy View"
+              title="P&L and activity grouped by strategy"
+              countLabel={`${strategyRows.length} strategies`}
+              empty="No strategy rows match the current filters."
+              hasRows={strategyRows.length > 0}
+            >
+              <div className="strategy-paper-table">
+                <div className="strategy-paper-row strategy-paper-head">
+                  <span>Strategy</span>
+                  <span>Open</span>
+                  <span>Closed</span>
+                  <span>W/L</span>
+                  <span>Open P&L</span>
+                  <span>Closed P&L</span>
+                </div>
+                {strategyPageData.rows.map((row) => (
+                  <div key={row.strategyId} className="strategy-paper-row">
+                    <strong>{row.strategyLabel}<small>{row.strategyId}</small></strong>
+                    <span>{row.open}</span>
+                    <span>{row.closed}</span>
+                    <span>{row.wins}/{row.losses}</span>
+                    <strong className={row.openPnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.openPnl)}</strong>
+                    <strong className={row.closedPnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                      {currency(row.closedPnl)}
+                      <small>{row.closed > 0 ? `${row.avgReturnPct.toFixed(2)}% avg` : 'waiting close'}</small>
+                    </strong>
+                  </div>
+                ))}
+              </div>
+              <PaginationControls pageData={strategyPageData} pageSize={paperPageSize} onPageChange={setStrategyPage} onPageSizeChange={setPaperPageSize} />
+            </PaperDeskSection>
+          )}
+
+          {activePaperTab === 'intake' && (
+            <PaperDeskSection
+              icon={Sparkles}
+              eyebrow="Intake Log"
+              title="System-added and manual paper entries"
+              countLabel={`${intakeTrades.length} entries`}
+              empty="No intake rows match the current filters."
+              hasRows={intakeTrades.length > 0}
+            >
+              <div className="intake-list">
+                {intakePageData.rows.map((trade) => (
+                  <button key={`${trade.symbol}-${trade.planned_at}-${trade.enabled}`} type="button" className="intake-row" onClick={() => onSelect(trade.symbol)}>
+                    <strong>{trade.symbol}<small>{trade.setup_family}</small></strong>
+                    <span>{paperSourceLabel(trade)}</span>
+                    <span>{paperSignalDate(trade) ?? trade.planned_at.slice(0, 10)}</span>
+                    <strong className={trade.enabled === 1 ? 'tone-warning' : trade.realized_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                      {trade.enabled === 1 ? 'Open' : currency(trade.realized_pnl)}
+                    </strong>
+                  </button>
+                ))}
+              </div>
+              <PaginationControls pageData={intakePageData} pageSize={paperPageSize} onPageChange={setIntakePage} onPageSizeChange={setPaperPageSize} />
+            </PaperDeskSection>
+          )}
+        </div>
       </Surface>
     </div>
   )
+}
+
+function paginateRows<T>(rows: T[], page: number, pageSize: number) {
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize))
+  const safePage = Math.min(Math.max(page, 1), totalPages)
+  const start = (safePage - 1) * pageSize
+  return {
+    rows: rows.slice(start, start + pageSize),
+    page: safePage,
+    totalPages,
+    totalRows: rows.length,
+    start: rows.length === 0 ? 0 : start + 1,
+    end: Math.min(start + pageSize, rows.length),
+  }
+}
+
+function PaperDeskSection({
+  icon: Icon,
+  eyebrow,
+  title,
+  countLabel,
+  empty,
+  hasRows,
+  children,
+}: {
+  icon: LucideIcon
+  eyebrow: string
+  title: string
+  countLabel: string
+  empty: string
+  hasRows: boolean
+  children: ReactNode
+}) {
+  return (
+    <div className="paper-tab-panel">
+      <div className="lane-head">
+        <div>
+          <span className="eyebrow">{eyebrow}</span>
+          <h3>{title}</h3>
+        </div>
+        <div className="mini-chip">
+          <Icon size={14} />
+          <span>{countLabel}</span>
+        </div>
+      </div>
+      {hasRows ? children : (
+        <div className="portfolio-empty">
+          <Icon size={20} />
+          <p>{empty}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PaginationControls<T>({
+  pageData,
+  pageSize,
+  onPageChange,
+  onPageSizeChange,
+}: {
+  pageData: ReturnType<typeof paginateRows<T>>
+  pageSize: number
+  onPageChange: (page: number) => void
+  onPageSizeChange: (pageSize: number) => void
+}) {
+  if (pageData.totalRows === 0) return null
+  return (
+    <div className="pagination-bar">
+      <span>
+        {pageData.start}-{pageData.end} of {pageData.totalRows}
+      </span>
+      <div className="pagination-actions">
+        <select className="select-input pagination-size" value={pageSize} onChange={(event) => onPageSizeChange(Number(event.currentTarget.value))}>
+          <option value={10}>10 rows</option>
+          <option value={25}>25 rows</option>
+          <option value={50}>50 rows</option>
+        </select>
+        <button type="button" className="ghost-button" onClick={() => onPageChange(pageData.page - 1)} disabled={pageData.page <= 1}>
+          Previous
+        </button>
+        <strong>{pageData.page} / {pageData.totalPages}</strong>
+        <button type="button" className="ghost-button" onClick={() => onPageChange(pageData.page + 1)} disabled={pageData.page >= pageData.totalPages}>
+          Next
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function buildPaperStrategyRows(trades: PaperTrade[]) {
+  const groups = new Map<string, {
+    strategyId: string
+    strategyLabel: string
+    open: number
+    closed: number
+    wins: number
+    losses: number
+    openPnl: number
+    closedPnl: number
+    returnPctSum: number
+  }>()
+
+  for (const trade of trades) {
+    const strategyId = paperStrategyId(trade) ?? trade.setup_family
+    const row = groups.get(strategyId) ?? {
+      strategyId,
+      strategyLabel: trade.setup_family || strategyLabel(strategyId),
+      open: 0,
+      closed: 0,
+      wins: 0,
+      losses: 0,
+      openPnl: 0,
+      closedPnl: 0,
+      returnPctSum: 0,
+    }
+
+    if (trade.enabled === 1) {
+      row.open += 1
+      row.openPnl += trade.unrealized_pnl
+    } else if (trade.close_reason !== 'removed') {
+      row.closed += 1
+      row.closedPnl += trade.realized_pnl
+      row.returnPctSum += tradeReturnPct(trade.realized_pnl, trade)
+      if (trade.realized_pnl >= 0) row.wins += 1
+      else row.losses += 1
+    }
+    groups.set(strategyId, row)
+  }
+
+  return Array.from(groups.values())
+    .map((row) => ({
+      ...row,
+      avgReturnPct: row.closed > 0 ? row.returnPctSum / row.closed : 0,
+    }))
+    .sort((a, b) => (b.open + b.closed) - (a.open + a.closed) || a.strategyLabel.localeCompare(b.strategyLabel))
+}
+
+function buildWeeklyStrategyRows(trades: PaperTrade[]) {
+  const groups = new Map<string, {
+    weekStart: string
+    strategyId: string
+    strategyLabel: string
+    entries: number
+    active: number
+    closed: number
+    wins: number
+    losses: number
+    closedPnl: number
+    returnPctSum: number
+  }>()
+
+  for (const trade of trades.filter(isSystemPaperTrade)) {
+    const signalDate = paperSignalDate(trade) ?? trade.planned_at.slice(0, 10)
+    const strategyId = paperStrategyId(trade) ?? trade.setup_family
+    const weekStart = tradingWeekStart(signalDate)
+    const key = `${weekStart}|${strategyId}`
+    const row = groups.get(key) ?? {
+      weekStart,
+      strategyId,
+      strategyLabel: trade.setup_family || strategyId,
+      entries: 0,
+      active: 0,
+      closed: 0,
+      wins: 0,
+      losses: 0,
+      closedPnl: 0,
+      returnPctSum: 0,
+    }
+
+    row.entries += 1
+    if (trade.enabled === 1) {
+      row.active += 1
+    } else if (trade.close_reason !== 'removed') {
+      row.closed += 1
+      row.closedPnl += trade.realized_pnl
+      row.returnPctSum += tradeReturnPct(trade.realized_pnl, trade)
+      if (trade.realized_pnl >= 0) row.wins += 1
+      else row.losses += 1
+    }
+    groups.set(key, row)
+  }
+
+  return Array.from(groups.values())
+    .map((row) => ({
+      ...row,
+      avgReturnPct: row.closed > 0 ? row.returnPctSum / row.closed : 0,
+    }))
+    .sort((a, b) => b.weekStart.localeCompare(a.weekStart) || a.strategyLabel.localeCompare(b.strategyLabel))
+}
+
+function tradingWeekStart(signalDate: string) {
+  const date = new Date(`${signalDate}T00:00:00`)
+  if (Number.isNaN(date.getTime())) return signalDate
+  const day = date.getDay()
+  const diff = (day + 6) % 7
+  date.setDate(date.getDate() - diff)
+  return localIsoDate(date)
 }
 
 function strategyLabel(strategyId: string) {
@@ -1636,31 +2507,176 @@ function pct(value: number) {
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+const STRATEGY_ANALYSIS_NOTES: Record<string, {
+  title: string
+  idea: string
+  entry: string
+  exit: string
+  interpretation: string
+  caveat: string
+}> = {
+  'rsi10-pullback-reversion-v1': {
+    title: 'RSI10 Pullback Reversion',
+    idea: 'Mean-reversion setup: buy a sharp pullback only when the stock is still in a long-term uptrend.',
+    entry: 'Close must be above SMA200 and RSI10 must close below 30. The simulated entry is the next session open.',
+    exit: 'Primary exit is RSI10 recovery above 40. The backtest also tracks the 4% stop, 4% target, and 10-session time stop used for risk comparison.',
+    interpretation: 'This strategy is working when RSI40 exits dominate, win rate stays above the baseline, and profit factor stays comfortably above 1.',
+    caveat: 'Paper Desk still tracks this with a stricter 5 trading-session clock, so live forward evidence can differ from the 10-session historical test.',
+  },
+}
+
 function BacktestsView({
   dashboard,
+  cache,
   running,
+  loading,
+  refreshingCache,
+  onLoad,
+  onRefreshCache,
   onRun,
 }: {
   dashboard: BacktestDashboardResponse | null
+  cache: BacktestCacheStatus | null
   running: boolean
+  loading: boolean
+  refreshingCache: boolean
+  onLoad: () => void
+  onRefreshCache: () => void
   onRun: () => void
 }) {
   const [selectedStrategy, setSelectedStrategy] = useState<string>('near-52w-high-v1')
   const [selectedYear, setSelectedYear] = useState<number | null>(null)
+  const [statusFilter, setStatusFilter] = useState('active')
+  const [familyFilter, setFamilyFilter] = useState('all')
+  const [backtestSort, setBacktestSort] = useState('stability')
+  const [backtestSearch, setBacktestSearch] = useState('')
+  const [backtestMode, setBacktestMode] = useState<'datewise' | 'strategy'>('datewise')
+  const [datewise, setDatewise] = useState<BacktestDatewiseResponse | null>(null)
+  const [datewiseDate, setDatewiseDate] = useState('')
+  const [datewiseStrategy, setDatewiseStrategy] = useState('all')
+  const [datewisePage, setDatewisePage] = useState(1)
+  const [datewisePageSize, setDatewisePageSize] = useState(25)
+  const [loadingDatewise, setLoadingDatewise] = useState(false)
 
   useEffect(() => {
-    if (!dashboard?.summaries.length) return
-    const profitableSummaries = dashboard.summaries.filter((summary) => summary.total_pnl > 0)
-    const visibleSummaries = profitableSummaries.length ? profitableSummaries : dashboard.summaries
+    if (!dashboard) return
+    let cancelled = false
+    setLoadingDatewise(true)
+    getBacktestDatewise({
+      date: datewiseDate || undefined,
+      strategy: datewiseStrategy,
+      page: datewisePage,
+      pageSize: datewisePageSize,
+    })
+      .then((payload) => {
+        if (cancelled) return
+        setDatewise(payload)
+        if (!datewiseDate && payload.selected_date) {
+          setDatewiseDate(payload.selected_date)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setDatewise(null)
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingDatewise(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [dashboard, datewiseDate, datewisePage, datewisePageSize, datewiseStrategy])
+
+  const methodFamilies = useMemo(() => {
+    if (!dashboard) return []
+    return Array.from(new Set(dashboard.diagnostics.map((row) => row.method_family))).sort()
+  }, [dashboard])
+  const methodStatuses = useMemo(() => {
+    if (!dashboard) return []
+    return Array.from(new Set(dashboard.diagnostics.map((row) => row.status))).sort()
+  }, [dashboard])
+  const visibleSummaries = useMemo(() => {
+    if (!dashboard) return []
+    const term = backtestSearch.trim().toLowerCase()
+    const diagnosticsById = new Map(dashboard.diagnostics.map((row) => [row.strategy_id, row]))
+    const dayQualityById = new Map(dashboard.day_quality.map((row) => [row.strategy_id, row]))
+    return dashboard.summaries
+      .filter((summary) => {
+        const diagnostic = diagnosticsById.get(summary.strategy_id)
+        const positiveDaysPct = dayQualityById.get(summary.strategy_id)?.positive_days_pct ?? 0
+        const status = diagnostic?.status ?? 'Unknown'
+        const family = diagnostic?.method_family ?? 'Unknown'
+        const matchesStatus =
+          statusFilter === 'all'
+          || (statusFilter === 'quality' && status !== 'Rejected' && summary.win_rate >= 50 && positiveDaysPct >= 50)
+          || (statusFilter === 'active' && status !== 'Rejected')
+          || status === statusFilter
+        const matchesFamily = familyFilter === 'all' || family === familyFilter
+        const label = strategyLabel(summary.strategy_id).toLowerCase()
+        const matchesSearch = !term
+          || summary.strategy_id.toLowerCase().includes(term)
+          || label.includes(term)
+          || family.toLowerCase().includes(term)
+        return matchesStatus && matchesFamily && matchesSearch
+      })
+      .sort((a, b) => {
+        const aDiagnostic = diagnosticsById.get(a.strategy_id)
+        const bDiagnostic = diagnosticsById.get(b.strategy_id)
+        if (backtestSort === 'pnl') return b.total_pnl - a.total_pnl
+        if (backtestSort === 'win') return b.win_rate - a.win_rate
+        if (backtestSort === 'trades') return b.total_trades - a.total_trades
+        if (backtestSort === 'name') return strategyLabel(a.strategy_id).localeCompare(strategyLabel(b.strategy_id))
+        return (bDiagnostic?.stability_score ?? 0) - (aDiagnostic?.stability_score ?? 0)
+      })
+  }, [backtestSearch, backtestSort, dashboard, familyFilter, statusFilter])
+
+  useEffect(() => {
+    if (!visibleSummaries.length) return
     if (!visibleSummaries.some((summary) => summary.strategy_id === selectedStrategy)) {
       setSelectedStrategy(visibleSummaries[0].strategy_id)
     }
-  }, [dashboard, selectedStrategy])
+  }, [selectedStrategy, visibleSummaries])
 
-  if (!dashboard) return <PageSkeleton />
+  if (!dashboard) {
+    return (
+      <div className="page-stack">
+        <Surface>
+          <div className="section-head">
+            <div>
+              <span className="eyebrow">Strategy Lab</span>
+              <h2>Backtest dashboard loads only on button click</h2>
+            </div>
+            <div className="hero-actions">
+              <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache}>
+                <Database size={14} className={refreshingCache ? 'spin' : ''} />
+                <span>{refreshingCache ? 'Refreshing Cache' : 'Refresh Backtest Cache'}</span>
+              </button>
+              <button type="button" className="ghost-button" onClick={onLoad} disabled={loading}>
+                <Database size={14} />
+                <span>{loading ? 'Loading Dashboard' : 'Load Dashboard'}</span>
+              </button>
+              <button type="button" className="primary-button" onClick={onRun} disabled={running}>
+                <RefreshCw size={14} className={running ? 'spin' : ''} />
+                <span>{running ? 'Running Backtest' : 'Run Backtest'}</span>
+              </button>
+            </div>
+          </div>
+          <div className="backtest-run-note">
+            <CircleAlert size={16} />
+            <span>Backtests now run from a ClickHouse feature cache. Refresh the cache only when parquet data or watchlist membership changes.</span>
+          </div>
+          {cache && (
+            <div className="backtest-kpi-grid">
+              <CandidateStat label="Cached Rows" value={cache.cached_rows.toLocaleString('en-IN')} />
+              <CandidateStat label="Symbols" value={cache.symbols.toLocaleString('en-IN')} />
+              <CandidateStat label="From" value={cache.from_date || 'N/A'} />
+              <CandidateStat label="To" value={cache.to_date || 'N/A'} />
+            </div>
+          )}
+        </Surface>
+      </div>
+    )
+  }
 
-  const profitableSummaries = dashboard.summaries.filter((summary) => summary.total_pnl > 0)
-  const visibleSummaries = profitableSummaries.length ? profitableSummaries : dashboard.summaries
   const selectedSummary =
     visibleSummaries.find((summary) => summary.strategy_id === selectedStrategy) ??
     visibleSummaries[0] ??
@@ -1675,7 +2691,21 @@ function BacktestsView({
   const winners = dashboard.winners.filter((row) => row.strategy_id === selectedStrategy).slice(0, 8)
   const losers = dashboard.losers.filter((row) => row.strategy_id === selectedStrategy).slice(0, 8)
   const trades = dashboard.trades.filter((row) => row.strategy_id === selectedStrategy).slice(0, 18)
-  const removedStrategies = dashboard.summaries.length - visibleSummaries.length
+  const visibleStrategyIds = new Set(visibleSummaries.map((summary) => summary.strategy_id))
+  const visibleDiagnostics = dashboard.diagnostics.filter((row) => visibleStrategyIds.has(row.strategy_id))
+  const dayQualityByStrategy = new Map(dashboard.day_quality.map((row) => [row.strategy_id, row]))
+  const dateOptions = datewise?.available_dates ?? []
+  const activeDate = datewise?.selected_date ?? datewiseDate
+  const activeDateIndex = activeDate ? dateOptions.indexOf(activeDate) : -1
+  const datewisePageData = {
+    rows: datewise?.rows ?? [],
+    page: datewise?.page ?? datewisePage,
+    pageSize: datewise?.page_size ?? datewisePageSize,
+    totalRows: datewise?.total_rows ?? 0,
+    totalPages: Math.max(1, Math.ceil((datewise?.total_rows ?? 0) / Math.max(datewise?.page_size ?? datewisePageSize, 1))),
+    start: (datewise?.total_rows ?? 0) === 0 ? 0 : ((datewise?.page ?? datewisePage) - 1) * (datewise?.page_size ?? datewisePageSize) + 1,
+    end: Math.min((datewise?.total_rows ?? 0), (datewise?.page ?? datewisePage) * (datewise?.page_size ?? datewisePageSize)),
+  }
 
   return (
     <div className="page-stack">
@@ -1686,20 +2716,123 @@ function BacktestsView({
             <h2>Backtested swing strategy returns from parquet history</h2>
           </div>
           <div className="hero-actions">
+            <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache || running}>
+              <Database size={14} className={refreshingCache ? 'spin' : ''} />
+              <span>{refreshingCache ? 'Refreshing Cache' : 'Refresh Cache'}</span>
+            </button>
             <button type="button" className="primary-button" onClick={onRun} disabled={running}>
               <RefreshCw size={14} className={running ? 'spin' : ''} />
               <span>{running ? 'Running Backtest' : 'Run Backtest'}</span>
             </button>
             <CandidateStat label="Run" value={dashboard.run_id.replace('watchlist-swing-', '')} />
-            <CandidateStat label="Profitable" value={String(visibleSummaries.length)} />
-            <CandidateStat label="Removed" value={String(Math.max(removedStrategies, 0))} tone={removedStrategies > 0 ? 'warning' : 'neutral'} />
-            <CandidateStat label="Trades Stored" value={String(visibleSummaries.reduce((sum, item) => sum + item.total_trades, 0).toLocaleString('en-IN'))} />
+            <CandidateStat label="Methods" value={String(dashboard.summaries.length)} />
+            <CandidateStat label="Shown" value={String(visibleSummaries.length)} tone={visibleSummaries.length > 0 ? 'positive' : 'warning'} />
+            <CandidateStat label="Trades Stored" value={String(dashboard.summaries.reduce((sum, item) => sum + item.total_trades, 0).toLocaleString('en-IN'))} />
           </div>
         </div>
 
         <div className="backtest-run-note">
           <Database size={16} />
-          <span>Runs use the current parquet files and active watchlist. Positive systems enter the shortlist; weak systems stay in the scorecard as rejected research.</span>
+          <span>Run Backtest refreshes the cache first, dedupes duplicate stock signals, and caps the simulation at 3 new positions per day with Rs 10k per trade.</span>
+        </div>
+
+        {cache && (
+          <div className="backtest-kpi-grid">
+            <CandidateStat label="Cache Rows" value={cache.cached_rows.toLocaleString('en-IN')} />
+            <CandidateStat label="Cache Symbols" value={cache.symbols.toLocaleString('en-IN')} />
+            <CandidateStat label="Cache From" value={cache.from_date || 'N/A'} />
+            <CandidateStat label="Cache To" value={cache.to_date || 'N/A'} />
+          </div>
+        )}
+
+        <div className="backtest-mode-toggle">
+          <button
+            type="button"
+            className={backtestMode === 'datewise' ? 'filter-chip active-ghost' : 'filter-chip'}
+            onClick={() => setBacktestMode('datewise')}
+          >
+            <CalendarDays size={14} />
+            <span>Datewise</span>
+          </button>
+          <button
+            type="button"
+            className={backtestMode === 'strategy' ? 'filter-chip active-ghost' : 'filter-chip'}
+            onClick={() => setBacktestMode('strategy')}
+          >
+            <BarChart3 size={14} />
+            <span>Strategy View</span>
+          </button>
+        </div>
+
+        {backtestMode === 'datewise' ? (
+          <DatewiseBacktestView
+            datewise={datewise}
+            loading={loadingDatewise}
+            dateOptions={dateOptions}
+            activeDate={activeDate}
+            activeDateIndex={activeDateIndex}
+            strategy={datewiseStrategy}
+            pageData={datewisePageData}
+            pageSize={datewisePageSize}
+            onDateChange={(date) => {
+              setDatewiseDate(date)
+              setDatewisePage(1)
+            }}
+            onStrategyChange={(strategy) => {
+              setDatewiseStrategy(strategy)
+              setDatewisePage(1)
+            }}
+            onPageChange={setDatewisePage}
+            onPageSizeChange={(size) => {
+              setDatewisePageSize(size)
+              setDatewisePage(1)
+            }}
+          />
+        ) : (
+          <>
+        <div className="desk-control-panel backtest-control-panel">
+          <label>
+            <span>Show</span>
+            <select className="select-input" value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value)}>
+              <option value="quality">Win & positive days 50%+</option>
+              <option value="active">Active only</option>
+              <option value="all">All methods</option>
+              {methodStatuses.map((status) => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Family</span>
+            <select className="select-input" value={familyFilter} onChange={(event) => setFamilyFilter(event.currentTarget.value)}>
+              <option value="all">All families</option>
+              {methodFamilies.map((family) => (
+                <option key={family} value={family}>{family}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Strategy</span>
+            <select className="select-input" value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.currentTarget.value)}>
+              {visibleSummaries.map((summary) => (
+                <option key={summary.strategy_id} value={summary.strategy_id}>{strategyLabel(summary.strategy_id)}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Sort</span>
+            <select className="select-input" value={backtestSort} onChange={(event) => setBacktestSort(event.currentTarget.value)}>
+              <option value="stability">Stability</option>
+              <option value="pnl">Total P&L</option>
+              <option value="win">Win rate</option>
+              <option value="trades">Trades</option>
+              <option value="name">Name</option>
+            </select>
+          </label>
+          <label className="wide-control">
+            <span>Search</span>
+            <input className="text-input" value={backtestSearch} onChange={(event) => setBacktestSearch(event.currentTarget.value)} placeholder="Strategy or family" />
+          </label>
         </div>
 
         {dashboard.diagnostics.length > 0 && (
@@ -1719,12 +2852,14 @@ function BacktestsView({
                 <span>Method</span>
                 <span>Status</span>
                 <span>Stability</span>
-                <span>Positive Months</span>
+                <span>Win</span>
+                <span>Positive Days</span>
                 <span>Profit Factor</span>
                 <span>P&L</span>
               </div>
-              {dashboard.diagnostics.map((row) => {
+              {visibleDiagnostics.map((row) => {
                 const canOpen = visibleSummaries.some((summary) => summary.strategy_id === row.strategy_id)
+                const positiveDaysPct = dayQualityByStrategy.get(row.strategy_id)?.positive_days_pct ?? 0
                 return (
                   <button
                     key={row.strategy_id}
@@ -1738,7 +2873,8 @@ function BacktestsView({
                     <strong>{strategyLabel(row.strategy_id)}<small>{row.method_family}</small></strong>
                     <span>{row.status}</span>
                     <strong>{row.stability_score.toFixed(1)}</strong>
-                    <span>{row.positive_months_pct.toFixed(2)}%</span>
+                    <span>{row.win_rate.toFixed(2)}%</span>
+                    <span>{positiveDaysPct.toFixed(2)}%</span>
                     <span>{row.profit_factor.toFixed(2)}</span>
                     <strong className={row.total_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.total_pnl)}</strong>
                   </button>
@@ -1761,6 +2897,13 @@ function BacktestsView({
             </button>
           ))}
         </div>
+
+        {!selectedSummary && (
+          <div className="portfolio-empty">
+            <ListTodo size={20} />
+            <p>No backtest methods match the current filters.</p>
+          </div>
+        )}
 
         {selectedSummary && (
           <>
@@ -1816,15 +2959,23 @@ function BacktestsView({
                   </div>
                 </div>
                 <div className="exit-quality-grid">
-                  <CandidateStat label="Target Hits" value={selectedSummary.tp_exits.toLocaleString('en-IN')} tone="positive" />
-                  <CandidateStat label="Stop Loss" value={selectedSummary.sl_exits.toLocaleString('en-IN')} tone="danger" />
-                  <CandidateStat label="Time Exits" value={selectedSummary.time_exits.toLocaleString('en-IN')} tone="warning" />
-                  <CandidateStat label="Worst Day" value={dayQuality ? currency(dayQuality.worst_day) : 'N/A'} tone="danger" />
-                  <CandidateStat label="Best Day" value={dayQuality ? currency(dayQuality.best_day) : 'N/A'} tone="positive" />
+              <CandidateStat label="Target Hits" value={selectedSummary.tp_exits.toLocaleString('en-IN')} tone="positive" />
+              <CandidateStat label="Stop Loss" value={selectedSummary.sl_exits.toLocaleString('en-IN')} tone="danger" />
+              <CandidateStat label="RSI40 Exits" value={(selectedSummary.rsi_exits ?? 0).toLocaleString('en-IN')} tone="positive" />
+              <CandidateStat label="Time Exits" value={selectedSummary.time_exits.toLocaleString('en-IN')} tone="warning" />
+              <CandidateStat label="Worst Day" value={dayQuality ? currency(dayQuality.worst_day) : 'N/A'} tone="danger" />
+              <CandidateStat label="Best Day" value={dayQuality ? currency(dayQuality.best_day) : 'N/A'} tone="positive" />
                   <CandidateStat label="Days Tested" value={dayQuality ? String(dayQuality.trading_days) : 'N/A'} />
                 </div>
               </Surface>
             </div>
+
+            <StrategyAnalysisPanel
+              strategyId={selectedStrategy}
+              summary={selectedSummary}
+              diagnostic={selectedDiagnostic}
+              dayQuality={dayQuality}
+            />
 
             <Surface className="inner-surface backtest-panel monthly-panel">
               <div className="compact-section-head">
@@ -1862,8 +3013,8 @@ function BacktestsView({
             </Surface>
 
             <div className="backtest-grid">
-              <BacktestSymbolList title="Best Stocks" rows={winners} positive />
-              <BacktestSymbolList title="Worst Stocks To Filter" rows={losers} />
+              <BacktestSymbolList title="Best Strategy-Stock Edge" rows={winners} positive />
+              <BacktestSymbolList title="Weak Stock Matches" rows={losers} />
             </div>
 
             <Surface className="inner-surface backtest-panel">
@@ -1899,8 +3050,223 @@ function BacktestsView({
             </Surface>
           </>
         )}
+          </>
+        )}
       </Surface>
     </div>
+  )
+}
+
+function DatewiseBacktestView({
+  datewise,
+  loading,
+  dateOptions,
+  activeDate,
+  activeDateIndex,
+  strategy,
+  pageData,
+  pageSize,
+  onDateChange,
+  onStrategyChange,
+  onPageChange,
+  onPageSizeChange,
+}: {
+  datewise: BacktestDatewiseResponse | null
+  loading: boolean
+  dateOptions: string[]
+  activeDate: string
+  activeDateIndex: number
+  strategy: string
+  pageData: ReturnType<typeof paginateRows<BacktestDatewiseResponse['rows'][number]>>
+  pageSize: number
+  onDateChange: (date: string) => void
+  onStrategyChange: (strategy: string) => void
+  onPageChange: (page: number) => void
+  onPageSizeChange: (pageSize: number) => void
+}) {
+  const summary = datewise?.summary
+  const strategyOptions = datewise?.strategy_options ?? []
+  const canMoveNewer = activeDateIndex > 0
+  const canMoveOlder = activeDateIndex >= 0 && activeDateIndex < dateOptions.length - 1
+
+  return (
+    <>
+      <div className="datewise-toolbar">
+        <div className="datewise-date-nav">
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => onDateChange(dateOptions[0])}
+            disabled={!dateOptions.length || activeDateIndex === 0}
+          >
+            Latest
+          </button>
+          <button
+            type="button"
+            className="ghost-button icon-button-text"
+            onClick={() => onDateChange(dateOptions[activeDateIndex - 1])}
+            disabled={!canMoveNewer}
+          >
+            <ChevronLeft size={14} />
+            <span>Newer</span>
+          </button>
+          <button
+            type="button"
+            className="ghost-button icon-button-text"
+            onClick={() => onDateChange(dateOptions[activeDateIndex + 1])}
+            disabled={!canMoveOlder}
+          >
+            <span>Older</span>
+            <ChevronRight size={14} />
+          </button>
+        </div>
+        <label>
+          <span>Date</span>
+          <select className="select-input" value={activeDate} onChange={(event) => onDateChange(event.currentTarget.value)}>
+            {dateOptions.map((date) => (
+              <option key={date} value={date}>{date}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Strategy</span>
+          <select className="select-input" value={strategy} onChange={(event) => onStrategyChange(event.currentTarget.value)}>
+            <option value="all">All strategies</option>
+            {strategyOptions.map((strategyId) => (
+              <option key={strategyId} value={strategyId}>{strategyLabel(strategyId)}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {loading && (
+        <div className="backtest-run-note">
+          <RefreshCw size={16} className="spin" />
+          <span>Loading date bucket...</span>
+        </div>
+      )}
+
+      {summary ? (
+        <>
+          <div className="backtest-kpi-grid datewise-kpi-grid">
+            <CandidateStat label="Date P&L" value={currency(summary.total_pnl)} tone={summary.total_pnl >= 0 ? 'positive' : 'danger'} />
+            <CandidateStat label="Trades" value={summary.total_trades.toLocaleString('en-IN')} />
+            <CandidateStat label="Win Rate" value={`${summary.win_rate.toFixed(2)}%`} tone={summary.win_rate >= 50 ? 'positive' : 'warning'} />
+            <CandidateStat label="Avg Trade" value={pct(summary.avg_return_pct)} tone={summary.avg_return_pct >= 0 ? 'positive' : 'danger'} />
+            <CandidateStat label="Winners" value={summary.winners.toLocaleString('en-IN')} tone="positive" />
+            <CandidateStat label="Losers" value={summary.losers.toLocaleString('en-IN')} tone="danger" />
+            <CandidateStat label="Top Gainer" value={`${summary.best_symbol || 'N/A'} ${currency(summary.best_pnl)}`} tone={summary.best_pnl >= 0 ? 'positive' : 'neutral'} />
+            <CandidateStat label="Top Loser" value={`${summary.worst_symbol || 'N/A'} ${currency(summary.worst_pnl)}`} tone={summary.worst_pnl < 0 ? 'danger' : 'neutral'} />
+          </div>
+
+          <Surface className="inner-surface datewise-panel">
+            <div className="compact-section-head">
+              <div>
+                <span className="eyebrow">Strategy Buckets</span>
+                <h2>{summary.trade_date} P&L by method</h2>
+              </div>
+              <div className="mini-chip">
+                <Target size={14} />
+                <span>{(datewise?.strategy_summaries.length ?? 0).toLocaleString('en-IN')} active strategies</span>
+              </div>
+            </div>
+            <div className="datewise-strategy-table">
+              <div className="datewise-strategy-row datewise-strategy-head">
+                <span>Strategy</span>
+                <span>Trades</span>
+                <span>Win</span>
+                <span>P&L</span>
+                <span>Best</span>
+                <span>Worst</span>
+              </div>
+              {(datewise?.strategy_summaries ?? []).map((row) => (
+                <div key={row.strategy_id} className="datewise-strategy-row">
+                  <strong>{strategyLabel(row.strategy_id)}<small>{row.setup_family}</small></strong>
+                  <span>{row.trades.toLocaleString('en-IN')}</span>
+                  <span>{row.win_rate.toFixed(2)}%</span>
+                  <strong className={row.pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.pnl)}</strong>
+                  <span>{row.best_symbol}<small className={row.best_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.best_pnl)}</small></span>
+                  <span>{row.worst_symbol}<small className={row.worst_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.worst_pnl)}</small></span>
+                </div>
+              ))}
+            </div>
+          </Surface>
+
+          <div className="backtest-grid">
+            <DatewiseMoverList title="Top Gainers" rows={datewise?.top_gainers ?? []} positive />
+            <DatewiseMoverList title="Top Losers" rows={datewise?.top_losers ?? []} />
+          </div>
+
+          <Surface className="inner-surface datewise-panel">
+            <div className="compact-section-head">
+              <div>
+                <span className="eyebrow">Date Trade Log</span>
+                <h2>Paginated entries for {summary.trade_date}</h2>
+              </div>
+            </div>
+            <div className="trade-log-table datewise-trade-log">
+              <div className="trade-log-row datewise-trade-row trade-log-head">
+                <span>Stock</span>
+                <span>Entry</span>
+                <span>Exit</span>
+                <span>Qty</span>
+                <span>P&L</span>
+                <span>Reason</span>
+              </div>
+              {pageData.rows.map((trade) => (
+                <div key={`${trade.strategy_id}-${trade.symbol}-${trade.entry_date}-${trade.exit_date}-${trade.pnl}`} className="trade-log-row datewise-trade-row">
+                  <strong>{trade.symbol}<small>{strategyLabel(trade.strategy_id)}</small></strong>
+                  <span>{trade.entry_date}<small>signal {trade.signal_date} | {currency(trade.entry_price)}</small></span>
+                  <span>{trade.exit_date}<small>{currency(trade.exit_price)}</small></span>
+                  <span>{trade.quantity}</span>
+                  <strong className={trade.pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
+                    {currency(trade.pnl)}
+                    <small>{pct(trade.return_pct)}</small>
+                  </strong>
+                  <span>{trade.exit_reason}<small>{trade.hold_sessions} sessions | score {trade.score}</small></span>
+                </div>
+              ))}
+            </div>
+            <PaginationControls pageData={pageData} pageSize={pageSize} onPageChange={onPageChange} onPageSizeChange={onPageSizeChange} />
+          </Surface>
+        </>
+      ) : (
+        <div className="portfolio-empty datewise-empty">
+          <CalendarDays size={20} />
+          <p>No trades found for this date bucket.</p>
+        </div>
+      )}
+    </>
+  )
+}
+
+function DatewiseMoverList({
+  title,
+  rows,
+  positive = false,
+}: {
+  title: string
+  rows: BacktestDatewiseResponse['rows']
+  positive?: boolean
+}) {
+  return (
+    <Surface className="inner-surface datewise-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">{positive ? 'Best of day' : 'Weakest of day'}</span>
+          <h2>{title}</h2>
+        </div>
+      </div>
+      <div className="datewise-mover-list">
+        {rows.map((row) => (
+          <div key={`${title}-${row.strategy_id}-${row.symbol}-${row.entry_date}-${row.pnl}`} className="datewise-mover-row">
+            <strong>{row.symbol}<small>{strategyLabel(row.strategy_id)}</small></strong>
+            <span>{row.entry_date}<small>{row.exit_reason}</small></span>
+            <strong className={row.pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.pnl)}<small>{pct(row.return_pct)}</small></strong>
+          </div>
+        ))}
+      </div>
+    </Surface>
   )
 }
 
@@ -1931,6 +3297,83 @@ function BacktestSymbolList({
             <span className={row.avg_return_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.avg_return_pct)}</span>
           </div>
         ))}
+        {rows.length === 0 && (
+          <div className="symbol-result-row symbol-result-empty">
+            <span>Need at least 5 trades on a stock for this strategy before calling it an edge.</span>
+          </div>
+        )}
+      </div>
+    </Surface>
+  )
+}
+
+function StrategyAnalysisPanel({
+  strategyId,
+  summary,
+  diagnostic,
+  dayQuality,
+}: {
+  strategyId: string
+  summary: BacktestRunSummary
+  diagnostic?: BacktestStrategyDiagnostic
+  dayQuality?: BacktestDayQuality
+}) {
+  const note = STRATEGY_ANALYSIS_NOTES[strategyId]
+  if (!note) return null
+
+  const rsiExitShare = summary.total_trades > 0 ? ((summary.rsi_exits ?? 0) / summary.total_trades) * 100 : 0
+  const stopShare = summary.total_trades > 0 ? (summary.sl_exits / summary.total_trades) * 100 : 0
+  const verdict = (diagnostic?.profit_factor ?? 0) >= 1.4 && summary.win_rate >= 60
+    ? 'Historically constructive'
+    : (diagnostic?.profit_factor ?? 0) > 1
+      ? 'Positive but needs forward evidence'
+      : 'Research only'
+
+  return (
+    <Surface className="inner-surface strategy-analysis-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Strategy Breakdown</span>
+          <h2>{note.title}</h2>
+        </div>
+        <div className="mini-chip">
+          <ShieldCheck size={14} />
+          <span>{verdict}</span>
+        </div>
+      </div>
+      <div className="strategy-analysis-grid">
+        <div className="strategy-rule-card">
+          <span className="micro-label">How it works</span>
+          <p>{note.idea}</p>
+          <div className="strategy-rule-steps">
+            <div>
+              <strong>Entry</strong>
+              <span>{note.entry}</span>
+            </div>
+            <div>
+              <strong>Exit</strong>
+              <span>{note.exit}</span>
+            </div>
+            <div>
+              <strong>Read</strong>
+              <span>{note.interpretation}</span>
+            </div>
+          </div>
+        </div>
+        <div className="strategy-rule-card">
+          <span className="micro-label">Latest run analysis</span>
+          <div className="strategy-analysis-metrics">
+            <CandidateStat label="Trades" value={summary.total_trades.toLocaleString('en-IN')} />
+            <CandidateStat label="P&L" value={currency(summary.total_pnl)} tone={summary.total_pnl >= 0 ? 'positive' : 'danger'} />
+            <CandidateStat label="Win Rate" value={`${summary.win_rate.toFixed(2)}%`} tone={summary.win_rate >= 55 ? 'positive' : 'warning'} />
+            <CandidateStat label="Profit Factor" value={diagnostic ? diagnostic.profit_factor.toFixed(2) : 'N/A'} tone={(diagnostic?.profit_factor ?? 0) >= 1.2 ? 'positive' : 'warning'} />
+            <CandidateStat label="RSI Exit Share" value={`${rsiExitShare.toFixed(1)}%`} tone={rsiExitShare >= 50 ? 'positive' : 'warning'} />
+            <CandidateStat label="Stop Share" value={`${stopShare.toFixed(1)}%`} tone={stopShare <= 20 ? 'positive' : 'warning'} />
+            <CandidateStat label="Positive Days" value={dayQuality ? `${dayQuality.positive_days_pct.toFixed(2)}%` : 'N/A'} tone={(dayQuality?.positive_days_pct ?? 0) >= 55 ? 'positive' : 'warning'} />
+            <CandidateStat label="Avg Hold" value={`${summary.avg_hold_sessions.toFixed(1)} sessions`} />
+          </div>
+          <p className="strategy-analysis-note">{note.caveat}</p>
+        </div>
       </div>
     </Surface>
   )
@@ -2188,11 +3631,13 @@ export default function App() {
   const [home, setHome] = useState<SwingHomeResponse | null>(null)
   const [scanner, setScanner] = useState<SwingScannerResponse | null>(null)
   const [historicalScreener, setHistoricalScreener] = useState<HistoricalScreenerResponse | null>(null)
+  const [freshSignals, setFreshSignals] = useState<FreshSignalsResponse | null>(null)
   const [bambooLatest, setBambooLatest] = useState<BambooLatestResponse | null>(null)
   const [accounts, setAccounts] = useState<BrokerAccountSnapshot[]>([])
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([])
   const [paperBudget, setPaperBudget] = useState<PaperBudget | null>(null)
   const [backtests, setBacktests] = useState<BacktestDashboardResponse | null>(null)
+  const [backtestCache, setBacktestCache] = useState<BacktestCacheStatus | null>(null)
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(initialRoute.symbol)
   const [detailCandidate, setDetailCandidate] = useState<SwingCandidate | null>(null)
   const [history, setHistory] = useState<SymbolHistoryResponse | null>(null)
@@ -2200,6 +3645,10 @@ export default function App() {
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [runningBacktest, setRunningBacktest] = useState(false)
+  const [loadingBacktestDashboard, setLoadingBacktestDashboard] = useState(false)
+  const [refreshingBacktestCache, setRefreshingBacktestCache] = useState(false)
+  const [stagingFresh, setStagingFresh] = useState(false)
+  const [refreshingFeatureCache, setRefreshingFeatureCache] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const autoClosingSymbols = useRef(new Set<string>())
@@ -2230,48 +3679,132 @@ export default function App() {
     setRefreshing(true)
     setError('')
     try {
-      const [homeData, scannerData, screenerData, bambooData, accountData, paperTradeData, paperBudgetData, backtestData] = await Promise.all([
+      const [homeData, scannerData, bambooData, accountData, nextPaperTrades, nextPaperBudget] = await Promise.all([
         getSwingHome(),
         getSwingScanner(28),
-        getHistoricalScreener({ limit: 80, setup: 'all', minPrice: 80, minAvgVolume: 100000 }),
         getBambooLatest().catch(() => null),
         getBrokerAccounts().catch(() => []),
         getPaperTrades().catch(() => []),
         getPaperBudget().catch(() => null),
-        getBacktestDashboard().catch(() => null),
       ])
       startTransition(() => {
         setHome(homeData)
         setScanner(scannerData)
-        setHistoricalScreener(screenerData)
         setBambooLatest(bambooData)
         setAccounts(accountData)
-        setPaperTrades(paperTradeData)
-        setPaperBudget(paperBudgetData)
-        setBacktests(backtestData)
+        setPaperTrades(nextPaperTrades)
+        setPaperBudget(nextPaperBudget)
         const defaultSymbol =
           selectedSymbol ??
-          screenerData.rows[0]?.symbol ??
+          freshSignals?.rows[0]?.symbol ??
+          historicalScreener?.rows[0]?.symbol ??
           bambooData?.top_signals[0]?.symbol ??
           homeData.top_candidates[0]?.symbol ??
           scannerData.candidates[0]?.symbol ??
           watchlist[0]?.symbol ??
-          paperTradeData.find((trade) => trade.enabled === 1)?.symbol ??
+          nextPaperTrades.find((trade) => trade.enabled === 1)?.symbol ??
           null
         setSelectedSymbol(defaultSymbol)
       })
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     } finally {
       setRefreshing(false)
     }
   }
 
+  const stageFreshNow = async () => {
+    setStagingFresh(true)
+    setError('')
+    try {
+      const freshSignalData = await stageFreshSignals({ limit: AUTO_PAPER_MAX_SUGGESTIONS, minPrice: 80, minAvgVolume: 100000 })
+      const screenerData: HistoricalScreenerResponse = {
+        updated_at: freshSignalData.updated_at,
+        range: '1y',
+        signal_date: freshSignalData.signal_date,
+        total_rows: freshSignalData.eligible_rows,
+        rows: freshSignalData.rows,
+        message: freshSignalData.message,
+      }
+      const [nextPaperTrades, nextPaperBudget] = await Promise.all([
+        getPaperTrades().catch(() => []),
+        getPaperBudget().catch(() => null),
+      ])
+      startTransition(() => {
+        setFreshSignals(freshSignalData)
+        setHistoricalScreener(screenerData)
+        setPaperTrades(nextPaperTrades)
+        setPaperBudget(nextPaperBudget)
+        if (!selectedSymbol && freshSignalData.rows[0]?.symbol) {
+          setSelectedSymbol(freshSignalData.rows[0].symbol)
+        }
+      })
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setStagingFresh(false)
+    }
+  }
+
+  const refreshFeatureCacheNow = async () => {
+    setRefreshingFeatureCache(true)
+    setError('')
+    try {
+      const result = await refreshFeatureCache()
+      setFreshSignals((current) => current
+        ? {
+            ...current,
+            updated_at: result.updated_at,
+            signal_date: result.data_date ?? current.signal_date,
+            message: result.message,
+          }
+        : current)
+      setHistoricalScreener((current) => current
+        ? {
+            ...current,
+            updated_at: result.updated_at,
+            signal_date: result.data_date ?? current.signal_date,
+            total_rows: result.cached_rows || current.total_rows,
+            message: result.message,
+          }
+        : current)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRefreshingFeatureCache(false)
+    }
+  }
+
+  const loadBacktestDashboard = async () => {
+    setLoadingBacktestDashboard(true)
+    setError('')
+    try {
+      const dashboard = await getBacktestDashboard()
+      setBacktests(dashboard)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setLoadingBacktestDashboard(false)
+    }
+  }
+
+  const refreshBacktestCacheNow = async () => {
+    setRefreshingBacktestCache(true)
+    setError('')
+    try {
+      const result = await refreshBacktestCache()
+      setBacktestCache(result.cache)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRefreshingBacktestCache(false)
+    }
+  }
+
   useEffect(() => {
-    refreshAll()
-    const timer = setInterval(refreshAll, 60_000)
-    return () => clearInterval(timer)
-  }, [])
+    if (view !== 'backtests' || backtests || loadingBacktestDashboard) return
+    void loadBacktestDashboard()
+  }, [view, backtests, loadingBacktestDashboard])
 
   useEffect(() => {
     if (!selectedSymbol) return
@@ -2330,31 +3863,16 @@ export default function App() {
 
   const addToPaperDesk = async (candidate: SwingCandidate) => {
     if (!canSendToPaper(candidate)) {
-      setError(`${candidate.symbol} is ${candidate.live_signal.label}; Paper Desk only accepts Enter Now signals.`)
+      setError(`${candidate.symbol} needs a valid entry price and stop loss before it can go to Paper Desk.`)
       return
     }
-    const quantity = quantityForCapital(candidate.last_price)
-    const tradePayload = {
-      symbol: candidate.symbol,
-      company_name: candidate.company_name,
-      setup_family: candidate.setup_family,
-      bias: candidate.bias,
-      entry_price: candidate.last_price,
-      quantity,
-      max_sessions: maxSessionsFromHold(candidate.expected_hold),
-      capital_allocated: PAPER_CAPITAL_PER_STOCK,
-      stop_loss: candidate.stop_loss,
-      target_price: candidate.target_price,
-      expected_hold: candidate.expected_hold,
-      thesis: candidate.thesis,
-      notes: candidate.reasons.join(' '),
-    }
+    const tradePayload = paperTradePayloadFromCandidate(candidate, 'Manual paper-stage.')
     setWatchlist((current) => upsertCandidate(current, candidate))
     try {
       const saved = await savePaperTrade(tradePayload)
       setPaperTrades((current) => [saved, ...current.filter((trade) => trade.symbol !== saved.symbol)])
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     }
   }
 
@@ -2367,7 +3885,7 @@ export default function App() {
     try {
       await deletePaperTrade(symbol)
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     }
   }
 
@@ -2380,7 +3898,7 @@ export default function App() {
       })
       setPaperTrades((current) => [closed, ...current.filter((item) => item.symbol !== closed.symbol)])
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     } finally {
       autoClosingSymbols.current.delete(trade.symbol)
     }
@@ -2393,7 +3911,7 @@ export default function App() {
       const nextBudget = await getPaperBudget().catch(() => null)
       if (nextBudget) setPaperBudget(nextBudget)
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     }
   }
 
@@ -2402,9 +3920,10 @@ export default function App() {
     setError('')
     try {
       const result = await runBacktest()
+      setBacktestCache(result.cache)
       setBacktests(result.dashboard)
     } catch (err) {
-      setError(String(err))
+      setError(errorMessage(err))
     } finally {
       setRunningBacktest(false)
     }
@@ -2414,10 +3933,16 @@ export default function App() {
     if (!scanner || paperTrades.length === 0) return
     const candidatesBySymbol = new Map(scanner.candidates.map((candidate) => [candidate.symbol, candidate]))
     paperTrades
-      .filter((trade) => isTradeExpired(trade) && !autoClosingSymbols.current.has(trade.symbol))
+      .filter((trade) => (isTradeStopped(trade) || isTradeTargetHit(trade) || isTradeExpired(trade)) && !autoClosingSymbols.current.has(trade.symbol))
       .forEach((trade) => {
         const candidate = candidatesBySymbol.get(trade.symbol)
-        void closePaperPlan(trade, trade.current_price ?? candidate?.last_price ?? trade.entry_price, `auto-closed after ${trade.max_sessions} sessions`)
+        const stopped = isTradeStopped(trade)
+        const targetHit = isTradeTargetHit(trade)
+        void closePaperPlan(
+          trade,
+          stopped ? trade.stop_loss : targetHit ? trade.target_price : trade.current_price ?? candidate?.last_price ?? trade.entry_price,
+          stopped ? 'stop-loss' : targetHit ? 'target-hit' : `auto-closed after ${trade.max_sessions} trading sessions`,
+        )
       })
   }, [scanner, paperTrades])
 
@@ -2540,7 +4065,7 @@ export default function App() {
             {updatedAt && <div className="mini-chip">Updated {compactDate(updatedAt)}</div>}
             <button type="button" className="ghost-button" onClick={refreshAll} disabled={refreshing}>
               <RefreshCw size={14} className={refreshing ? 'spin' : ''} />
-              <span>{refreshing ? 'Refreshing' : 'Refresh'}</span>
+              <span>{refreshing ? 'Loading' : 'Load Workspace'}</span>
             </button>
           </div>
         </header>
@@ -2580,9 +4105,14 @@ export default function App() {
               <ScannerView
                 scanner={scanner}
                 historicalScreener={historicalScreener}
+                freshSignals={freshSignals}
                 bambooLatest={bambooLatest}
                 selectedSymbol={selectedSymbol}
                 onSelect={openStock}
+                onStageFresh={stageFreshNow}
+                onRefreshCache={refreshFeatureCacheNow}
+                stagingFresh={stagingFresh}
+                refreshingCache={refreshingFeatureCache}
               />
             )}
             {view === 'watchlist' && (
@@ -2605,7 +4135,18 @@ export default function App() {
                 onUpdate={updatePaperPlan}
               />
             )}
-            {view === 'backtests' && <BacktestsView dashboard={backtests} running={runningBacktest} onRun={runBacktestNow} />}
+            {view === 'backtests' && (
+              <BacktestsView
+                dashboard={backtests}
+                cache={backtestCache}
+                running={runningBacktest}
+                loading={loadingBacktestDashboard}
+                refreshingCache={refreshingBacktestCache}
+                onLoad={loadBacktestDashboard}
+                onRefreshCache={refreshBacktestCacheNow}
+                onRun={runBacktestNow}
+              />
+            )}
             {view === 'research' && <ResearchView setupMix={home?.setup_mix ?? []} bambooLatest={bambooLatest} onSelect={openStock} />}
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}
             {view === 'stock' && (

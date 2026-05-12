@@ -1,0 +1,49 @@
+{
+  "id": "trend-reversal-failed-breakdown-v1",
+  "name": "Trend Reversal Failed Breakdown V1",
+  "description": "Research-only reversal breakout setup: a liquid stock undercuts its prior 20-day low, reclaims that level and SMA20, and closes strong.",
+  "enabled": true,
+  "status": "research-only",
+  "research_summary": {
+    "source": "docs/quant_research_outputs/trend_reversal_breakout",
+    "base_profit_factor": 1.226,
+    "base_expectancy_pct": 0.514,
+    "out_of_sample_profit_factor": 0.412,
+    "warning": "Focused Python research found a weak out-of-sample result. This is included in app backtests for monitoring, not promotion."
+  },
+  "universe": {
+    "source": "watchlist",
+    "market": "NSE equities",
+    "min_price": 50,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "Trend Reversal Breakout",
+    "min_score": 74,
+    "entry_price": "next_open",
+    "rules": [
+      "day low undercuts prior 20-day low",
+      "close reclaims prior 20-day low",
+      "close reclaims SMA20",
+      "prior close was at or below prior SMA20",
+      "volume ratio >= 0.9",
+      "close location >= 70% of candle range"
+    ]
+  },
+  "exit": {
+    "take_profit_pct": 6,
+    "stop_loss_pct": 4,
+    "max_hold_sessions": 8,
+    "exit_price": "conservative_ohlc",
+    "same_day_conflict": "stop_first"
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 5,
+    "paper_test_only": true
+  },
+  "notes": [
+    "This strategy family is not approved for live trading.",
+    "Use app backtests to monitor whether the pattern improves after more data."
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "rsi10-pullback-reversion-v1",
+  "name": "RSI10 Pullback Reversion V1",
+  "description": "Larry Connors inspired pullback strategy: trade long only in a long-term uptrend when RSI10 closes below 30, then exit when RSI10 recovers above 40 or after 10 trading sessions.",
+  "enabled": true,
+  "source": {
+    "kind": "youtube",
+    "title": "RSI10 pullback strategy transcript shared by user",
+    "url": "https://www.youtube.com/watch?v=W8ENIXvcGlQ",
+    "credit": "Larry Connors concept as described in the training video"
+  },
+  "universe": {
+    "source": "watchlist",
+    "market": "NSE equities",
+    "min_price": 80,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "RSI10 Pullback Reversion",
+    "trend_filter": "close_above_sma200",
+    "rsi_period": 10,
+    "rsi_below": 30,
+    "entry_price": "next_open"
+  },
+  "exit": {
+    "primary": "rsi10_crosses_above_40",
+    "time_stop_sessions": 10,
+    "exit_price": "next_open_after_exit_signal",
+    "paper_proxy": {
+      "take_profit_pct": 4,
+      "stop_loss_pct": 4,
+      "max_hold_sessions": 5
+    }
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 7
+  },
+  "notes": [
+    "Original video describes S&P 500 above 200DMA, RSI10 below 30, next-open entry, exit on RSI10 above 40 or after 10 trading days.",
+    "This implementation adapts the long-term uptrend filter to individual stocks using close above SMA200 because the app scans NSE watchlist stocks."
+  ]
+}

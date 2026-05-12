@@ -1,0 +1,24 @@
+[
+  {
+    "strategy": "atr_stretch_liquid_only_python",
+    "reasons": "No hard-fail in summary gates; still requires manual review, walk-forward inspection, and paper trading.",
+    "trades": 362,
+    "trades_per_week": 1.525,
+    "trades_per_month": 6.63,
+    "win_rate": 58.56,
+    "loss_rate": 41.44,
+    "profit_factor": 1.873,
+    "total_return_proxy_pct": 31.87,
+    "max_drawdown_proxy_pct": -4.12,
+    "avg_win_pct": 5.633,
+    "avg_loss_pct": -4.251,
+    "expectancy_pct": 1.538,
+    "sharpe_trade": 4.142,
+    "sortino_trade": 10.675,
+    "longest_win_streak": 12,
+    "longest_loss_streak": 9,
+    "avg_hold_days": 4.95,
+    "best_year": 2026,
+    "worst_year": 2025
+  }
+]

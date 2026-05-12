@@ -371,7 +371,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr14"] = tr.groupby(df["symbol"]).rolling(14, min_periods=10).mean().reset_index(level=0, drop=True)
     for n in [5, 10, 20, 50, 100, 200]:
         df[f"sma{n}"] = g["close"].transform(lambda s, n=n: s.rolling(n, min_periods=max(5, n // 2)).mean())
-    for n in [20, 50, 100]:
+    for n in [20, 50, 100, 200]:
         df[f"ema{n}"] = g["close"].transform(lambda s, n=n: s.ewm(span=n, adjust=False, min_periods=max(5, n // 2)).mean())
     delta = g["close"].diff()
     gain = delta.clip(lower=0)
@@ -384,9 +384,49 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         gain.groupby(df["symbol"]).rolling(2, min_periods=2).mean().reset_index(level=0, drop=True)
         / loss.groupby(df["symbol"]).rolling(2, min_periods=2).mean().reset_index(level=0, drop=True).replace(0, np.nan)
     )))
+    for n in [5, 20, 60, 120]:
+        df[f"ret{n}"] = df["close"] / g["close"].shift(n) - 1
+    df["returns_1"] = df["ret1"]
+    df["returns_5"] = df["ret5"]
+    df["returns_20"] = df["ret20"]
     df["vol20"] = g["volume"].transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["traded_value"] = df["close"] * df["volume"]
+    df["adv20"] = g["traded_value"].transform(lambda s: s.rolling(20, min_periods=10).mean())
     df["relvol"] = df["volume"] / df["vol20"].replace(0, np.nan)
+    df["volume_ratio"] = df["relvol"]
+    df["rolling_vol_20"] = g["ret1"].transform(lambda s: s.rolling(20, min_periods=10).std(ddof=0))
     df["range_pct"] = (df["high"] - df["low"]) / df["close"]
+    df["atr_pct"] = df["atr14"] / df["close"].replace(0, np.nan)
+    up_move = g["high"].diff()
+    down_move = -g["low"].diff()
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+    plus_di14 = 100 * plus_dm.groupby(df["symbol"]).rolling(14, min_periods=10).mean().reset_index(level=0, drop=True) / df["atr14"].replace(0, np.nan)
+    minus_di14 = 100 * minus_dm.groupby(df["symbol"]).rolling(14, min_periods=10).mean().reset_index(level=0, drop=True) / df["atr14"].replace(0, np.nan)
+    dx14 = 100 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14).replace(0, np.nan)
+    df["adx14"] = dx14.groupby(df["symbol"]).rolling(14, min_periods=10).mean().reset_index(level=0, drop=True)
+    df["adx14_rising"] = df["adx14"] > g["adx14"].shift(5)
+    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["close_location"] = (df["close"] - df["low"]) / candle_range
+    df["dist_ema20_atr"] = (df["close"] - df["ema20"]) / df["atr14"].replace(0, np.nan)
+    df["prev_close"] = prev_close
+    df["prev_sma20"] = g["sma20"].shift(1)
+    df["prev_sma50"] = g["sma50"].shift(1)
+    df["prev_sma100"] = g["sma100"].shift(1)
+    df["prev_sma200"] = g["sma200"].shift(1)
+    df["reclaim_sma20"] = (df["close"] > df["sma20"]) & (df["prev_close"] <= df["prev_sma20"])
+    df["reclaim_sma50"] = (df["close"] > df["sma50"]) & (df["prev_close"] <= df["prev_sma50"])
+    df["reclaim_sma100"] = (df["close"] > df["sma100"]) & (df["prev_close"] <= df["prev_sma100"])
+    df["reclaim_sma200"] = (df["close"] > df["sma200"]) & (df["prev_close"] <= df["prev_sma200"])
+    df["was_below_sma50_20"] = (df["close"] < df["sma50"]).groupby(df["symbol"]).transform(lambda s: s.rolling(20, min_periods=10).max()).fillna(0).astype(bool)
+    df["was_below_sma100_30"] = (df["close"] < df["sma100"]).groupby(df["symbol"]).transform(lambda s: s.rolling(30, min_periods=15).max()).fillna(0).astype(bool)
+    df["was_below_sma200_60"] = (df["close"] < df["sma200"]).groupby(df["symbol"]).transform(lambda s: s.rolling(60, min_periods=30).max()).fillna(0).astype(bool)
     df["range7_min"] = g["range_pct"].transform(lambda s: s.rolling(7, min_periods=7).min())
     prior_high = g["high"].shift(1)
     prior_low = g["low"].shift(1)
@@ -394,12 +434,31 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["prior_low20"] = prior_low.groupby(df["symbol"]).rolling(20, min_periods=10).min().reset_index(level=0, drop=True)
     df["prior_high55"] = prior_high.groupby(df["symbol"]).rolling(55, min_periods=30).max().reset_index(level=0, drop=True)
     df["prior_low55"] = prior_low.groupby(df["symbol"]).rolling(55, min_periods=30).min().reset_index(level=0, drop=True)
+    df["prior_high252"] = prior_high.groupby(df["symbol"]).rolling(252, min_periods=120).max().reset_index(level=0, drop=True)
+    df["prior_low252"] = prior_low.groupby(df["symbol"]).rolling(252, min_periods=120).min().reset_index(level=0, drop=True)
     df["bb_mid20"] = df["sma20"]
     df["bb_std20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=20).std())
     df["bb_upper"] = df["bb_mid20"] + 2 * df["bb_std20"]
     df["bb_lower"] = df["bb_mid20"] - 2 * df["bb_std20"]
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid20"]
     df["bb_width_q20"] = g["bb_width"].transform(lambda s: s.rolling(120, min_periods=60).quantile(0.2))
+    df["zscore_20"] = (df["close"] - df["sma20"]) / df["bb_std20"].replace(0, np.nan)
+    df["rs60_rank"] = df.groupby("trade_date")["ret60"].rank(pct=True)
+    df["rs120_rank"] = df.groupby("trade_date")["ret120"].rank(pct=True)
+    df["market_ret1"] = df.groupby("trade_date")["ret1"].transform("mean")
+    df["market_breadth50"] = (df["close"] > df["sma50"]).groupby(df["trade_date"]).transform("mean")
+    df["market_breadth200"] = (df["close"] > df["sma200"]).groupby(df["trade_date"]).transform("mean")
+    df["market_vol20"] = df.groupby("trade_date")["ret1"].transform(lambda s: s.std(ddof=0))
+    df["liquid_research"] = (df["close"] >= 50) & (df["vol20"] >= 100000) & (df["adv20"] >= 20_000_000)
+    vol_q25 = g["rolling_vol_20"].transform(lambda s: s.rolling(252, min_periods=60).quantile(0.25))
+    vol_q75 = g["rolling_vol_20"].transform(lambda s: s.rolling(252, min_periods=60).quantile(0.75))
+    price_near_sma50 = (df["close"] / df["sma50"].replace(0, np.nan) - 1).abs() < 0.03
+    df["trend_regime"] = "sideways"
+    df.loc[(df["close"] > df["ema50"]) & (df["ema50"] > df["ema200"]) & (df["adx14"] >= 20) & df["adx14_rising"], "trend_regime"] = "trending"
+    df.loc[(df["adx14"] < 18) & price_near_sma50, "trend_regime"] = "sideways"
+    df["volatility_regime"] = "normal"
+    df.loc[df["rolling_vol_20"] <= vol_q25, "volatility_regime"] = "low"
+    df.loc[(df["rolling_vol_20"] >= vol_q75) | (df["atr_pct"] >= 0.08), "volatility_regime"] = "high"
     df["next_open"] = g["open"].shift(-1)
     df["year"] = df["trade_date"].dt.year
     df["dow"] = df["trade_date"].dt.day_name()
@@ -497,6 +556,105 @@ def make_strategies() -> list[StrategySpec]:
             3.2,
             12,
             lambda d: (d.close > d.prior_high55) & (d.ema20 > d.ema50) & (d.ema50 > d.ema100) & (d.relvol > 1.8) & d.gap_pct.between(-1, 2),
+        ),
+        StrategySpec(
+            "rs_leader_ema20_pullback",
+            "Relative strength pullback",
+            "Liquid top-RS stocks pull back to EMA20 while market breadth is constructive.",
+            1.3,
+            2.4,
+            8,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.45) & (d.rs60_rank > 0.75) & (d.close > d.sma200) & (d.ema20 > d.ema50) & (d.close <= d.ema20 * 1.01) & (d.close >= d.ema20 * 0.96) & d.rsi14.between(40, 60) & (d.relvol < 1.3),
+        ),
+        StrategySpec(
+            "near_52w_rs_pullback",
+            "Leadership pullback",
+            "Liquid relative-strength stocks near 52-week highs pause near SMA20 without being extended.",
+            1.4,
+            2.8,
+            12,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.45) & (d.rs120_rank > 0.80) & (d.close > d.sma200) & (d.close / d.prior_high252 > 0.85) & (d.close <= d.sma20 * 1.015) & (d.close >= d.sma20 * 0.95) & (d.dist_ema20_atr < 1.2) & d.relvol.between(0.5, 1.4),
+        ),
+        StrategySpec(
+            "failed_breakdown_reclaim20",
+            "Failed breakdown reversal",
+            "Liquid uptrend stock undercuts prior 20-day low but closes back above it with strong close location.",
+            1.2,
+            2.3,
+            7,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.40) & (d.close > d.sma200) & (d.low < d.prior_low20) & (d.close > d.prior_low20) & (d.close_location > 0.65) & (d.relvol > 0.8) & (d.gap_pct > -6),
+        ),
+        StrategySpec(
+            "atr_stretch_leader_reclaim",
+            "Mean reversion",
+            "Liquid relative-strength stock in long-term uptrend closes stretched below EMA20 but recovers off the lows.",
+            1.3,
+            2.1,
+            6,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.35) & (d.close > d.sma200) & (d.rs120_rank > 0.55) & (d.dist_ema20_atr < -1.8) & (d.dist_ema20_atr > -4.5) & (d.rsi14 < 38) & (d.close_location > 0.45) & (d.gap_pct > -8),
+        ),
+        StrategySpec(
+            "vol_dryup_rs_breakout",
+            "Volatility compression breakout",
+            "Liquid RS leader breaks a 20-day high after Bollinger width compression.",
+            1.4,
+            2.7,
+            10,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.45) & (d.rs60_rank > 0.70) & (d.bb_width < d.bb_width_q20 * 1.15) & (d.close > d.prior_high20) & (d.relvol > 1.1) & d.gap_pct.between(-2, 3),
+        ),
+        StrategySpec(
+            "defensive_nr7_leader_breakout",
+            "Narrow range breakout",
+            "Liquid RS leader posts an NR7 breakout with controlled ATR and a normal gap.",
+            1.2,
+            2.2,
+            8,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.40) & (d.rs60_rank > 0.65) & (d.range_pct <= d.range7_min * 1.001) & (d.close > d.prior_high20) & (d.atr_pct < 0.08) & d.gap_pct.between(-2, 2),
+        ),
+        StrategySpec(
+            "post_gap_reclaim_swing",
+            "Gap reversal",
+            "Liquid uptrend stock gaps down, then closes strong and above VWAP as a next-day swing reclaim.",
+            1.2,
+            2.2,
+            6,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.35) & (d.close > d.sma200) & d.gap_pct.between(-6, -1) & (d.close > d.open) & (d.close > d.close_vwap) & (d.close_location > 0.70) & (d.rs60_rank > 0.50),
+        ),
+        StrategySpec(
+            "trend_reversal_sma50_breakout",
+            "Trend reversal breakout",
+            "Liquid stock regains SMA50 after recent weakness and breaks the prior 20-day high with volume.",
+            1.4,
+            2.6,
+            10,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.35) & d.was_below_sma50_20 & d.reclaim_sma50 & (d.close > d.prior_high20) & (d.relvol > 1.2) & (d.close_location > 0.65) & d.gap_pct.between(-3, 4),
+        ),
+        StrategySpec(
+            "trend_reversal_sma100_base_breakout",
+            "Trend reversal breakout",
+            "Liquid stock recovers from a 60-day decline, reclaims SMA100, and breaks a 20-day base.",
+            1.5,
+            3.0,
+            12,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.35) & d.was_below_sma100_30 & d.reclaim_sma100 & (d.ret60 < 0.05) & (d.close > d.prior_high20) & (d.relvol > 1.15) & (d.close_location > 0.60),
+        ),
+        StrategySpec(
+            "trend_reversal_sma200_reclaim",
+            "Trend reversal breakout",
+            "Liquid stock reclaims SMA200 after being below it, with a strong close and above-average volume.",
+            1.6,
+            3.2,
+            15,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.40) & d.was_below_sma200_60 & d.reclaim_sma200 & (d.close > d.prior_high20) & (d.relvol > 1.25) & (d.close_location > 0.65) & (d.atr_pct < 0.09),
+        ),
+        StrategySpec(
+            "trend_reversal_failed_breakdown_breakout",
+            "Trend reversal breakout",
+            "Liquid stock forms a failed 20-day breakdown, then regains SMA20 and clears short resistance.",
+            1.3,
+            2.4,
+            8,
+            lambda d: d.liquid_research & (d.market_breadth200 > 0.35) & (d.low < d.prior_low20) & (d.close > d.prior_low20) & d.reclaim_sma20 & (d.close_location > 0.70) & (d.relvol > 0.9) & (d.rs60_rank > 0.35),
         ),
     ]
 

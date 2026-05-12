@@ -1,0 +1,40 @@
+{
+  "id": "compression-breakout-v1",
+  "name": "Compression Breakout V1",
+  "description": "Research-only breakout after range compression: trend is up, candle range is compressed versus its recent average, then price closes near a 20-day breakout with volume.",
+  "enabled": true,
+  "status": "research-only",
+  "universe": {
+    "source": "watchlist",
+    "market": "NSE equities",
+    "min_price": 50,
+    "min_avg_volume20": 100000
+  },
+  "entry": {
+    "setup_family": "Compression Breakout",
+    "min_score": 82,
+    "entry_price": "next_open",
+    "rules": [
+      "day_close > SMA20 and SMA20 > SMA50",
+      "distance to 20-day high <= 1.5%",
+      "volume ratio >= 1.1",
+      "daily range <= 75% of 20-day average range"
+    ]
+  },
+  "exit": {
+    "take_profit_pct": 7,
+    "stop_loss_pct": 4,
+    "max_hold_sessions": 10,
+    "exit_price": "conservative_ohlc",
+    "same_day_conflict": "stop_first"
+  },
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 5,
+    "paper_test_only": true
+  },
+  "notes": [
+    "This is an app-backtest proxy for breakout-after-compression research.",
+    "Do not promote unless dashboard diagnostics improve after forward data."
+  ]
+}

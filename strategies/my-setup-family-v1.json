@@ -1,0 +1,27 @@
+{
+  "description": "Explain what market behavior this strategy is trying to capture.",
+  "enabled": true,
+  "entry": {
+    "entry_price": "next_open",
+    "min_score": 88,
+    "setup_family": "Near 52W High"
+  },
+  "exit": {
+    "exit_price": "close",
+    "max_hold_sessions": 12,
+    "same_day_conflict": "stop_first",
+    "stop_loss_pct": 4,
+    "take_profit_pct": 8
+  },
+  "id": "my-setup-family-v1",
+  "name": "My Setup Family V1",
+  "risk": {
+    "capital_per_trade": 50000,
+    "max_positions_per_day": 5
+  },
+  "universe": {
+    "min_avg_volume20": 100000,
+    "min_price": 50,
+    "source": "watchlist"
+  }
+}

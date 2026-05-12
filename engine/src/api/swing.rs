@@ -1,21 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use clickhouse::Row;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::RwLockReadGuard;
 
-use crate::api::AppState;
+use crate::api::{paper, AppState};
 use crate::dhan::client::DhanClient;
 use crate::dhan::market_data::{fetch_quotes, QuoteItem};
-use crate::types::{compute_bucket, is_nse_holiday, now_ist};
+use crate::types::{compute_bucket, is_nse_holiday, now_ist, prev_trading_day};
 
 #[derive(Row, Deserialize, Clone)]
 struct WatchRow {
@@ -154,6 +155,7 @@ pub struct HistoryQuery {
 pub struct HistoricalScreenerQuery {
     limit: Option<usize>,
     setup: Option<String>,
+    strategy: Option<String>,
     min_price: Option<f64>,
     min_avg_volume: Option<f64>,
 }
@@ -189,7 +191,7 @@ pub struct SymbolHistoryResponse {
     message: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct HistoricalScreenerRow {
     symbol: String,
     as_of: String,
@@ -207,12 +209,24 @@ pub struct HistoricalScreenerRow {
     distance_to_20d_high_pct: f64,
     distance_to_52w_high_pct: f64,
     range_position_pct: f64,
+    atr14: f64,
+    atr_pct: f64,
+    close_location: f64,
+    gap_pct: f64,
+    rs60_rank: f64,
+    rs120_rank: f64,
+    market_breadth200: f64,
+    planned_entry: String,
+    stop_loss: f64,
+    target_price: f64,
+    risk_reward: f64,
 }
 
 #[derive(Serialize)]
 pub struct HistoricalScreenerResponse {
     updated_at: String,
     range: String,
+    signal_date: Option<String>,
     total_rows: usize,
     rows: Vec<HistoricalScreenerRow>,
     message: Option<String>,
@@ -309,16 +323,31 @@ struct HistoricalFallbackRow {
 struct HistoricalScreenerFeatureRow {
     symbol: Option<String>,
     trade_date: Option<String>,
+    day_open: Option<f64>,
     day_close: Option<f64>,
     day_high: Option<f64>,
     day_low: Option<f64>,
     day_volume: Option<String>,
     sma20: Option<f64>,
     sma50: Option<f64>,
+    sma200: Option<f64>,
     avg_volume20: Option<f64>,
     high_20d: Option<f64>,
     high_52w: Option<f64>,
     low_52w: Option<f64>,
+    rsi10: Option<f64>,
+    atr14: Option<f64>,
+    atr_pct: Option<f64>,
+    range_pct: Option<f64>,
+    close_location: Option<f64>,
+    gap_pct: Option<f64>,
+    prior_high20: Option<f64>,
+    prior_high55: Option<f64>,
+    prior_high252: Option<f64>,
+    prior_low20: Option<f64>,
+    rs60_rank: Option<f64>,
+    rs120_rank: Option<f64>,
+    market_breadth200: Option<f64>,
 }
 
 #[derive(Row, Deserialize)]
@@ -328,6 +357,149 @@ struct StrategyStatusRow {
 }
 
 const QUOTE_CACHE_TTL_SECS: u64 = 20;
+const PAPER_CAPITAL_PER_SIGNAL: f64 = 50_000.0;
+
+const CREATE_SCREENER_FEATURE_CACHE: &str = r#"
+CREATE TABLE IF NOT EXISTS trading.daily_screener_features (
+    trade_date     Date,
+    symbol         String,
+    day_open       Float64,
+    day_high       Float64,
+    day_low        Float64,
+    day_close      Float64,
+    prev_close     Float64,
+    day_volume     UInt64,
+    sma20          Float64,
+    sma50          Float64,
+    sma200         Float64,
+    avg_volume20   Float64,
+    high_20d       Float64,
+    high_52w       Float64,
+    low_52w        Float64,
+    rsi10          Float64,
+    atr14          Float64,
+    atr_pct        Float64,
+    range_pct      Float64,
+    close_location Float64,
+    gap_pct        Float64,
+    prior_high20   Float64,
+    prior_high55   Float64,
+    prior_high252  Float64,
+    prior_low20    Float64,
+    rs60_rank      Float64,
+    rs120_rank     Float64,
+    market_breadth200 Float64,
+    refreshed_at   DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(refreshed_at)
+ORDER BY (trade_date, symbol)
+"#;
+
+const SCREENER_FEATURE_CACHE_ALTERS: &[&str] = &[
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS atr14 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS atr_pct Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS range_pct Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS close_location Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS gap_pct Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high20 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high55 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high252 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_low20 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS rs60_rank Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS rs120_rank Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS market_breadth200 Float64 DEFAULT 0",
+];
+
+const CREATE_SIGNAL_LEDGER: &str = r#"
+CREATE TABLE IF NOT EXISTS trading.signal_ledger (
+    signal_key       String,
+    symbol           String,
+    strategy_id      String,
+    strategy_label   String,
+    strategy_status  String,
+    setup_family     String,
+    signal_date      String,
+    first_seen_at    DateTime DEFAULT now(),
+    last_seen_at     DateTime DEFAULT now(),
+    entry_price      Float64,
+    quantity         UInt32,
+    stop_loss        Float64,
+    target_price     Float64,
+    score            UInt8,
+    source           String DEFAULT 'historical-screener',
+    status           String DEFAULT 'active',
+    paper_status     String DEFAULT 'staged',
+    close_reason     String DEFAULT '',
+    realized_pnl     Float64 DEFAULT 0,
+    inserted_at      DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+ORDER BY signal_key
+"#;
+
+#[derive(Row, Serialize)]
+struct SignalLedgerInsertRow {
+    signal_key: String,
+    symbol: String,
+    strategy_id: String,
+    strategy_label: String,
+    strategy_status: String,
+    setup_family: String,
+    signal_date: String,
+    entry_price: f64,
+    quantity: u32,
+    stop_loss: f64,
+    target_price: f64,
+    score: u8,
+    source: String,
+    status: String,
+    paper_status: String,
+    close_reason: String,
+    realized_pnl: f64,
+}
+
+#[derive(Row, Deserialize)]
+struct SignalLedgerKeyRow {
+    signal_key: String,
+}
+
+#[derive(Row, Deserialize)]
+struct SymbolOnlyRow {
+    symbol: String,
+}
+
+#[derive(Serialize)]
+pub struct FreshSignalsResponse {
+    updated_at: String,
+    signal_date: Option<String>,
+    eligible_rows: usize,
+    new_rows: usize,
+    seen_rows: usize,
+    staged_rows: usize,
+    rows: Vec<HistoricalScreenerRow>,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct FeatureCacheRefreshResponse {
+    updated_at: String,
+    data_date: Option<String>,
+    cached_rows: usize,
+    message: String,
+}
+
+#[derive(Row, Deserialize)]
+struct FeatureCacheStatsRow {
+    data_date: String,
+    #[serde(deserialize_with = "deserialize_clickhouse_u64")]
+    cached_rows: u64,
+    avg_atr14: f64,
+}
+
+#[derive(Deserialize)]
+pub struct FreshSignalQuery {
+    limit: Option<usize>,
+    min_price: Option<f64>,
+    min_avg_volume: Option<f64>,
+}
 
 pub async fn home(State(state): State<AppState>) -> Json<SwingHomeResponse> {
     let bundle = build_dashboard_bundle(&state, 16, None).await;
@@ -430,6 +602,10 @@ pub async fn historical_screener(
         .setup
         .unwrap_or_else(|| "all".to_string())
         .to_lowercase();
+    let strategy_filter = query
+        .strategy
+        .unwrap_or_else(|| "all".to_string())
+        .to_lowercase();
     let min_price = query.min_price.unwrap_or(80.0).max(1.0);
     let min_avg_volume = query.min_avg_volume.unwrap_or(100_000.0).max(0.0);
 
@@ -442,6 +618,7 @@ pub async fn historical_screener(
                 .into_iter()
                 .filter_map(|row| map_historical_screener_row(row, &strategy_statuses))
                 .filter(|row| matches_setup_filter(row, &setup_filter))
+                .filter(|row| matches_strategy_filter(row, &strategy_filter))
                 .collect();
             mapped.sort_by(|a, b| {
                 strategy_status_rank(&a.strategy_status)
@@ -449,12 +626,15 @@ pub async fn historical_screener(
                     .then_with(|| b.score.cmp(&a.score))
                     .then_with(|| a.symbol.cmp(&b.symbol))
             });
+            let signal_date = mapped.first().map(|row| row.as_of.clone());
+            let total_rows = mapped.len();
             mapped.truncate(limit);
 
             Json(HistoricalScreenerResponse {
                 updated_at: crate::types::now_ist().to_rfc3339(),
                 range: "1y".to_string(),
-                total_rows: mapped.len(),
+                signal_date,
+                total_rows,
                 rows: mapped,
                 message: None,
             })
@@ -462,11 +642,149 @@ pub async fn historical_screener(
         Err(err) => Json(HistoricalScreenerResponse {
             updated_at: crate::types::now_ist().to_rfc3339(),
             range: "1y".to_string(),
+            signal_date: None,
             total_rows: 0,
             rows: Vec::new(),
             message: Some(format!("Historical screener query failed: {}", err)),
         }),
     }
+}
+
+pub async fn fresh_signals(
+    State(state): State<AppState>,
+    Query(query): Query<FreshSignalQuery>,
+) -> Result<Json<FreshSignalsResponse>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(40).clamp(1, 120);
+    let min_price = query.min_price.unwrap_or(80.0).max(1.0);
+    let min_avg_volume = query.min_avg_volume.unwrap_or(100_000.0).max(0.0);
+
+    ensure_signal_ledger(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    paper::ensure_table(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    let rows = load_historical_screener_rows(&state, min_price, min_avg_volume)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Fresh signal screener query failed: {err}"),
+            )
+        })?;
+    let strategy_statuses = load_latest_strategy_statuses(&state)
+        .await
+        .unwrap_or_default();
+    let mut eligible: Vec<HistoricalScreenerRow> = rows
+        .into_iter()
+        .filter_map(|row| map_historical_screener_row(row, &strategy_statuses))
+        .filter(is_paper_eligible_signal)
+        .collect();
+    eligible.sort_by(|a, b| {
+        strategy_status_rank(&a.strategy_status)
+            .cmp(&strategy_status_rank(&b.strategy_status))
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+
+    let seen_keys = load_signal_ledger_keys(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut new_candidates = Vec::new();
+    for row in &eligible {
+        if !seen_keys.contains(&signal_key_for(row)) {
+            new_candidates.push(row.clone());
+        }
+    }
+    let active_paper_symbols = load_active_paper_symbols(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let fresh_rows = new_candidates
+        .iter()
+        .filter(|row| !active_paper_symbols.contains(&row.symbol))
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let staged_keys = fresh_rows
+        .iter()
+        .map(signal_key_for)
+        .collect::<HashSet<_>>();
+
+    let ledger_rows = new_candidates
+        .iter()
+        .map(|row| {
+            let paper_status = if staged_keys.contains(&signal_key_for(row)) {
+                "staged"
+            } else if active_paper_symbols.contains(&row.symbol) {
+                "already-active"
+            } else {
+                "baseline"
+            };
+            build_signal_ledger_row(row, paper_status)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    insert_signal_ledger_rows(&state, &ledger_rows)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    let mut staged_rows = 0usize;
+    for row in fresh_rows.iter() {
+        if stage_signal_to_paper(&state, row).await.is_ok() {
+            staged_rows += 1;
+        }
+    }
+
+    let signal_date = eligible
+        .first()
+        .map(|row| row.as_of.clone())
+        .or_else(|| fresh_rows.first().map(|row| row.as_of.clone()));
+    let message = if fresh_rows.is_empty() {
+        Some("No new unique signals. Existing matching signals are already in the ledger or Paper Desk.".to_string())
+    } else {
+        None
+    };
+
+    Ok(Json(FreshSignalsResponse {
+        updated_at: crate::types::now_ist().to_rfc3339(),
+        signal_date,
+        eligible_rows: eligible.len(),
+        new_rows: new_candidates.len(),
+        seen_rows: eligible.len().saturating_sub(new_candidates.len()),
+        staged_rows,
+        rows: fresh_rows,
+        message,
+    }))
+}
+
+pub async fn refresh_feature_cache(
+    State(state): State<AppState>,
+) -> Result<Json<FeatureCacheRefreshResponse>, (StatusCode, String)> {
+    ensure_screener_feature_cache(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    refresh_screener_feature_cache(&state)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Feature cache refresh failed: {err}"),
+            )
+        })?;
+    let stats = latest_feature_cache_stats(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Feature cache stats failed: {err}")))?;
+
+    Ok(Json(FeatureCacheRefreshResponse {
+        updated_at: crate::types::now_ist().to_rfc3339(),
+        data_date: stats
+            .as_ref()
+            .filter(|row| row.cached_rows > 0)
+            .map(|row| row.data_date.clone()),
+        cached_rows: stats.map(|row| row.cached_rows as usize).unwrap_or(0),
+        message: "Daily screener features cached in ClickHouse. RSI is based on close-to-close gains/losses; volume is stored separately as day volume and volume ratio inputs.".to_string(),
+    }))
 }
 
 pub async fn bamboo_latest() -> Json<BambooLatestResponse> {
@@ -690,10 +1008,27 @@ fn read_stale_cached_quotes(
 }
 
 async fn resolve_dhan_credentials(state: &AppState) -> Option<ResolvedDhanCredentials> {
-    if !state.config.dhan_access_token.is_empty() && !state.config.dhan_client_id.is_empty() {
+    if !state.config.dhan_access_token.is_empty() {
+        let client_id = if !state.config.dhan_client_id.is_empty() {
+            state.config.dhan_client_id.clone()
+        } else {
+            parse_dhan_jwt_claims(&state.config.dhan_access_token)
+                .ok()
+                .and_then(|claims| claims.dhan_client_id)
+                .unwrap_or_default()
+        };
+
+        if !client_id.is_empty() {
+            return Some(ResolvedDhanCredentials {
+                access_token: state.config.dhan_access_token.clone(),
+                client_id,
+                source: "environment".to_string(),
+            });
+        }
+
         return Some(ResolvedDhanCredentials {
             access_token: state.config.dhan_access_token.clone(),
-            client_id: state.config.dhan_client_id.clone(),
+            client_id: String::new(),
             source: "environment".to_string(),
         });
     }
@@ -890,6 +1225,10 @@ async fn load_historical_fallbacks(
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
+    let cached = load_cached_historical_fallbacks(state, symbols).await?;
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
 
     let symbol_list = symbols
         .iter()
@@ -943,6 +1282,10 @@ async fn load_live_signal_baselines(
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
+    let cached = load_cached_live_signal_baselines(state, symbols).await?;
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
 
     let symbol_list = symbols
         .iter()
@@ -978,10 +1321,12 @@ async fn load_live_signal_baselines(
             day_volume, \
             toFloat64(sma20) AS sma20, \
             toFloat64(sma50) AS sma50, \
+            toFloat64(sma200) AS sma200, \
             toFloat64(avg_volume20) AS avg_volume20, \
             toFloat64(high_20d) AS high_20d, \
             toFloat64(high_52w) AS high_52w, \
-            toFloat64(low_52w) AS low_52w \
+            toFloat64(low_52w) AS low_52w, \
+            toFloat64(rsi10) AS rsi10 \
         FROM ( \
             SELECT \
                 symbol, \
@@ -992,12 +1337,19 @@ async fn load_live_signal_baselines(
                 day_volume, \
                 avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma20, \
                 avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS sma50, \
+                avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS sma200, \
                 avg(day_volume) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20, \
                 max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high_20d, \
                 max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w, \
                 min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w, \
+                100 - (100 / (1 + avg(gain) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) / greatest(avg(loss) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW), 0.000001))) AS rsi10, \
                 row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn \
-            FROM daily \
+            FROM ( \
+                SELECT *, \
+                    greatest(day_close - lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS gain, \
+                    greatest(lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - day_close, 0) AS loss \
+                FROM daily \
+            ) \
         ) \
         WHERE rn = 1",
         parquet_source,
@@ -1346,6 +1698,8 @@ fn evaluate_live_signal(
     let low = seed.low_price.min(seed.last_price) as f64;
     let sma20 = replace_latest_average(row.sma20.unwrap_or(historical_close), historical_close, close, 20.0);
     let sma50 = replace_latest_average(row.sma50.unwrap_or(historical_close), historical_close, close, 50.0);
+    let sma200 = replace_latest_average(row.sma200.unwrap_or(historical_close), historical_close, close, 200.0);
+    let rsi10 = row.rsi10.unwrap_or(50.0);
     let avg_volume20 = row.avg_volume20.unwrap_or(0.0).max(1.0);
     let high_20d = row.high_20d.unwrap_or(high).max(high);
     let high_52w = row.high_52w.unwrap_or(high).max(high);
@@ -1367,7 +1721,10 @@ fn evaluate_live_signal(
     let volume_ratio = day_volume / avg_volume20;
     let trend_up = close > sma20 && sma20 > sma50;
     let pullback_zone = close >= sma20 * 0.98 && close <= sma20 * 1.03;
-    let setup_family = if trend_up && breakout_pct <= 1.5 && volume_ratio >= 1.1 {
+    let rsi10_pullback = close > sma200 && rsi10 < 30.0;
+    let setup_family = if rsi10_pullback {
+        "RSI10 Pullback Reversion"
+    } else if trend_up && breakout_pct <= 1.5 && volume_ratio >= 1.1 {
         "Breakout Setup"
     } else if trend_up && pullback_zone {
         "Pullback To 20 DMA"
@@ -1395,6 +1752,8 @@ fn evaluate_live_signal(
         volume_ratio,
         close,
         sma20,
+        sma200,
+        rsi10,
     );
     let strategy_status = strategy_statuses
         .get(strategy_id)
@@ -1541,6 +1900,7 @@ fn strategy_exit_plan(strategy_id: &str) -> Option<(f32, f32, &'static str)> {
         "breakout-volume-v2" => Some((10.0, 4.0, "12 sessions")),
         "pullback-20dma-v1" => Some((6.0, 3.0, "10 sessions")),
         "pullback-quality-v2" => Some((7.0, 3.0, "12 sessions")),
+        "rsi10-pullback-reversion-v1" => Some((4.0, 4.0, "5 sessions")),
         "near-52w-high-v1" => Some((10.0, 5.0, "15 sessions")),
         "near-52w-high-tight-v2" => Some((8.0, 4.0, "12 sessions")),
         "near-52w-high-runner-v2" => Some((12.0, 5.0, "20 sessions")),
@@ -1826,6 +2186,18 @@ fn normalize_history_range(raw: Option<&str>) -> String {
     }
 }
 
+fn last_completed_trading_day() -> chrono::NaiveDate {
+    let now = now_ist();
+    let today = now.date_naive();
+    let close_reached = now.hour() > 15 || (now.hour() == 15 && now.minute() >= 30);
+
+    if !is_nse_holiday(today) && close_reached {
+        today
+    } else {
+        prev_trading_day(today)
+    }
+}
+
 fn history_where_clause(range: &str) -> &'static str {
     match range {
         "3m" => "subtractMonths(today(), 3)",
@@ -1856,6 +2228,22 @@ fn parquet_source_for_recent_months(months: usize) -> String {
         let year = current_year - offset as i32;
         parts.push(format!(
             "SELECT * FROM file('parquets/candles_{year:04}*.parquet', Parquet)"
+        ));
+    }
+
+    parts.join(" UNION ALL ")
+}
+
+fn parquet_feature_source_for_recent_months(months: usize) -> String {
+    let now = Utc::now();
+    let current_year = now.year();
+    let years_to_scan = ((months.max(1) + 11) / 12 + 1).max(1);
+    let mut parts = Vec::new();
+
+    for offset in 0..years_to_scan {
+        let year = current_year - offset as i32;
+        parts.push(format!(
+            "SELECT date AS candle_date, symbol, bucket, open, high, low, close, volume FROM file('parquets/candles_{year:04}*.parquet', Parquet)"
         ));
     }
 
@@ -1899,6 +2287,269 @@ async fn run_clickhouse_json_query<T: DeserializeOwned>(
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn deserialize_clickhouse_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("expected unsigned integer")),
+        serde_json::Value::String(text) => text
+            .parse::<u64>()
+            .map_err(|err| serde::de::Error::custom(format!("invalid UInt64 string: {err}"))),
+        _ => Err(serde::de::Error::custom("expected UInt64 number or string")),
+    }
+}
+
+async fn ensure_screener_feature_cache(state: &AppState) -> Result<(), String> {
+    state
+        .ch
+        .query(CREATE_SCREENER_FEATURE_CACHE)
+        .execute()
+        .await
+        .map_err(|err| format!("daily_screener_features table: {err}"))?;
+    for alter in SCREENER_FEATURE_CACHE_ALTERS {
+        state
+            .ch
+            .query(alter)
+            .execute()
+            .await
+            .map_err(|err| format!("daily_screener_features migration: {err}"))?;
+    }
+    Ok(())
+}
+
+async fn latest_feature_cache_stats(state: &AppState) -> anyhow::Result<Option<FeatureCacheStatsRow>> {
+    ensure_screener_feature_cache(state)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
+    let query = format!(
+        "WITH target AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM trading.daily_screener_features FINAL \
+            WHERE trade_date <= toDate('{target_date}') \
+        ) \
+        SELECT \
+            toString(trade_date) AS data_date, \
+            toUInt64(count()) AS cached_rows, \
+            toFloat64(avg(atr14)) AS avg_atr14 \
+        FROM trading.daily_screener_features FINAL \
+        WHERE trade_date = (SELECT data_date FROM target) \
+        GROUP BY trade_date"
+    );
+    Ok(run_clickhouse_json_query::<FeatureCacheStatsRow>(state, query)
+        .await?
+        .into_iter()
+        .next())
+}
+
+async fn refresh_screener_feature_cache(state: &AppState) -> anyhow::Result<()> {
+    let parquet_source = parquet_feature_source_for_recent_months(24);
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
+    let query = format!(
+        "INSERT INTO trading.daily_screener_features \
+        (trade_date, symbol, day_open, day_high, day_low, day_close, prev_close, day_volume, \
+         sma20, sma50, sma200, avg_volume20, high_20d, high_52w, low_52w, rsi10, \
+         atr14, atr_pct, range_pct, close_location, gap_pct, prior_high20, prior_high55, \
+         prior_high252, prior_low20, rs60_rank, rs120_rank, market_breadth200, refreshed_at) \
+        WITH daily AS ( \
+            SELECT \
+                symbol, \
+                toDate(candle_date) AS trade_date, \
+                argMin(open, bucket) AS day_open, \
+                max(high) AS day_high, \
+                min(low) AS day_low, \
+                argMax(close, bucket) AS day_close, \
+                toUInt64(sum(volume)) AS day_volume \
+            FROM ({}) \
+            WHERE toDate(candle_date) >= subtractYears(today(), 2) \
+              AND symbol IN (SELECT symbol FROM trading.watchlist WHERE enabled = 1) \
+              AND candle_date IS NOT NULL \
+              AND open IS NOT NULL \
+              AND high IS NOT NULL \
+              AND low IS NOT NULL \
+              AND close IS NOT NULL \
+              AND volume IS NOT NULL \
+            GROUP BY symbol, trade_date \
+        ), target_date AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM daily \
+            WHERE trade_date <= toDate('{target_date}') \
+        ), with_prev AS ( \
+            SELECT *, \
+                lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS prev_close \
+            FROM daily \
+        ), priced AS ( \
+            SELECT *, \
+                greatest(day_close - prev_close, 0) AS gain, \
+                greatest(prev_close - day_close, 0) AS loss, \
+                greatest(day_high - day_low, abs(day_high - prev_close), abs(day_low - prev_close)) AS true_range, \
+                if(prev_close > 0, ((day_open - prev_close) / prev_close) * 100, 0) AS gap_pct, \
+                if(day_close > 0, (day_high - day_low) / day_close, 0) AS range_pct, \
+                if(day_high > day_low, (day_close - day_low) / (day_high - day_low), 0.5) AS close_location \
+            FROM with_prev \
+        ), ranked AS ( \
+            SELECT \
+                symbol, \
+                trade_date, \
+                day_open, \
+                day_high, \
+                day_low, \
+                day_close, \
+                prev_close, \
+                day_volume, \
+                avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma20, \
+                avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS sma50, \
+                avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS sma200, \
+                avg(day_volume) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20, \
+                max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high_20d, \
+                max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w, \
+                min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w, \
+                avg(true_range) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14, \
+                if(day_close > 0, avg(true_range) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) / day_close, 0) AS atr_pct, \
+                range_pct, \
+                close_location, \
+                gap_pct, \
+                coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING), day_high) AS prior_high20, \
+                coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 55 PRECEDING AND 1 PRECEDING), day_high) AS prior_high55, \
+                coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING), day_high) AS prior_high252, \
+                coalesce(min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING), day_low) AS prior_low20, \
+                if(lagInFrame(day_close, 60, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 0, day_close / lagInFrame(day_close, 60, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1, 0) AS ret60, \
+                if(lagInFrame(day_close, 120, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 0, day_close / lagInFrame(day_close, 120, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1, 0) AS ret120, \
+                100 - (100 / (1 + avg(gain) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) / greatest(avg(loss) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW), 0.000001))) AS rsi10, \
+                row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn \
+            FROM priced \
+        ), scored AS ( \
+            SELECT *, \
+                toFloat64(rank() OVER (PARTITION BY trade_date ORDER BY ret60)) / greatest(toFloat64(count() OVER (PARTITION BY trade_date)), 1.0) AS rs60_rank, \
+                toFloat64(rank() OVER (PARTITION BY trade_date ORDER BY ret120)) / greatest(toFloat64(count() OVER (PARTITION BY trade_date)), 1.0) AS rs120_rank, \
+                avg(if(day_close > sma200, 1.0, 0.0)) OVER (PARTITION BY trade_date) AS market_breadth200 \
+            FROM ranked \
+        ) \
+        SELECT \
+            trade_date, \
+            symbol, \
+            toFloat64(day_open), \
+            toFloat64(day_high), \
+            toFloat64(day_low), \
+            toFloat64(day_close), \
+            toFloat64(prev_close), \
+            day_volume, \
+            toFloat64(sma20), \
+            toFloat64(sma50), \
+            toFloat64(sma200), \
+            toFloat64(avg_volume20), \
+            toFloat64(high_20d), \
+            toFloat64(high_52w), \
+            toFloat64(low_52w), \
+            toFloat64(rsi10), \
+            toFloat64(atr14), \
+            toFloat64(atr_pct), \
+            toFloat64(range_pct), \
+            toFloat64(close_location), \
+            toFloat64(gap_pct), \
+            toFloat64(prior_high20), \
+            toFloat64(prior_high55), \
+            toFloat64(prior_high252), \
+            toFloat64(prior_low20), \
+            toFloat64(rs60_rank), \
+            toFloat64(rs120_rank), \
+            toFloat64(market_breadth200), \
+            now() \
+        FROM scored \
+        WHERE rn = 1 \
+          AND trade_date = (SELECT data_date FROM target_date)",
+        parquet_source
+    );
+    state.ch.query(&query).execute().await?;
+    Ok(())
+}
+
+async fn load_cached_historical_fallbacks(
+    state: &AppState,
+    symbols: &[String],
+) -> anyhow::Result<HashMap<String, HistoricalFallbackRow>> {
+    ensure_screener_feature_cache(state)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let symbol_list = symbols
+        .iter()
+        .map(|symbol| format!("'{}'", escape_sql_string(symbol)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
+    let query = format!(
+        "WITH target AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM trading.daily_screener_features FINAL \
+            WHERE trade_date <= toDate('{target_date}') \
+        ) \
+        SELECT \
+            f.symbol, \
+            toString(f.trade_date) AS trade_date, \
+            toFloat64(f.day_open) AS day_open, \
+            toFloat64(f.day_high) AS day_high, \
+            toFloat64(f.day_low) AS day_low, \
+            toFloat64(f.day_close) AS day_close, \
+            toFloat64(f.day_volume) AS day_volume, \
+            toFloat64(f.prev_close) AS prev_close \
+        FROM trading.daily_screener_features AS f FINAL \
+        WHERE f.trade_date = (SELECT data_date FROM target) \
+          AND f.symbol IN ({symbol_list})"
+    );
+    let rows = run_clickhouse_json_query::<HistoricalFallbackRow>(state, query).await?;
+    Ok(rows.into_iter().map(|row| (row.symbol.clone(), row)).collect())
+}
+
+async fn load_cached_live_signal_baselines(
+    state: &AppState,
+    symbols: &[String],
+) -> anyhow::Result<HashMap<String, HistoricalScreenerFeatureRow>> {
+    ensure_screener_feature_cache(state)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let symbol_list = symbols
+        .iter()
+        .map(|symbol| format!("'{}'", escape_sql_string(symbol)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
+    let query = format!(
+        "WITH target AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM trading.daily_screener_features FINAL \
+            WHERE trade_date <= toDate('{target_date}') \
+        ) \
+        SELECT \
+            f.symbol, \
+            toString(f.trade_date) AS trade_date, \
+            toFloat64(f.day_open) AS day_open, \
+            toFloat64(f.day_close) AS day_close, \
+            toFloat64(f.day_high) AS day_high, \
+            toFloat64(f.day_low) AS day_low, \
+            toString(f.day_volume) AS day_volume, \
+            toFloat64(f.sma20) AS sma20, \
+            toFloat64(f.sma50) AS sma50, \
+            toFloat64(f.sma200) AS sma200, \
+            toFloat64(f.avg_volume20) AS avg_volume20, \
+            toFloat64(f.high_20d) AS high_20d, \
+            toFloat64(f.high_52w) AS high_52w, \
+            toFloat64(f.low_52w) AS low_52w, \
+            toFloat64(f.rsi10) AS rsi10 \
+        FROM trading.daily_screener_features AS f FINAL \
+        WHERE f.trade_date = (SELECT data_date FROM target) \
+          AND f.symbol IN ({symbol_list})"
+    );
+    let rows = run_clickhouse_json_query::<HistoricalScreenerFeatureRow>(state, query).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.symbol.clone().map(|symbol| (symbol, row)))
+        .collect())
 }
 
 async fn load_historical_candles(
@@ -2015,6 +2666,11 @@ async fn load_latest_strategy_statuses(state: &AppState) -> anyhow::Result<HashM
                 multiIf( \
                     total_pnl <= 0, 'Rejected', \
                     strategy_id = 'momentum-core-v1', 'Research', \
+                    strategy_id = 'rsi10-pullback-reversion-v1', 'Research', \
+                    strategy_id = 'failed-breakdown-reclaim-v1', 'Research', \
+                    strategy_id = 'compression-breakout-v1', 'Watch', \
+                    strategy_id = 'breakout-continuation-v1', 'Watch', \
+                    strategy_id = 'rs-leader-continuation-v1', 'Watch', \
                     strategy_id = 'near-52w-high-runner-v2', 'Watch', \
                     'Fragile' \
                 ) AS status \
@@ -2034,7 +2690,23 @@ async fn load_historical_screener_rows(
     min_price: f64,
     min_avg_volume: f64,
 ) -> anyhow::Result<Vec<HistoricalScreenerFeatureRow>> {
+    ensure_screener_feature_cache(state)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let cache_stats = latest_feature_cache_stats(state).await?;
+    let cache_usable = cache_stats
+        .as_ref()
+        .is_some_and(|row| row.cached_rows > 0 && row.avg_atr14 > 0.0);
+    if !cache_usable {
+        refresh_screener_feature_cache(state).await?;
+    }
+    let cached = load_cached_historical_screener_rows(state, min_price, min_avg_volume).await?;
+    if cache_usable || !cached.is_empty() {
+        return Ok(cached);
+    }
+
     let parquet_source = parquet_source_for_recent_months(24);
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
     let query = format!(
         "WITH daily AS ( \
             SELECT \
@@ -2048,21 +2720,11 @@ async fn load_historical_screener_rows(
             WHERE toDate(date) >= subtractYears(today(), 2) \
               AND symbol IN (SELECT symbol FROM trading.watchlist WHERE enabled = 1) \
             GROUP BY symbol, trade_date \
-        ) \
-        SELECT \
-            symbol, \
-            toString(trade_date) AS trade_date, \
-            toFloat64(day_close) AS day_close, \
-            toFloat64(day_high) AS day_high, \
-            toFloat64(day_low) AS day_low, \
-            day_volume, \
-            toFloat64(sma20) AS sma20, \
-            toFloat64(sma50) AS sma50, \
-            toFloat64(avg_volume20) AS avg_volume20, \
-            toFloat64(high_20d) AS high_20d, \
-            toFloat64(high_52w) AS high_52w, \
-            toFloat64(low_52w) AS low_52w \
-        FROM ( \
+        ), target_date AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM daily \
+            WHERE trade_date <= toDate('{target_date}') \
+        ), ranked AS ( \
             SELECT \
                 symbol, \
                 trade_date, \
@@ -2072,19 +2734,95 @@ async fn load_historical_screener_rows(
                 day_volume, \
                 avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma20, \
                 avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS sma50, \
+                avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS sma200, \
                 avg(day_volume) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20, \
                 max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high_20d, \
                 max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w, \
                 min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w, \
+                100 - (100 / (1 + avg(gain) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) / greatest(avg(loss) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW), 0.000001))) AS rsi10, \
                 row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn \
-            FROM daily \
+            FROM ( \
+                SELECT *, \
+                    greatest(day_close - lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS gain, \
+                    greatest(lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - day_close, 0) AS loss \
+                FROM daily \
+            ) \
         ) \
-        WHERE rn = 1 AND day_close >= {min_price} AND avg_volume20 >= {min_avg_volume} \
+        SELECT \
+            symbol, \
+            toString(ranked.trade_date) AS trade_date, \
+            toFloat64(day_close) AS day_close, \
+            toFloat64(day_high) AS day_high, \
+            toFloat64(day_low) AS day_low, \
+            day_volume, \
+            toFloat64(sma20) AS sma20, \
+            toFloat64(sma50) AS sma50, \
+            toFloat64(sma200) AS sma200, \
+            toFloat64(avg_volume20) AS avg_volume20, \
+            toFloat64(high_20d) AS high_20d, \
+            toFloat64(high_52w) AS high_52w, \
+            toFloat64(low_52w) AS low_52w, \
+            toFloat64(rsi10) AS rsi10 \
+        FROM ranked \
+        WHERE rn = 1 \
+          AND ranked.trade_date = (SELECT data_date FROM target_date) \
+          AND day_close >= {min_price} \
+          AND avg_volume20 >= {min_avg_volume} \
         ORDER BY avg_volume20 DESC \
         LIMIT 1200",
         parquet_source
     );
 
+    run_clickhouse_json_query::<HistoricalScreenerFeatureRow>(state, query).await
+}
+
+async fn load_cached_historical_screener_rows(
+    state: &AppState,
+    min_price: f64,
+    min_avg_volume: f64,
+) -> anyhow::Result<Vec<HistoricalScreenerFeatureRow>> {
+    let target_date = last_completed_trading_day().format("%Y-%m-%d").to_string();
+    let query = format!(
+        "WITH target AS ( \
+            SELECT max(trade_date) AS data_date \
+            FROM trading.daily_screener_features FINAL \
+            WHERE trade_date <= toDate('{target_date}') \
+        ) \
+        SELECT \
+            f.symbol, \
+            toString(f.trade_date) AS trade_date, \
+            toFloat64(f.day_open) AS day_open, \
+            toFloat64(f.day_close) AS day_close, \
+            toFloat64(f.day_high) AS day_high, \
+            toFloat64(f.day_low) AS day_low, \
+            toString(f.day_volume) AS day_volume, \
+            toFloat64(f.sma20) AS sma20, \
+            toFloat64(f.sma50) AS sma50, \
+            toFloat64(f.sma200) AS sma200, \
+            toFloat64(f.avg_volume20) AS avg_volume20, \
+            toFloat64(f.high_20d) AS high_20d, \
+            toFloat64(f.high_52w) AS high_52w, \
+            toFloat64(f.low_52w) AS low_52w, \
+            toFloat64(f.rsi10) AS rsi10, \
+            toFloat64(f.atr14) AS atr14, \
+            toFloat64(f.atr_pct) AS atr_pct, \
+            toFloat64(f.range_pct) AS range_pct, \
+            toFloat64(f.close_location) AS close_location, \
+            toFloat64(f.gap_pct) AS gap_pct, \
+            toFloat64(f.prior_high20) AS prior_high20, \
+            toFloat64(f.prior_high55) AS prior_high55, \
+            toFloat64(f.prior_high252) AS prior_high252, \
+            toFloat64(f.prior_low20) AS prior_low20, \
+            toFloat64(f.rs60_rank) AS rs60_rank, \
+            toFloat64(f.rs120_rank) AS rs120_rank, \
+            toFloat64(f.market_breadth200) AS market_breadth200 \
+        FROM trading.daily_screener_features AS f FINAL \
+        WHERE f.trade_date = (SELECT data_date FROM target) \
+          AND f.day_close >= {min_price} \
+          AND f.avg_volume20 >= {min_avg_volume} \
+        ORDER BY f.avg_volume20 DESC \
+        LIMIT 1200"
+    );
     run_clickhouse_json_query::<HistoricalScreenerFeatureRow>(state, query).await
 }
 
@@ -2095,33 +2833,85 @@ fn map_historical_screener_row(
     let symbol = row.symbol?;
     let trade_date = row.trade_date?;
     let day_close = row.day_close?;
-    let day_high = row.day_high?;
-    let day_low = row.day_low?;
+    let _day_high = row.day_high?;
+    let _day_low = row.day_low?;
     let day_volume: u64 = row.day_volume?.parse().ok()?;
     let sma20 = row.sma20?;
     let sma50 = row.sma50?;
+    let sma200 = row.sma200.unwrap_or(sma50);
     let avg_volume20 = row.avg_volume20?;
     let high_20d = row.high_20d?;
     let high_52w = row.high_52w?;
     let low_52w = row.low_52w?;
+    let day_high = row.day_high?;
+    let day_low = row.day_low?;
 
     if day_close <= 0.0 || high_20d <= 0.0 || high_52w <= 0.0 || low_52w <= 0.0 {
         return None;
     }
 
-    let breakout_pct = ((high_20d - day_close) / high_20d) * 100.0;
+    let atr14 = row.atr14.unwrap_or_else(|| (day_high - day_low).abs()).max(0.0);
+    let atr_pct = row
+        .atr_pct
+        .filter(|value| *value > 0.0)
+        .unwrap_or_else(|| if day_close > 0.0 { atr14 / day_close } else { 0.0 });
+    let range_pct = row
+        .range_pct
+        .filter(|value| *value > 0.0)
+        .unwrap_or_else(|| if day_close > 0.0 { (day_high - day_low).max(0.0) / day_close } else { 0.0 });
+    let close_location = row
+        .close_location
+        .unwrap_or_else(|| if day_high > day_low { (day_close - day_low) / (day_high - day_low) } else { 0.5 })
+        .clamp(0.0, 1.0);
+    let gap_pct = row.gap_pct.unwrap_or_else(|| {
+        row.day_open
+            .filter(|open| *open > 0.0)
+            .map(|open| ((open - day_close) / day_close) * 100.0)
+            .unwrap_or(0.0)
+    });
+    let prior_high20 = row.prior_high20.filter(|value| *value > 0.0).unwrap_or(high_20d);
+    let prior_high55 = row.prior_high55.filter(|value| *value > 0.0).unwrap_or(prior_high20);
+    let prior_high252 = row.prior_high252.filter(|value| *value > 0.0).unwrap_or(high_52w);
+    let prior_low20 = row.prior_low20.filter(|value| *value > 0.0).unwrap_or(day_low);
+    let rs60_rank = row.rs60_rank.unwrap_or(0.5).clamp(0.0, 1.0);
+    let rs120_rank = row.rs120_rank.unwrap_or(0.5).clamp(0.0, 1.0);
+    let market_breadth200 = row.market_breadth200.unwrap_or(0.5).clamp(0.0, 1.0);
+    let breakout_pct = ((prior_high20 - day_close) / prior_high20) * 100.0;
     let distance_to_52w_high_pct = ((high_52w - day_close) / high_52w) * 100.0;
     let range_span = (high_52w - low_52w).max(0.01);
     let range_position_pct = ((day_close - low_52w) / range_span) * 100.0;
     let volume_ratio = day_volume as f64 / avg_volume20.max(1.0);
     let trend_up = day_close > sma20 && sma20 > sma50;
     let pullback_zone = day_close >= sma20 * 0.98 && day_close <= sma20 * 1.03;
+    let rsi10 = row.rsi10.unwrap_or(50.0);
+    let rsi10_pullback = day_close > sma200 && rsi10 < 30.0;
+    let breakout_close = day_close > prior_high20 && close_location >= 0.6;
+    let compression_breakout = breakout_close
+        && volume_ratio >= 1.05
+        && atr_pct < 0.08
+        && range_pct <= (atr_pct * 1.05).max(0.015);
+    let failed_breakdown_reclaim = day_low < prior_low20
+        && day_close > prior_low20
+        && close_location >= 0.65
+        && volume_ratio >= 0.8;
+    let relative_strength_leader = rs60_rank >= 0.75
+        && rs120_rank >= 0.65
+        && day_close > sma50
+        && (distance_to_52w_high_pct <= 10.0 || day_close > prior_high55 || day_close > prior_high252);
 
-    let setup_family = if trend_up && breakout_pct <= 1.5 && volume_ratio >= 1.1 {
-        "Breakout Setup"
+    let setup_family = if rsi10_pullback {
+        "RSI10 Pullback Reversion"
+    } else if failed_breakdown_reclaim {
+        "Failed Breakdown Reclaim"
+    } else if compression_breakout {
+        "Compression Breakout"
+    } else if trend_up && breakout_close && volume_ratio >= 1.1 {
+        "Breakout Continuation"
+    } else if relative_strength_leader {
+        "Relative Strength Leader"
     } else if trend_up && pullback_zone {
         "Pullback To 20 DMA"
-    } else if row.day_close > row.sma50 && distance_to_52w_high_pct <= 8.0 {
+    } else if day_close > sma50 && distance_to_52w_high_pct <= 8.0 {
         "Near 52W High"
     } else {
         "Trend Filter"
@@ -2129,7 +2919,7 @@ fn map_historical_screener_row(
 
     let trend_label = if trend_up {
         "Uptrend"
-    } else if row.day_close > row.sma50 {
+    } else if day_close > sma50 {
         "Constructive"
     } else {
         "Needs Work"
@@ -2139,8 +2929,10 @@ fn map_historical_screener_row(
     if trend_up {
         score += 18.0;
     }
-    if breakout_pct <= 1.5 {
+    if breakout_close {
         score += 14.0;
+    } else if breakout_pct <= 1.5 {
+        score += 10.0;
     } else if breakout_pct <= 4.0 {
         score += 8.0;
     }
@@ -2154,6 +2946,26 @@ fn map_historical_screener_row(
     }
     if pullback_zone {
         score += 8.0;
+    }
+    if rsi10_pullback {
+        score += 16.0;
+    }
+    if failed_breakdown_reclaim {
+        score += 14.0;
+    }
+    if compression_breakout {
+        score += 12.0;
+    }
+    if rs60_rank >= 0.75 {
+        score += 8.0;
+    } else if rs60_rank >= 0.60 {
+        score += 4.0;
+    }
+    if close_location >= 0.75 {
+        score += 6.0;
+    }
+    if market_breadth200 >= 0.45 {
+        score += 4.0;
     }
     if range_position_pct >= 70.0 {
         score += 6.0;
@@ -2170,11 +2982,22 @@ fn map_historical_screener_row(
         volume_ratio,
         day_close,
         sma20,
+        sma200,
+        rsi10,
     );
     let strategy_status = strategy_statuses
         .get(strategy_id)
         .cloned()
         .unwrap_or_else(|| default_strategy_status(strategy_id).to_string());
+    let (planned_entry, stop_loss, target_price, risk_reward) = historical_trade_plan(
+        setup_family,
+        day_close,
+        day_low,
+        sma20,
+        atr14,
+        prior_high20,
+        prior_low20,
+    );
 
     Some(HistoricalScreenerRow {
         symbol,
@@ -2193,7 +3016,56 @@ fn map_historical_screener_row(
         distance_to_20d_high_pct: round2_f64(breakout_pct.max(0.0)),
         distance_to_52w_high_pct: round2_f64(distance_to_52w_high_pct.max(0.0)),
         range_position_pct: round2_f64(range_position_pct.clamp(0.0, 100.0)),
+        atr14: round2_f64(atr14),
+        atr_pct: round2_f64(atr_pct * 100.0),
+        close_location: round2_f64(close_location * 100.0),
+        gap_pct: round2_f64(gap_pct),
+        rs60_rank: round2_f64(rs60_rank * 100.0),
+        rs120_rank: round2_f64(rs120_rank * 100.0),
+        market_breadth200: round2_f64(market_breadth200 * 100.0),
+        planned_entry,
+        stop_loss,
+        target_price,
+        risk_reward,
     })
+}
+
+fn historical_trade_plan(
+    setup_family: &str,
+    close: f64,
+    low: f64,
+    sma20: f64,
+    atr14: f64,
+    prior_high20: f64,
+    prior_low20: f64,
+) -> (String, f64, f64, f64) {
+    let atr = atr14.max(close * 0.015).max(0.01);
+    let raw_stop = match setup_family {
+        "Breakout Continuation" | "Compression Breakout" => (prior_high20 - 0.35 * atr).min(close - 1.2 * atr),
+        "Pullback To 20 DMA" => (sma20 - 0.8 * atr).min(low - 0.25 * atr),
+        "Failed Breakdown Reclaim" => prior_low20.min(low) - 0.25 * atr,
+        "RSI10 Pullback Reversion" => close - 1.4 * atr,
+        "Relative Strength Leader" | "Near 52W High" => close - 1.6 * atr,
+        _ => close - 1.5 * atr,
+    };
+    let stop_loss = round2_f64(raw_stop.max(close * 0.88).min(close - 0.01));
+    let risk = (close - stop_loss).max(0.01);
+    let reward_multiple = match setup_family {
+        "RSI10 Pullback Reversion" => 1.4,
+        "Pullback To 20 DMA" | "Failed Breakdown Reclaim" => 1.8,
+        _ => 2.0,
+    };
+    let target_price = round2_f64(close + risk * reward_multiple);
+    let risk_reward = round2_f64((target_price - close) / risk);
+    let planned_entry = match setup_family {
+        "Breakout Continuation" | "Compression Breakout" => {
+            format!("Next session strength above Rs {:.2}", prior_high20.max(close))
+        }
+        "Pullback To 20 DMA" => format!("Buy zone near 20 DMA Rs {:.2} to close Rs {:.2}", sma20, close),
+        "Failed Breakdown Reclaim" => format!("Reclaim hold above Rs {:.2}", prior_low20),
+        _ => format!("Next session confirmation near Rs {:.2}", close),
+    };
+    (planned_entry, stop_loss, target_price, risk_reward)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2208,7 +3080,30 @@ fn strategy_match_for_screener(
     volume_ratio: f64,
     day_close: f64,
     sma20: f64,
+    sma200: f64,
+    rsi10: f64,
 ) -> (&'static str, &'static str) {
+    if day_close > sma200 && rsi10 < 30.0 {
+        return ("rsi10-pullback-reversion-v1", "RSI10 Pullback");
+    }
+    if setup_family == "Failed Breakdown Reclaim" && score >= 86 {
+        return ("failed-breakdown-reclaim-v1", "Failed Breakdown Reclaim");
+    }
+    if setup_family == "Compression Breakout" && score >= 88 {
+        return ("compression-breakout-v1", "Compression Breakout");
+    }
+    if setup_family == "Breakout Continuation" && score >= 88 && volume_ratio >= 1.1 && trend_up {
+        return ("breakout-continuation-v1", "Breakout Continuation");
+    }
+    if setup_family == "Relative Strength Leader" && score >= 86 {
+        return ("rs-leader-continuation-v1", "RS Leader Continuation");
+    }
+    if setup_family == "Pullback To 20 DMA" && score >= 88 && trend_up && pullback_zone && volume_ratio >= 0.8 && day_close >= sma20 {
+        return ("pullback-quality-v2", "Pullback Quality");
+    }
+    if setup_family == "Pullback To 20 DMA" {
+        return ("pullback-20dma-v1", "Pullback 20DMA");
+    }
     if distance_to_52w_high_pct <= 3.0 && range_position_pct >= 85.0 && trend_up && score >= 92 {
         return ("momentum-core-v1", "Momentum Core");
     }
@@ -2224,16 +3119,10 @@ fn strategy_match_for_screener(
     if setup_family == "Near 52W High" && score >= 80 {
         return ("near-52w-high-v1", "Near 52W High");
     }
-    if setup_family == "Pullback To 20 DMA" && score >= 88 && trend_up && pullback_zone && volume_ratio >= 0.8 && day_close >= sma20 {
-        return ("pullback-quality-v2", "Pullback Quality");
-    }
-    if setup_family == "Pullback To 20 DMA" {
-        return ("pullback-20dma-v1", "Pullback 20DMA");
-    }
     if setup_family == "Breakout Setup" && score >= 90 && volume_ratio >= 1.5 && breakout_pct <= 1.0 && trend_up {
         return ("breakout-volume-v2", "Breakout Volume");
     }
-    if setup_family == "Breakout Setup" {
+    if setup_family == "Breakout Setup" || setup_family == "Breakout Continuation" {
         return ("swing-breakout-v1", "Swing Breakout");
     }
     ("unlinked-screener", "Unlinked Screen")
@@ -2242,6 +3131,11 @@ fn strategy_match_for_screener(
 fn default_strategy_status(strategy_id: &str) -> &'static str {
     match strategy_id {
         "momentum-core-v1" => "Research",
+        "rsi10-pullback-reversion-v1" => "Research",
+        "failed-breakdown-reclaim-v1" => "Research",
+        "compression-breakout-v1" => "Watch",
+        "breakout-continuation-v1" => "Watch",
+        "rs-leader-continuation-v1" => "Watch",
         "near-52w-high-runner-v2" => "Watch",
         "near-52w-high-v1" | "near-52w-high-tight-v2" | "near-52w-high-volume-v3" => "Fragile",
         "pullback-20dma-v1" | "pullback-quality-v2" | "swing-breakout-v1" | "breakout-volume-v2" => "Rejected",
@@ -2262,12 +3156,221 @@ fn strategy_status_rank(status: &str) -> u8 {
 fn matches_setup_filter(row: &HistoricalScreenerRow, setup_filter: &str) -> bool {
     match setup_filter {
         "all" => true,
-        "breakout" => row.setup_family == "Breakout Setup",
+        "breakout" => matches!(row.setup_family.as_str(), "Breakout Setup" | "Breakout Continuation" | "Compression Breakout"),
         "pullback" => row.setup_family == "Pullback To 20 DMA",
+        "compression" => row.setup_family == "Compression Breakout",
+        "reclaim" | "failed-breakdown" => row.setup_family == "Failed Breakdown Reclaim",
+        "rs" | "relative-strength" => row.setup_family == "Relative Strength Leader",
+        "rsi10" | "reversion" => row.setup_family == "RSI10 Pullback Reversion",
         "52wh" | "near-high" => row.setup_family == "Near 52W High",
         "trend" => row.setup_family == "Trend Filter",
         _ => true,
     }
+}
+
+fn matches_strategy_filter(row: &HistoricalScreenerRow, strategy_filter: &str) -> bool {
+    match strategy_filter {
+        "all" => true,
+        "fresh" | "signals" => matches!(row.strategy_status.as_str(), "Research" | "Watch"),
+        value => {
+            row.strategy_id.eq_ignore_ascii_case(value)
+                || row.strategy_label.to_lowercase().replace(' ', "-") == value
+                || row.strategy_status.to_lowercase() == value
+        }
+    }
+}
+
+async fn ensure_signal_ledger(state: &AppState) -> Result<(), String> {
+    state
+        .ch
+        .query(CREATE_SIGNAL_LEDGER)
+        .execute()
+        .await
+        .map_err(|err| format!("signal_ledger table: {err}"))
+}
+
+async fn load_signal_ledger_keys(state: &AppState) -> Result<HashSet<String>, String> {
+    ensure_signal_ledger(state).await?;
+    let rows = state
+        .ch
+        .query("SELECT signal_key FROM trading.signal_ledger FINAL")
+        .fetch_all::<SignalLedgerKeyRow>()
+        .await
+        .map_err(|err| format!("signal ledger keys: {err}"))?;
+    Ok(rows.into_iter().map(|row| row.signal_key).collect())
+}
+
+async fn load_active_paper_symbols(state: &AppState) -> Result<HashSet<String>, String> {
+    paper::ensure_table(state).await?;
+    let rows = state
+        .ch
+        .query("SELECT symbol FROM trading.paper_trades FINAL WHERE enabled = 1")
+        .fetch_all::<SymbolOnlyRow>()
+        .await
+        .map_err(|err| format!("active paper symbols: {err}"))?;
+    Ok(rows.into_iter().map(|row| row.symbol).collect())
+}
+
+fn build_signal_ledger_row(
+    row: &HistoricalScreenerRow,
+    paper_status: &str,
+) -> Result<SignalLedgerInsertRow, String> {
+    let Some(rule) = paper_rule_for_strategy(&row.strategy_id) else {
+        return Err(format!("no paper rule for {}", row.strategy_id));
+    };
+    let entry_price = row.close.max(0.01);
+    let quantity = quantity_for_capital(entry_price, PAPER_CAPITAL_PER_SIGNAL);
+    Ok(SignalLedgerInsertRow {
+        signal_key: signal_key_for(row),
+        symbol: row.symbol.clone(),
+        strategy_id: row.strategy_id.clone(),
+        strategy_label: row.strategy_label.clone(),
+        strategy_status: row.strategy_status.clone(),
+        setup_family: row.setup_family.clone(),
+        signal_date: row.as_of.clone(),
+        entry_price,
+        quantity,
+        stop_loss: round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0)),
+        target_price: round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0)),
+        score: row.score,
+        source: "historical-screener".to_string(),
+        status: "active".to_string(),
+        paper_status: paper_status.to_string(),
+        close_reason: String::new(),
+        realized_pnl: 0.0,
+    })
+}
+
+async fn insert_signal_ledger_rows(
+    state: &AppState,
+    rows: &[SignalLedgerInsertRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut insert = state
+        .ch
+        .insert("trading.signal_ledger")
+        .map_err(|err| format!("signal ledger insert: {err}"))?;
+    for row in rows {
+        insert
+            .write(row)
+            .await
+            .map_err(|err| format!("signal ledger write: {err}"))?;
+    }
+    insert
+        .end()
+        .await
+        .map_err(|err| format!("signal ledger commit: {err}"))?;
+
+    Ok(())
+}
+
+async fn stage_signal_to_paper(
+    state: &AppState,
+    row: &HistoricalScreenerRow,
+) -> Result<(), String> {
+    let Some(rule) = paper_rule_for_strategy(&row.strategy_id) else {
+        return Err(format!("no paper rule for {}", row.strategy_id));
+    };
+    let entry_price = row.close.max(0.01);
+    let quantity = quantity_for_capital(entry_price, PAPER_CAPITAL_PER_SIGNAL);
+    let stop_loss = round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0));
+    let target_price = round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0));
+    let trade = paper::PaperTradeRow {
+        symbol: row.symbol.clone(),
+        company_name: row.symbol.clone(),
+        setup_family: row.strategy_label.clone(),
+        bias: "Long".to_string(),
+        entry_price,
+        quantity,
+        stop_loss,
+        target_price,
+        max_sessions: paper::DEFAULT_PAPER_MAX_SESSIONS,
+        capital_allocated: entry_price * f64::from(quantity),
+        expected_hold: format!("{} trading sessions", paper::DEFAULT_PAPER_MAX_SESSIONS),
+        thesis: format!(
+            "{} is a new unique {} signal from {} with score {}.",
+            row.symbol, row.strategy_label, row.as_of, row.score
+        ),
+        notes: format!(
+            "Auto-staged newest unique signal. signal_date={} strategy={} strategy_status={} signal_key={} rule={} stop_pct={:.2} target_pct={:.2}",
+            row.as_of,
+            row.strategy_id,
+            row.strategy_status,
+            signal_key_for(row),
+            rule.source,
+            rule.stop_loss_pct,
+            rule.take_profit_pct
+        ),
+        exit_price: None,
+        close_reason: String::new(),
+        realized_pnl: 0.0,
+        enabled: 1,
+    };
+
+    paper::upsert_system_trade(state, trade).await
+}
+
+fn is_paper_eligible_signal(row: &HistoricalScreenerRow) -> bool {
+    matches!(row.strategy_status.as_str(), "Research" | "Watch")
+        && paper_rule_for_strategy(&row.strategy_id).is_some()
+        && row.close > 0.0
+}
+
+fn signal_key_for(row: &HistoricalScreenerRow) -> String {
+    format!("{}|{}", row.symbol, row.strategy_id)
+}
+
+struct PaperRule {
+    stop_loss_pct: f64,
+    take_profit_pct: f64,
+    source: &'static str,
+}
+
+fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
+    let rule = match strategy_id {
+        "near-52w-high-v1"
+        | "near-52w-high-runner-v2"
+        | "near-52w-high-volume-v3"
+        | "near-52w-high-tight-v2"
+        | "momentum-core-v1" => PaperRule {
+            stop_loss_pct: 5.0,
+            take_profit_pct: 10.0,
+            source: "near-52w-high backtest family",
+        },
+        "pullback-20dma-v1" | "pullback-quality-v2" => PaperRule {
+            stop_loss_pct: 3.0,
+            take_profit_pct: 6.0,
+            source: "pullback-20dma backtest family",
+        },
+        "rsi10-pullback-reversion-v1" => PaperRule {
+            stop_loss_pct: 4.0,
+            take_profit_pct: 4.0,
+            source: "built-in RSI10 pullback rule",
+        },
+        "failed-breakdown-reclaim-v1" => PaperRule {
+            stop_loss_pct: 4.0,
+            take_profit_pct: 7.0,
+            source: "daily failed-breakdown reclaim model",
+        },
+        "compression-breakout-v1" | "breakout-continuation-v1" | "swing-breakout-v1" | "breakout-volume-v2" => PaperRule {
+            stop_loss_pct: 4.0,
+            take_profit_pct: 8.0,
+            source: "swing-breakout backtest family",
+        },
+        "rs-leader-continuation-v1" => PaperRule {
+            stop_loss_pct: 5.0,
+            take_profit_pct: 10.0,
+            source: "relative-strength continuation model",
+        },
+        _ => return None,
+    };
+    Some(rule)
+}
+
+fn quantity_for_capital(price: f64, capital: f64) -> u32 {
+    ((capital / price.max(0.01)).floor() as u32).max(1)
 }
 
 fn read_bamboo_signal_csv(path: &str) -> anyhow::Result<Vec<BambooLatestSignal>> {

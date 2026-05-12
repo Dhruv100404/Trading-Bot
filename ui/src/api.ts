@@ -134,14 +134,44 @@ export interface HistoricalScreenerRow {
   distance_to_20d_high_pct: number
   distance_to_52w_high_pct: number
   range_position_pct: number
+  atr14: number
+  atr_pct: number
+  close_location: number
+  gap_pct: number
+  rs60_rank: number
+  rs120_rank: number
+  market_breadth200: number
+  planned_entry: string
+  stop_loss: number
+  target_price: number
+  risk_reward: number
 }
 
 export interface HistoricalScreenerResponse {
   updated_at: string
   range: string
+  signal_date: string | null
   total_rows: number
   rows: HistoricalScreenerRow[]
   message: string | null
+}
+
+export interface FreshSignalsResponse {
+  updated_at: string
+  signal_date: string | null
+  eligible_rows: number
+  new_rows: number
+  seen_rows: number
+  staged_rows: number
+  rows: HistoricalScreenerRow[]
+  message: string | null
+}
+
+export interface FeatureCacheRefreshResponse {
+  updated_at: string
+  data_date: string | null
+  cached_rows: number
+  message: string
 }
 
 export interface BambooLatestSignal {
@@ -262,6 +292,7 @@ export interface BacktestRunSummary {
   tp_exits: number
   sl_exits: number
   time_exits: number
+  rsi_exits: number
   from_date: string
   to_date: string
 }
@@ -325,6 +356,7 @@ export interface BacktestStrategyDiagnostic {
 export interface BacktestTradeLogRow {
   strategy_id: string
   symbol: string
+  signal_date: string
   entry_date: string
   exit_date: string
   setup_family: string
@@ -336,6 +368,32 @@ export interface BacktestTradeLogRow {
   exit_reason: string
   hold_sessions: number
   score: number
+}
+
+export interface BacktestDateSummary {
+  trade_date: string
+  total_trades: number
+  winners: number
+  losers: number
+  win_rate: number
+  total_pnl: number
+  avg_return_pct: number
+  best_symbol: string
+  best_pnl: number
+  worst_symbol: string
+  worst_pnl: number
+}
+
+export interface BacktestDateStrategySummary {
+  strategy_id: string
+  setup_family: string
+  trades: number
+  win_rate: number
+  pnl: number
+  best_symbol: string
+  best_pnl: number
+  worst_symbol: string
+  worst_pnl: number
 }
 
 export interface BacktestDashboardResponse {
@@ -351,20 +409,81 @@ export interface BacktestDashboardResponse {
   trades: BacktestTradeLogRow[]
 }
 
+export interface BacktestDatewiseResponse {
+  run_id: string
+  updated_at: string
+  selected_date: string | null
+  available_dates: string[]
+  strategy_options: string[]
+  summary: BacktestDateSummary | null
+  strategy_summaries: BacktestDateStrategySummary[]
+  top_gainers: BacktestTradeLogRow[]
+  top_losers: BacktestTradeLogRow[]
+  rows: BacktestTradeLogRow[]
+  page: number
+  page_size: number
+  total_rows: number
+}
+
+export interface BacktestCacheStatus {
+  cached_rows: number
+  symbols: number
+  from_date: string
+  to_date: string
+  refreshed_at: string
+}
+
 export interface BacktestRunResponse {
   ok: boolean
   run_id: string
   message: string
+  cache: BacktestCacheStatus
   dashboard: BacktestDashboardResponse
 }
 
-async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(path, options)
+export interface BacktestCacheRefreshResponse {
+  ok: boolean
+  updated_at: string
+  cache: BacktestCacheStatus
+  message: string
+}
+
+async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  const timeoutMs = options?.timeoutMs ?? 60000
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+  const { timeoutMs: _timeoutMs, signal, ...fetchOptions } = options ?? {}
+  if (signal) {
+    signal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+  let res: Response
+  try {
+    res = await fetch(path, { ...fetchOptions, signal: controller.signal })
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`Engine API timed out after ${Math.round(timeoutMs / 1000)}s.`)
+    }
+    throw err
+  } finally {
+    window.clearTimeout(timeout)
+  }
+  const contentType = res.headers.get('content-type') ?? ''
   if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`API error ${res.status}: ${text}`)
+    if (!contentType.includes('application/json')) {
+      throw new Error(`Engine API is unavailable (${res.status}).`)
+    }
+    const payload = await res.json().catch(() => null)
+    const message = typeof payload === 'string'
+      ? payload
+      : payload && typeof payload === 'object' && 'message' in payload
+        ? String(payload.message)
+        : `API request failed (${res.status}).`
+    throw new Error(message)
   }
   if (res.status === 204) return undefined as T
+  if (!contentType.includes('application/json')) {
+    throw new Error('Engine API is unavailable or returned a non-JSON response.')
+  }
   return res.json() as Promise<T>
 }
 
@@ -387,16 +506,39 @@ export async function getSwingHistory(symbol: string, range = '1y'): Promise<Sym
 export async function getHistoricalScreener(params?: {
   limit?: number
   setup?: string
+  strategy?: string
   minPrice?: number
   minAvgVolume?: number
 }): Promise<HistoricalScreenerResponse> {
   const search = new URLSearchParams()
   if (params?.limit) search.set('limit', String(params.limit))
   if (params?.setup) search.set('setup', params.setup)
+  if (params?.strategy) search.set('strategy', params.strategy)
   if (params?.minPrice) search.set('min_price', String(params.minPrice))
   if (params?.minAvgVolume) search.set('min_avg_volume', String(params.minAvgVolume))
   const query = search.toString()
   return apiFetch<HistoricalScreenerResponse>(`/api/swing/historical-screener${query ? `?${query}` : ''}`)
+}
+
+export async function stageFreshSignals(params?: {
+  limit?: number
+  minPrice?: number
+  minAvgVolume?: number
+}): Promise<FreshSignalsResponse> {
+  const search = new URLSearchParams()
+  if (params?.limit) search.set('limit', String(params.limit))
+  if (params?.minPrice) search.set('min_price', String(params.minPrice))
+  if (params?.minAvgVolume) search.set('min_avg_volume', String(params.minAvgVolume))
+  const query = search.toString()
+  return apiFetch<FreshSignalsResponse>(`/api/swing/fresh-signals${query ? `?${query}` : ''}`, {
+    method: 'POST',
+  })
+}
+
+export async function refreshFeatureCache(): Promise<FeatureCacheRefreshResponse> {
+  return apiFetch<FeatureCacheRefreshResponse>('/api/swing/feature-cache/refresh', {
+    method: 'POST',
+  })
 }
 
 export async function getBambooLatest(): Promise<BambooLatestResponse> {
@@ -458,8 +600,31 @@ export async function getBacktestDashboard(): Promise<BacktestDashboardResponse>
   return apiFetch<BacktestDashboardResponse>('/api/backtests/dashboard')
 }
 
+export async function getBacktestDatewise(params?: {
+  date?: string
+  strategy?: string
+  page?: number
+  pageSize?: number
+}): Promise<BacktestDatewiseResponse> {
+  const search = new URLSearchParams()
+  if (params?.date) search.set('date', params.date)
+  if (params?.strategy) search.set('strategy', params.strategy)
+  if (params?.page) search.set('page', String(params.page))
+  if (params?.pageSize) search.set('page_size', String(params.pageSize))
+  const query = search.toString()
+  return apiFetch<BacktestDatewiseResponse>(`/api/backtests/datewise${query ? `?${query}` : ''}`)
+}
+
+export async function refreshBacktestCache(): Promise<BacktestCacheRefreshResponse> {
+  return apiFetch<BacktestCacheRefreshResponse>('/api/backtests/feature-cache/refresh', {
+    method: 'POST',
+    timeoutMs: 300000,
+  })
+}
+
 export async function runBacktest(): Promise<BacktestRunResponse> {
   return apiFetch<BacktestRunResponse>('/api/backtests/run', {
     method: 'POST',
+    timeoutMs: 300000,
   })
 }

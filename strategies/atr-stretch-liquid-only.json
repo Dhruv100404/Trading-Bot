@@ -2,7 +2,7 @@
   "id": "atr-stretch-liquid-only-v1",
   "name": "ATR Stretch Liquid Only V1",
   "description": "Paper-test watchlist strategy from second-pass swing research: mean reversion after a deep ATR stretch, restricted to liquid stocks only.",
-  "enabled": false,
+  "enabled": true,
   "status": "paper-test-only",
   "research_summary": {
     "source": "docs/quant_research_outputs/second_pass_swing/final_report.md",
@@ -33,9 +33,11 @@
     ]
   },
   "exit": {
+    "take_profit_pct": 6,
+    "stop_loss_pct": 4,
+    "max_hold_sessions": 7,
     "stop_atr": 1.4,
     "target_atr": 2.0,
-    "max_hold_sessions": 7,
     "exit_price": "conservative_ohlc",
     "same_day_conflict": "stop_first"
   },

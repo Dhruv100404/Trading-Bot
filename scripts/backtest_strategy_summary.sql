@@ -4,6 +4,8 @@ WITH
         UNION ALL
         SELECT 'pullback-20dma-v1', 'Pullback To 20 DMA V1', 'Pullback To 20 DMA', 80, 6.0, 3.0, 10, 50000.0
         UNION ALL
+        SELECT 'rsi10-pullback-reversion-v1', 'RSI10 Pullback Reversion V1', 'RSI10 Pullback Reversion', 80, 4.0, 4.0, 10, 50000.0
+        UNION ALL
         SELECT 'near-52w-high-v1', 'Near 52W High V1', 'Near 52W High', 80, 10.0, 5.0, 15, 50000.0
     ),
     daily AS (
@@ -26,6 +28,13 @@ WITH
           AND volume IS NOT NULL
         GROUP BY symbol, trade_date
     ),
+    priced AS (
+        SELECT
+            *,
+            greatest(day_close - lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS gain,
+            greatest(lagInFrame(day_close, 1, day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - day_close, 0) AS loss
+        FROM daily
+    ),
     features AS (
         SELECT
             symbol,
@@ -38,11 +47,13 @@ WITH
             row_number() OVER (PARTITION BY symbol ORDER BY trade_date) AS rn,
             avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma20,
             avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS sma50,
+            avg(day_close) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS sma200,
             avg(day_volume) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20,
             max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high_20d,
             max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,
-            min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w
-        FROM daily
+            min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w,
+            100 - (100 / (1 + avg(gain) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) / greatest(avg(loss) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW), 0.000001))) AS rsi10
+        FROM priced
     ),
     scored AS (
         SELECT
@@ -52,7 +63,8 @@ WITH
             ((day_close - low_52w) / nullIf(high_52w - low_52w, 0.01)) * 100.0 AS range_position_pct,
             day_volume / greatest(avg_volume20, 1.0) AS volume_ratio,
             day_close > sma20 AND sma20 > sma50 AS trend_up,
-            day_close >= sma20 * 0.98 AND day_close <= sma20 * 1.03 AS pullback_zone
+            day_close >= sma20 * 0.98 AND day_close <= sma20 * 1.03 AS pullback_zone,
+            day_close > sma200 AND rsi10 < 30 AS rsi10_pullback
         FROM features
         WHERE rn >= 252
           AND day_close >= 50
@@ -63,7 +75,11 @@ WITH
             s.symbol,
             s.trade_date AS signal_date,
             s.rn AS signal_rn,
+            s.day_close,
+            s.sma200,
+            s.rsi10,
             multiIf(
+                rsi10_pullback, 'RSI10 Pullback Reversion',
                 trend_up AND breakout_pct <= 1.5 AND volume_ratio >= 1.1, 'Breakout Setup',
                 trend_up AND pullback_zone, 'Pullback To 20 DMA',
                 day_close > sma50 AND distance_to_52w_high_pct <= 8.0, 'Near 52W High',
@@ -76,6 +92,7 @@ WITH
                 + if(distance_to_52w_high_pct <= 8.0, 10, 0)
                 + if(volume_ratio >= 1.2, 10, if(volume_ratio >= 1.0, 5, 0))
                 + if(pullback_zone, 8, 0)
+                + if(rsi10_pullback, 16, 0)
                 + if(range_position_pct >= 70.0, 6, 0)
             ))) AS score
         FROM scored s
@@ -104,6 +121,10 @@ WITH
            AND e.rn = sig.signal_rn + 1
         WHERE e.day_open > 0
           AND sig.score >= st.min_score
+          AND multiIf(
+              st.strategy_id = 'rsi10-pullback-reversion-v1', sig.day_close > sig.sma200 AND sig.rsi10 < 30,
+              true
+          )
     ),
     exits AS (
         SELECT
@@ -120,6 +141,8 @@ WITH
             e.tp_pct,
             e.sl_pct,
             e.max_hold_sessions,
+            minIf(f.trade_date, e.strategy_id = 'rsi10-pullback-reversion-v1' AND f.rsi10 > 40) AS rsi_exit_date,
+            argMinIf(f.day_close, f.rn, e.strategy_id = 'rsi10-pullback-reversion-v1' AND f.rsi10 > 40) AS rsi_exit_price,
             minIf(f.trade_date, f.day_low <= e.entry_price * (1 - e.sl_pct / 100.0)) AS stop_date,
             minIf(f.trade_date, f.day_high >= e.entry_price * (1 + e.tp_pct / 100.0)) AS target_date,
             argMax(f.day_close, f.rn) AS time_exit_price,
@@ -152,6 +175,9 @@ WITH
             signal_date,
             entry_date,
             multiIf(
+                strategy_id = 'rsi10-pullback-reversion-v1' AND stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date) AND (rsi_exit_date = toDate('1970-01-01') OR stop_date <= rsi_exit_date), stop_date,
+                strategy_id = 'rsi10-pullback-reversion-v1' AND target_date != toDate('1970-01-01') AND (rsi_exit_date = toDate('1970-01-01') OR target_date <= rsi_exit_date), target_date,
+                strategy_id = 'rsi10-pullback-reversion-v1' AND rsi_exit_date != toDate('1970-01-01'), rsi_exit_date,
                 stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date), stop_date,
                 target_date != toDate('1970-01-01'), target_date,
                 time_exit_date
@@ -159,6 +185,9 @@ WITH
             setup_family,
             entry_price,
             multiIf(
+                strategy_id = 'rsi10-pullback-reversion-v1' AND stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date) AND (rsi_exit_date = toDate('1970-01-01') OR stop_date <= rsi_exit_date), entry_price * (1 - sl_pct / 100.0),
+                strategy_id = 'rsi10-pullback-reversion-v1' AND target_date != toDate('1970-01-01') AND (rsi_exit_date = toDate('1970-01-01') OR target_date <= rsi_exit_date), entry_price * (1 + tp_pct / 100.0),
+                strategy_id = 'rsi10-pullback-reversion-v1' AND rsi_exit_date != toDate('1970-01-01'), rsi_exit_price,
                 stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date), entry_price * (1 - sl_pct / 100.0),
                 target_date != toDate('1970-01-01'), entry_price * (1 + tp_pct / 100.0),
                 time_exit_price
@@ -168,6 +197,9 @@ WITH
             (exit_price - entry_price) * quantity AS pnl,
             ((exit_price - entry_price) / entry_price) * 100.0 AS return_pct,
             multiIf(
+                strategy_id = 'rsi10-pullback-reversion-v1' AND stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date) AND (rsi_exit_date = toDate('1970-01-01') OR stop_date <= rsi_exit_date), 'SL',
+                strategy_id = 'rsi10-pullback-reversion-v1' AND target_date != toDate('1970-01-01') AND (rsi_exit_date = toDate('1970-01-01') OR target_date <= rsi_exit_date), 'TP',
+                strategy_id = 'rsi10-pullback-reversion-v1' AND rsi_exit_date != toDate('1970-01-01'), 'RSI40',
                 stop_date != toDate('1970-01-01') AND (target_date = toDate('1970-01-01') OR stop_date <= target_date), 'SL',
                 target_date != toDate('1970-01-01'), 'TP',
                 'TIME'

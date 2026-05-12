@@ -3,12 +3,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use chrono::{DateTime, Duration, NaiveDate};
 use clickhouse::Row;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::api::AppState;
 use crate::api::swing::get_live_quotes;
 use crate::types::{is_nse_holiday, now_ist};
+
+pub(crate) const DEFAULT_PAPER_MAX_SESSIONS: u16 = 5;
 
 const CREATE_PAPER_TRADES: &str = r#"
 CREATE TABLE IF NOT EXISTS trading.paper_trades (
@@ -21,7 +24,7 @@ CREATE TABLE IF NOT EXISTS trading.paper_trades (
     stop_loss         Float64,
     target_price      Float64,
     planned_at        DateTime DEFAULT now(),
-    max_sessions      UInt16 DEFAULT 10,
+    max_sessions      UInt16 DEFAULT 7,
     capital_allocated Float64 DEFAULT 50000,
     expected_hold     String DEFAULT '',
     thesis            String DEFAULT '',
@@ -76,23 +79,23 @@ pub struct PaperTrade {
 
 #[derive(Row, Serialize)]
 pub struct PaperTradeRow {
-    symbol: String,
-    company_name: String,
-    setup_family: String,
-    bias: String,
-    entry_price: f64,
-    quantity: u32,
-    stop_loss: f64,
-    target_price: f64,
-    max_sessions: u16,
-    capital_allocated: f64,
-    expected_hold: String,
-    thesis: String,
-    notes: String,
-    exit_price: Option<f64>,
-    close_reason: String,
-    realized_pnl: f64,
-    enabled: u8,
+    pub(crate) symbol: String,
+    pub(crate) company_name: String,
+    pub(crate) setup_family: String,
+    pub(crate) bias: String,
+    pub(crate) entry_price: f64,
+    pub(crate) quantity: u32,
+    pub(crate) stop_loss: f64,
+    pub(crate) target_price: f64,
+    pub(crate) max_sessions: u16,
+    pub(crate) capital_allocated: f64,
+    pub(crate) expected_hold: String,
+    pub(crate) thesis: String,
+    pub(crate) notes: String,
+    pub(crate) exit_price: Option<f64>,
+    pub(crate) close_reason: String,
+    pub(crate) realized_pnl: f64,
+    pub(crate) enabled: u8,
 }
 
 #[derive(Deserialize)]
@@ -358,6 +361,56 @@ fn apply_current_price(
     trade.quote_updated_at = quote_updated_at;
 }
 
+fn validate_stop_loss(entry_price: f64, stop_loss: f64) -> Result<f64, String> {
+    if stop_loss > 0.0 && stop_loss < entry_price {
+        return Ok(round2(stop_loss));
+    }
+
+    Err("paper trade requires a stop_loss below entry_price".to_string())
+}
+
+fn validate_target_price(entry_price: f64, target_price: f64) -> Result<f64, String> {
+    if target_price > entry_price {
+        return Ok(round2(target_price));
+    }
+
+    Err("paper trade requires a target_price above entry_price".to_string())
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn trading_sessions_elapsed(planned_at: &str) -> u16 {
+    let now = now_ist();
+    let Some(planned_date) = parse_paper_datetime(planned_at) else {
+        return 0;
+    };
+    count_trading_sessions(planned_date, now.date_naive())
+}
+
+fn parse_paper_datetime(value: &str) -> Option<NaiveDate> {
+    DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%z")
+        .ok()
+        .map(|dt| dt.date_naive())
+}
+
+fn count_trading_sessions(from: NaiveDate, to: NaiveDate) -> u16 {
+    if to < from {
+        return 0;
+    }
+
+    let mut sessions = 0u16;
+    let mut cursor = from;
+    while cursor <= to {
+        if !is_nse_holiday(cursor) {
+            sessions = sessions.saturating_add(1);
+        }
+        cursor = cursor + Duration::days(1);
+    }
+    sessions
+}
+
 async fn run_clickhouse_json_query<T: DeserializeOwned>(
     state: &AppState,
     sql: String,
@@ -377,7 +430,7 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-async fn ensure_table(state: &AppState) -> Result<(), String> {
+pub(crate) async fn ensure_table(state: &AppState) -> Result<(), String> {
     state
         .ch
         .query(CREATE_PAPER_TRADES)
@@ -393,6 +446,28 @@ async fn ensure_table(state: &AppState) -> Result<(), String> {
             .await
             .map_err(|err| format!("paper_trades migration: {err}"))?;
     }
+
+    Ok(())
+}
+
+pub(crate) async fn upsert_system_trade(
+    state: &AppState,
+    trade: PaperTradeRow,
+) -> Result<(), String> {
+    ensure_table(state).await?;
+
+    let mut insert = state
+        .ch
+        .insert("trading.paper_trades")
+        .map_err(|err| format!("paper trades system insert: {err}"))?;
+    insert
+        .write(&trade)
+        .await
+        .map_err(|err| format!("paper trades system write: {err}"))?;
+    insert
+        .end()
+        .await
+        .map_err(|err| format!("paper trades system commit: {err}"))?;
 
     Ok(())
 }
@@ -467,7 +542,23 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<PaperTradesRespo
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
-    let mut trades = state
+    let mut trades = fetch_visible_paper_trades(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    enrich_with_live_quotes(&state, &mut trades).await;
+
+    if auto_close_triggered_trades(&state, &trades).await? > 0 {
+        trades = fetch_visible_paper_trades(&state)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        enrich_with_live_quotes(&state, &mut trades).await;
+    }
+
+    Ok(Json(PaperTradesResponse { trades }))
+}
+
+async fn fetch_visible_paper_trades(state: &AppState) -> Result<Vec<PaperTrade>, String> {
+    state
         .ch
         .query(&format!(
             "{} WHERE enabled = 1 OR close_reason != 'removed' ORDER BY inserted_at DESC",
@@ -475,10 +566,36 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<PaperTradesRespo
         ))
         .fetch_all::<PaperTrade>()
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("paper trades list: {err}")))?;
-    enrich_with_live_quotes(&state, &mut trades).await;
+        .map_err(|err| format!("paper trades list: {err}"))
+}
 
-    Ok(Json(PaperTradesResponse { trades }))
+async fn auto_close_triggered_trades(state: &AppState, trades: &[PaperTrade]) -> Result<usize, (StatusCode, String)> {
+    let mut closed_count = 0;
+
+    for trade in trades.iter().filter(|trade| trade.enabled == 1) {
+        let stop_hit = trade.stop_loss > 0.0 && trade.current_price > 0.0 && trade.current_price <= trade.stop_loss;
+        let target_hit = trade.target_price > 0.0 && trade.current_price > 0.0 && trade.current_price >= trade.target_price;
+        let sessions_elapsed = trading_sessions_elapsed(&trade.planned_at);
+        let time_exit = sessions_elapsed >= trade.max_sessions;
+
+        let (exit_price, close_reason) = if stop_hit {
+            (trade.stop_loss, "stop-loss".to_string())
+        } else if target_hit {
+            (trade.target_price, "target-hit".to_string())
+        } else if time_exit {
+            (
+                if trade.current_price > 0.0 { trade.current_price } else { trade.entry_price },
+                format!("auto-closed after {} trading sessions", trade.max_sessions),
+            )
+        } else {
+            continue;
+        };
+
+        close_trade_row(state, trade, exit_price, close_reason).await?;
+        closed_count += 1;
+    }
+
+    Ok(closed_count)
 }
 
 pub async fn upsert(
@@ -490,6 +607,10 @@ pub async fn upsert(
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let entry_price = input.entry_price.max(0.01);
+    let stop_loss = validate_stop_loss(entry_price, input.stop_loss)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let target_price = validate_target_price(entry_price, input.target_price)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let quantity = input
         .quantity
         .unwrap_or_else(|| {
@@ -507,11 +628,13 @@ pub async fn upsert(
         bias: input.bias.unwrap_or_else(|| "Long".to_string()),
         entry_price,
         quantity,
-        stop_loss: input.stop_loss,
-        target_price: input.target_price,
-        max_sessions: input.max_sessions.unwrap_or(10).max(1),
+        stop_loss,
+        target_price,
+        max_sessions: input.max_sessions.unwrap_or(DEFAULT_PAPER_MAX_SESSIONS).max(1),
         capital_allocated,
-        expected_hold: input.expected_hold.unwrap_or_default(),
+        expected_hold: input
+            .expected_hold
+            .unwrap_or_else(|| format!("{} trading sessions", DEFAULT_PAPER_MAX_SESSIONS)),
         thesis: input.thesis.unwrap_or_default(),
         notes: input.notes.unwrap_or_default(),
         exit_price: None,
@@ -571,6 +694,33 @@ pub async fn close(
         .map_err(|err| (StatusCode::NOT_FOUND, format!("open paper trade not found: {err}")))?;
 
     let exit_price = input.exit_price.max(0.0);
+    close_trade_row(
+        &state,
+        &current,
+        exit_price,
+        input
+            .close_reason
+            .unwrap_or_else(|| "session-expired".to_string()),
+    )
+    .await?;
+
+    let saved = state
+        .ch
+        .query(&format!("{} WHERE symbol = ? LIMIT 1", paper_trade_select()))
+        .bind(&symbol)
+        .fetch_one::<PaperTrade>()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("paper trades fetch closed: {err}")))?;
+
+    Ok(Json(saved))
+}
+
+async fn close_trade_row(
+    state: &AppState,
+    current: &PaperTrade,
+    exit_price: f64,
+    close_reason: String,
+) -> Result<(), (StatusCode, String)> {
     let realized_pnl = (exit_price - current.entry_price) * f64::from(current.quantity);
     let closed = PaperTradeRow {
         symbol: current.symbol.clone(),
@@ -587,9 +737,7 @@ pub async fn close(
         thesis: current.thesis.clone(),
         notes: current.notes.clone(),
         exit_price: Some(exit_price),
-        close_reason: input
-            .close_reason
-            .unwrap_or_else(|| "session-expired".to_string()),
+        close_reason,
         realized_pnl,
         enabled: 0,
     };
@@ -607,15 +755,7 @@ pub async fn close(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("paper trades close commit: {err}")))?;
 
-    let saved = state
-        .ch
-        .query(&format!("{} WHERE symbol = ? LIMIT 1", paper_trade_select()))
-        .bind(&symbol)
-        .fetch_one::<PaperTrade>()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("paper trades fetch closed: {err}")))?;
-
-    Ok(Json(saved))
+    Ok(())
 }
 
 pub async fn remove(
