@@ -31,6 +31,7 @@ services:
       - DEBUG=${DEBUG:-false}
     volumes:
       - ./strategies:/app/strategies
+      - ./docs:/app/docs:ro
     depends_on:
       clickhouse:
         condition: service_healthy

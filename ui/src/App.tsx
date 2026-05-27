@@ -30,6 +30,7 @@ import {
   getBacktestDashboard,
   getBacktestDatewise,
   getBambooLatest,
+  getMultiDeriveResearch,
   closePaperTrade,
   deletePaperTrade,
   getPaperBudget,
@@ -59,6 +60,7 @@ import {
   type LiveSignal,
   type PaperTrade,
   type PaperBudget,
+  type MultiDeriveResponse,
   type SymbolHistoryResponse,
   type SetupMix,
   type SwingCandidate,
@@ -3382,12 +3384,24 @@ function StrategyAnalysisPanel({
 function ResearchView({
   setupMix,
   bambooLatest,
+  multiDerive,
+  loadingMultiDerive,
+  onReloadMultiDerive,
   onSelect,
 }: {
   setupMix: SetupMix[]
   bambooLatest: BambooLatestResponse | null
+  multiDerive: MultiDeriveResponse | null
+  loadingMultiDerive: boolean
+  onReloadMultiDerive: () => void
   onSelect: (symbol: string) => void
 }) {
+  const baseMetric = multiDerive?.metrics.find((metric) => metric.cost_scenario === 'base') ?? null
+  const stressMetric = multiDerive?.metrics.find((metric) => metric.cost_scenario === 'stress') ?? null
+  const oosSplit = multiDerive?.splits.find((split) => split.strategy === 'out_of_sample') ?? null
+  const latestCandidates = multiDerive?.latest_candidates.slice(0, 10) ?? []
+  const generatedAt = typeof multiDerive?.manifest?.generated_at === 'string' ? multiDerive.manifest.generated_at : null
+
   return (
     <div className="page-stack">
       <Surface>
@@ -3400,6 +3414,120 @@ function ResearchView({
             <Database size={14} />
             <span>Nightly Python worker is still the right place for full calibration and backtests</span>
           </div>
+        </div>
+
+        <div className="strategy-research-panel">
+          <div className="compact-section-head">
+            <div>
+              <span className="eyebrow">Script Replay Candidate</span>
+              <h2>ATR stretch reversal research replay</h2>
+            </div>
+            <button type="button" className="ghost-button" onClick={onReloadMultiDerive} disabled={loadingMultiDerive}>
+              <RefreshCw size={14} className={loadingMultiDerive ? 'spin' : ''} />
+              <span>{loadingMultiDerive ? 'Loading' : 'Reload'}</span>
+            </button>
+          </div>
+          {multiDerive?.message ? (
+            <div className="backtest-run-note">
+              <CircleAlert size={16} />
+              <span>{multiDerive.message}</span>
+            </div>
+          ) : (
+            <>
+              <div className="backtest-run-note research-replay-note">
+                <CircleAlert size={16} />
+                <span>
+                  File-backed Python replay only. This is not yet a promoted engine backtest, and the setup/rank slice came from proxy research,
+                  so these numbers are evidence for review, not live approval. Latest strict forward-validation audit fails promotion:
+                  train-only selection produced zero validation trades and about 1.06 forward base PF.
+                </span>
+              </div>
+              <div className="backtest-kpi-grid">
+                <CandidateStat label="Base PF" value={baseMetric ? baseMetric.profit_factor.toFixed(2) : 'N/A'} tone={(baseMetric?.profit_factor ?? 0) >= 1.5 ? 'positive' : 'warning'} />
+                <CandidateStat label="Stress PF" value={stressMetric ? stressMetric.profit_factor.toFixed(2) : 'N/A'} tone={(stressMetric?.profit_factor ?? 0) >= 1.2 ? 'positive' : 'warning'} />
+                <CandidateStat label="Expectancy" value={baseMetric ? pct(baseMetric.expectancy_pct) : 'N/A'} tone={(baseMetric?.expectancy_pct ?? 0) > 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Drawdown" value={baseMetric ? pct(baseMetric.max_drawdown_proxy_pct) : 'N/A'} tone={(baseMetric?.max_drawdown_proxy_pct ?? -99) > -5 ? 'positive' : 'warning'} />
+                <CandidateStat label="Trades" value={baseMetric ? baseMetric.trades.toLocaleString('en-IN') : 'N/A'} />
+                <CandidateStat label="OOS PF" value={oosSplit ? oosSplit.profit_factor.toFixed(2) : 'N/A'} tone={(oosSplit?.profit_factor ?? 0) >= 1 ? 'positive' : 'warning'} />
+              </div>
+              <div className="research-verdict multi-derive-verdict">
+                <strong>Replay mechanics are real OHLC path simulation, but promotion is still pending.</strong>
+                <span>Signal day enters next open, stop {baseMetric?.stop_atr ?? 1.6} ATR, target {baseMetric?.target_atr ?? 3} ATR, max hold {baseMetric?.max_hold_days ?? 10} sessions. Generated {generatedAt ? compactDate(generatedAt) : 'from latest files'}.</span>
+                <span>Proper promotion needs a frozen rule wired into the engine backtest path and a clean forward window that survives base and stress costs.</span>
+              </div>
+              <div className="multi-derive-grid">
+                <Surface className="inner-surface research-card">
+                  <span className="micro-label">Chronological Splits</span>
+                  <div className="mini-data-table">
+                    <div className="mini-data-row mini-data-head">
+                      <span>Split</span>
+                      <span>Trades</span>
+                      <span>PF</span>
+                      <span>Exp</span>
+                    </div>
+                    {(multiDerive?.splits ?? []).map((split) => (
+                      <div key={split.strategy} className="mini-data-row">
+                        <span>{split.strategy.replace('_', ' ')}</span>
+                        <span>{split.trades}</span>
+                        <span>{split.profit_factor.toFixed(2)}</span>
+                        <span>{pct(split.expectancy_pct)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </Surface>
+                <Surface className="inner-surface research-card">
+                  <span className="micro-label">Exit Quality</span>
+                  <div className="mini-data-table">
+                    <div className="mini-data-row mini-data-head">
+                      <span>Exit</span>
+                      <span>Trades</span>
+                      <span>Win</span>
+                      <span>Avg</span>
+                    </div>
+                    {(multiDerive?.exits ?? []).map((row) => (
+                      <div key={row.exit_reason} className="mini-data-row">
+                        <span>{row.exit_reason}</span>
+                        <span>{row.trades}</span>
+                        <span>{row.win_rate.toFixed(0)}%</span>
+                        <span>{pct(row.avg_net_return_pct)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </Surface>
+                <Surface className="inner-surface research-card">
+                  <span className="micro-label">Top Contributors</span>
+                  <div className="bamboo-mini-list">
+                    {(multiDerive?.symbols.slice(0, 5) ?? []).map((row) => (
+                      <button key={row.symbol} type="button" onClick={() => onSelect(row.symbol)}>
+                        <span>{row.symbol}</span>
+                        <strong>{pct(row.total_net_return_pct)}</strong>
+                      </button>
+                    ))}
+                  </div>
+                </Surface>
+              </div>
+              <div className="latest-derived-table">
+                <div className="mini-data-row mini-data-head">
+                  <span>Symbol</span>
+                  <span>Setup</span>
+                  <span>Rank</span>
+                  <span>Regime</span>
+                  <span>RelVol</span>
+                  <span>MFE</span>
+                </div>
+                {latestCandidates.map((candidate) => (
+                  <button key={`${candidate.symbol}-${candidate.trade_date}`} type="button" className="mini-data-row" onClick={() => onSelect(candidate.symbol)}>
+                    <span>{candidate.symbol}</span>
+                    <span>{candidate.setup_family.replace('_', ' ')}</span>
+                    <span>{candidate.rank_score.toFixed(1)}</span>
+                    <span>{candidate.regime_label}</span>
+                    <span>{candidate.relvol.toFixed(2)}x</span>
+                    <span>{pct(candidate.mfe_10d_pct)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         <div className="strategy-research-panel">
@@ -3633,6 +3761,8 @@ export default function App() {
   const [historicalScreener, setHistoricalScreener] = useState<HistoricalScreenerResponse | null>(null)
   const [freshSignals, setFreshSignals] = useState<FreshSignalsResponse | null>(null)
   const [bambooLatest, setBambooLatest] = useState<BambooLatestResponse | null>(null)
+  const [multiDerive, setMultiDerive] = useState<MultiDeriveResponse | null>(null)
+  const [loadingMultiDerive, setLoadingMultiDerive] = useState(false)
   const [accounts, setAccounts] = useState<BrokerAccountSnapshot[]>([])
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([])
   const [paperBudget, setPaperBudget] = useState<PaperBudget | null>(null)
@@ -3679,10 +3809,11 @@ export default function App() {
     setRefreshing(true)
     setError('')
     try {
-      const [homeData, scannerData, bambooData, accountData, nextPaperTrades, nextPaperBudget] = await Promise.all([
+      const [homeData, scannerData, bambooData, multiDeriveData, accountData, nextPaperTrades, nextPaperBudget] = await Promise.all([
         getSwingHome(),
         getSwingScanner(28),
         getBambooLatest().catch(() => null),
+        getMultiDeriveResearch().catch(() => null),
         getBrokerAccounts().catch(() => []),
         getPaperTrades().catch(() => []),
         getPaperBudget().catch(() => null),
@@ -3691,6 +3822,7 @@ export default function App() {
         setHome(homeData)
         setScanner(scannerData)
         setBambooLatest(bambooData)
+        setMultiDerive(multiDeriveData)
         setAccounts(accountData)
         setPaperTrades(nextPaperTrades)
         setPaperBudget(nextPaperBudget)
@@ -3788,6 +3920,19 @@ export default function App() {
     }
   }
 
+  const loadMultiDeriveResearch = async () => {
+    setLoadingMultiDerive(true)
+    setError('')
+    try {
+      const payload = await getMultiDeriveResearch()
+      setMultiDerive(payload)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setLoadingMultiDerive(false)
+    }
+  }
+
   const refreshBacktestCacheNow = async () => {
     setRefreshingBacktestCache(true)
     setError('')
@@ -3805,6 +3950,11 @@ export default function App() {
     if (view !== 'backtests' || backtests || loadingBacktestDashboard) return
     void loadBacktestDashboard()
   }, [view, backtests, loadingBacktestDashboard])
+
+  useEffect(() => {
+    if (view !== 'research' || multiDerive || loadingMultiDerive) return
+    void loadMultiDeriveResearch()
+  }, [view, multiDerive, loadingMultiDerive])
 
   useEffect(() => {
     if (!selectedSymbol) return
@@ -4147,7 +4297,16 @@ export default function App() {
                 onRun={runBacktestNow}
               />
             )}
-            {view === 'research' && <ResearchView setupMix={home?.setup_mix ?? []} bambooLatest={bambooLatest} onSelect={openStock} />}
+            {view === 'research' && (
+              <ResearchView
+                setupMix={home?.setup_mix ?? []}
+                bambooLatest={bambooLatest}
+                multiDerive={multiDerive}
+                loadingMultiDerive={loadingMultiDerive}
+                onReloadMultiDerive={loadMultiDeriveResearch}
+                onSelect={openStock}
+              />
+            )}
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}
             {view === 'stock' && (
               <StockDetailView
