@@ -1785,7 +1785,7 @@ fn evaluate_live_signal(
                 score, setup_family, volume_ratio
             ),
         )
-    } else if strategy_status == "Research" && entry_window_open {
+    } else if strategy_status == "Candidate" && entry_window_open {
         (
             "ENTRY_NOW",
             "Enter Now",
@@ -1794,7 +1794,7 @@ fn evaluate_live_signal(
                 strategy_label, score, distance_to_52w_high_pct, volume_ratio
             ),
         )
-    } else if strategy_status == "Research" {
+    } else if strategy_status == "Candidate" {
         (
             "WAIT_FOR_TRIGGER",
             "Signal Ready",
@@ -1808,7 +1808,7 @@ fn evaluate_live_signal(
             "WATCH",
             "Watch Only",
             format!(
-                "{} matches, but latest backtest diagnostics mark it Watch rather than Research.",
+                "{} matches, but latest backtest diagnostics mark it Watch rather than Candidate.",
                 strategy_label
             ),
         )
@@ -2665,9 +2665,9 @@ async fn load_latest_strategy_statuses(state: &AppState) -> anyhow::Result<HashM
                 strategy_id, \
                 multiIf( \
                     total_pnl <= 0, 'Rejected', \
-                    strategy_id = 'momentum-core-v1', 'Research', \
-                    strategy_id = 'rsi10-pullback-reversion-v1', 'Research', \
-                    strategy_id = 'failed-breakdown-reclaim-v1', 'Research', \
+                    strategy_id = 'momentum-core-v1', 'Candidate', \
+                    strategy_id = 'rsi10-pullback-reversion-v1', 'Candidate', \
+                    strategy_id = 'failed-breakdown-reclaim-v1', 'Candidate', \
                     strategy_id = 'compression-breakout-v1', 'Watch', \
                     strategy_id = 'breakout-continuation-v1', 'Watch', \
                     strategy_id = 'rs-leader-continuation-v1', 'Watch', \
@@ -3130,9 +3130,9 @@ fn strategy_match_for_screener(
 
 fn default_strategy_status(strategy_id: &str) -> &'static str {
     match strategy_id {
-        "momentum-core-v1" => "Research",
-        "rsi10-pullback-reversion-v1" => "Research",
-        "failed-breakdown-reclaim-v1" => "Research",
+        "momentum-core-v1" => "Candidate",
+        "rsi10-pullback-reversion-v1" => "Candidate",
+        "failed-breakdown-reclaim-v1" => "Candidate",
         "compression-breakout-v1" => "Watch",
         "breakout-continuation-v1" => "Watch",
         "rs-leader-continuation-v1" => "Watch",
@@ -3145,7 +3145,7 @@ fn default_strategy_status(strategy_id: &str) -> &'static str {
 
 fn strategy_status_rank(status: &str) -> u8 {
     match status {
-        "Research" => 0,
+        "Candidate" => 0,
         "Watch" => 1,
         "Fragile" => 2,
         "Rejected" => 3,
@@ -3171,7 +3171,7 @@ fn matches_setup_filter(row: &HistoricalScreenerRow, setup_filter: &str) -> bool
 fn matches_strategy_filter(row: &HistoricalScreenerRow, strategy_filter: &str) -> bool {
     match strategy_filter {
         "all" => true,
-        "fresh" | "signals" => matches!(row.strategy_status.as_str(), "Research" | "Watch"),
+        "fresh" | "signals" => matches!(row.strategy_status.as_str(), "Candidate" | "Watch"),
         value => {
             row.strategy_id.eq_ignore_ascii_case(value)
                 || row.strategy_label.to_lowercase().replace(' ', "-") == value
@@ -3313,7 +3313,7 @@ async fn stage_signal_to_paper(
 }
 
 fn is_paper_eligible_signal(row: &HistoricalScreenerRow) -> bool {
-    matches!(row.strategy_status.as_str(), "Research" | "Watch")
+    matches!(row.strategy_status.as_str(), "Candidate" | "Watch")
         && paper_rule_for_strategy(&row.strategy_id).is_some()
         && row.close > 0.0
 }
@@ -3347,7 +3347,7 @@ fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
         "rsi10-pullback-reversion-v1" => PaperRule {
             stop_loss_pct: 4.0,
             take_profit_pct: 4.0,
-            source: "built-in RSI10 pullback rule",
+            source: "engine RSI10 pullback model",
         },
         "failed-breakdown-reclaim-v1" => PaperRule {
             stop_loss_pct: 4.0,

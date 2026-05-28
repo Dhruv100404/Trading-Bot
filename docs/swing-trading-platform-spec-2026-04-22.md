@@ -90,7 +90,7 @@ Keep and reuse:
 - Rust API foundation in `engine/src/api`
 - ClickHouse schema and access patterns
 - account, position, and paper/live mode concepts
-- analysis scripts under `analysis/` and `strategies/`
+- Python analysis scripts under `scripts/`
 - watchlist source files in `data/`
 
 Replace or heavily refactor:
@@ -340,7 +340,7 @@ Show:
 - `GET /api/swing/home`
 - `GET /api/swing/scanner`
 - `GET /api/swing/candidates/:symbol`
-- `GET /api/swing/research/summary`
+- `GET /api/backtests/dashboard`
 - `GET /api/paper/portfolio`
 - `GET /api/paper/plans`
 - `GET /api/paper/positions`
@@ -354,7 +354,7 @@ Show:
 - `POST /api/paper/positions/:id/close`
 - `POST /api/swing/watchlists`
 - `PATCH /api/swing/watchlists/:id`
-- `POST /api/research/refresh`
+- `POST /api/backtests/run`
 
 ### Websocket events
 
@@ -375,7 +375,7 @@ The Python worker should own batch and offline jobs:
 - generate regime summaries and evidence bundles
 - store outputs into ClickHouse
 
-This keeps heavy research loops out of the request path while still reusing the current `analysis/` and `strategies/` assets.
+This keeps heavy research loops out of the request path while still reusing the Python research and tuning assets under `scripts/`.
 
 ## Docker-Only Deployment
 

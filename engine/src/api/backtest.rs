@@ -580,6 +580,9 @@ fn default_strategy_condition(strategy: &BacktestStrategySpec) -> String {
 }
 
 fn load_backtest_strategy_specs() -> Vec<BacktestStrategySpec> {
+    // Backtest strategy behavior is code-owned. Do not load strategy behavior from
+    // external JSON files here; promote validated Python research into explicit
+    // engine specs or a dedicated Python backtest service.
     let mut specs = built_in_variant_specs();
     if specs.is_empty() {
         specs.push(BacktestStrategySpec {
@@ -1038,7 +1041,7 @@ async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::R
             strategy_id, method_family, total_trades, total_pnl, win_rate, profit_factor, expectancy_pct, \
             positive_months_pct, median_monthly_pnl, worst_month, best_month, max_drawdown_rs, \
             round(raw_stability_score, 2) AS stability_score, \
-            multiIf(total_pnl <= 0, 'Rejected', raw_stability_score >= 56 AND positive_months_pct >= 55, 'Research', raw_stability_score >= 50, 'Watch', 'Fragile') AS status \
+            multiIf(total_pnl <= 0, 'Rejected', raw_stability_score >= 56 AND positive_months_pct >= 55, 'Candidate', raw_stability_score >= 50, 'Watch', 'Fragile') AS status \
         FROM ( \
             SELECT \
                 s.strategy_id AS strategy_id, \

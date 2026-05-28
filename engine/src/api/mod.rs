@@ -11,7 +11,6 @@ pub mod positions;
 pub mod paper;
 pub mod swing;
 pub mod backtest;
-pub mod research;
 
 /// Short-lived cache of Dhan quotes shared across swing endpoints.
 pub struct CachedQuotes {
@@ -63,7 +62,6 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         .route("/api/backtests/datewise",        get(backtest::datewise))
         .route("/api/backtests/feature-cache/refresh", post(backtest::refresh_cache))
         .route("/api/backtests/run",             post(backtest::run))
-        .route("/api/research/multi-derive",     get(research::multi_derive))
         .layer(cors)
         .with_state(state);
 

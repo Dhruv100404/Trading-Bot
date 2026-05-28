@@ -531,7 +531,7 @@
   .home-candidate-row {
     width: 100%;
     display: grid;
-    grid-template-columns: 34px minmax(145px, 1.05fr) minmax(132px, 0.9fr) 112px 70px 48px minmax(100px, 0.72fr);
+    grid-template-columns: 34px minmax(145px, 1.05fr) minmax(132px, 0.9fr) 112px 70px 48px minmax(100px, 0.72fr) minmax(112px, 0.55fr);
     gap: 10px;
     align-items: center;
     border: 1px solid #263a55;
@@ -540,6 +540,34 @@
     padding: 8px 10px;
     text-align: left;
     color: #f8fafc;
+  }
+
+  .home-row-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+
+  .home-row-actions .ghost-button {
+    width: 32px;
+    height: 32px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .top-picks-toolbar {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .top-picks-toolbar .filter-strip {
+    padding: 0;
+  }
+
+  .top-picks-sort {
+    width: auto;
+    min-width: 142px;
   }
 
   .home-candidate-row:hover,
@@ -781,7 +809,7 @@
 
   .hero-stat-grid,
   .detail-metrics-grid,
-  .research-grid,
+  .api-grid,
   .queue-grid,
   .lane-grid,
   .opportunity-grid,
@@ -976,7 +1004,7 @@
 
   .opportunity-grid,
   .mix-stack,
-  .research-grid,
+  .api-grid,
   .settings-grid,
   .queue-grid,
   .workflow-stack {
@@ -990,7 +1018,7 @@
   .candidate-card,
   .inner-surface,
   .mix-row,
-  .research-card {
+  .api-card {
     position: relative;
     border: 1px solid var(--line);
     background: var(--surface-strong);
@@ -1179,6 +1207,28 @@
     background: var(--surface);
   }
 
+  .scanner-strategy-groups {
+    display: grid;
+    gap: 12px;
+  }
+
+  .scanner-strategy-section {
+    padding: 12px;
+  }
+
+  .scanner-strategy-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+
+  .scanner-strategy-head h3 {
+    margin: 4px 0 0;
+    font-size: 1rem;
+  }
+
   .scanner-table thead {
     background: #0b1220;
   }
@@ -1250,7 +1300,7 @@
     letter-spacing: 0.08em;
   }
 
-  .strategy-pill-research {
+  .strategy-pill-candidate {
     border-color: rgba(38, 223, 154, 0.42);
     background: rgba(0, 168, 107, 0.12);
   }
@@ -1644,7 +1694,7 @@
   }
 
   .queue-grid,
-  .research-grid {
+  .api-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2216,15 +2266,6 @@
     padding: 10px 12px;
   }
 
-  .research-replay-note {
-    margin: 12px 0;
-    align-items: flex-start;
-    border-color: rgba(244, 184, 73, 0.38);
-    background: rgba(244, 184, 73, 0.08);
-    color: #f6ddb0;
-    line-height: 1.45;
-  }
-
   .backtest-control-panel {
     margin-bottom: 14px;
   }
@@ -2469,7 +2510,7 @@
     background: rgba(255, 139, 139, 0.06);
   }
 
-  .method-status-research {
+  .method-status-candidate {
     background: rgba(0, 168, 107, 0.08);
   }
 
@@ -2661,7 +2702,7 @@
     margin-top: 0;
   }
 
-  .research-card p {
+  .api-card p {
     color: var(--muted);
     margin: 8px 0 0;
     line-height: 1.5;
@@ -2744,96 +2785,10 @@
     background: var(--accent-soft);
   }
 
-  .strategy-research-panel {
-    padding: 0 18px 18px;
-  }
-
-  .strategy-research-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    margin-top: 12px;
-  }
-
-  .strategy-research-card {
-    padding: 14px;
-  }
-
-  .strategy-research-card.tone-positive {
-    border-color: rgba(38, 223, 154, 0.28);
-  }
-
-  .strategy-research-card.tone-warning {
-    border-color: rgba(255, 205, 107, 0.28);
-  }
-
-  .strategy-research-card.tone-danger {
-    border-color: rgba(255, 139, 139, 0.28);
-  }
-
-  .strategy-research-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .strategy-research-head strong {
-    display: block;
-    margin-top: 4px;
-    font-size: 1rem;
-  }
-
-  .status-dot {
-    width: 9px;
-    height: 9px;
-    flex: 0 0 auto;
-    border-radius: 999px;
-    margin-top: 4px;
-    background: var(--muted);
-  }
-
-  .status-dot.tone-positive {
-    background: var(--accent-strong);
-  }
-
-  .status-dot.tone-warning {
-    background: var(--warning);
-  }
-
-  .status-dot.tone-danger {
-    background: var(--danger);
-  }
-
-  .strategy-research-card p {
-    min-height: 72px;
-    margin: 12px 0;
-    color: var(--muted);
-    line-height: 1.48;
-  }
-
   .strategy-metric-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
-  }
-
-  .research-verdict {
-    display: grid;
-    gap: 7px;
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid var(--line);
-    color: var(--muted);
-    line-height: 1.45;
-  }
-
-  .research-verdict strong {
-    color: var(--text);
-  }
-
-  .multi-derive-verdict {
-    margin: 12px 0;
   }
 
   .multi-derive-grid {
@@ -2917,24 +2872,6 @@
   .doc-link:hover {
     color: var(--accent-strong);
     border-bottom-color: #a9e7cc;
-  }
-
-  .research-notes {
-    margin: 0 18px 18px;
-    padding: 14px;
-    border-radius: 8px;
-    background: var(--surface-strong);
-    border: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .research-notes div {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    color: var(--muted);
   }
 
   .settings-list {
@@ -3067,8 +3004,7 @@
   .paper-desk-hero,
   .desk-control-panel,
   .datewise-toolbar,
-  .strategy-research-grid,
-  .research-grid,
+  .api-grid,
   .scanner-summary-strip {
     grid-template-columns: 1fr;
   }
@@ -3087,7 +3023,7 @@
   }
 
   .home-candidate-row {
-    grid-template-columns: 30px minmax(130px, 1fr) minmax(120px, 0.8fr) 86px 60px 42px minmax(88px, 0.65fr);
+    grid-template-columns: 30px minmax(130px, 1fr) minmax(120px, 0.8fr) 86px 60px 42px minmax(88px, 0.65fr) minmax(98px, 0.55fr);
   }
 }
 
@@ -3108,7 +3044,7 @@
   .opportunity-grid,
   .lane-grid,
   .mix-stack,
-  .research-grid,
+  .api-grid,
   .queue-grid,
   .settings-grid {
     padding: 14px;
@@ -3141,7 +3077,7 @@
   }
 
   .home-candidate-row {
-    grid-template-columns: 30px minmax(0, 1fr) 44px;
+    grid-template-columns: 30px minmax(0, 1fr) 44px 102px;
   }
 
   .home-setup-cell,

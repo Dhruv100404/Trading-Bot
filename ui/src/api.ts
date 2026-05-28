@@ -448,95 +448,6 @@ export interface BacktestCacheRefreshResponse {
   message: string
 }
 
-export interface MultiDeriveMetric {
-  strategy: string
-  cost_scenario: string
-  trades: number
-  win_rate: number
-  profit_factor: number
-  total_return_proxy_pct: number
-  max_drawdown_proxy_pct: number
-  expectancy_pct: number
-  avg_hold_days: number
-  stop_atr: number
-  target_atr: number
-  max_hold_days: number
-}
-
-export interface MultiDeriveSplit {
-  strategy: string
-  trades: number
-  win_rate: number
-  profit_factor: number
-  total_return_proxy_pct: number
-  max_drawdown_proxy_pct: number
-  expectancy_pct: number
-  range_start: string
-  range_end: string
-}
-
-export interface MultiDeriveYear {
-  year: number
-  trades: number
-  win_rate: number
-  profit_factor: number
-  total_return_proxy_pct: number
-  max_drawdown_proxy_pct: number
-  expectancy_pct: number
-}
-
-export interface MultiDeriveExit {
-  exit_reason: string
-  trades: number
-  win_rate: number
-  avg_net_return_pct: number
-  total_net_return_pct: number
-  avg_hold_days: number
-}
-
-export interface MultiDeriveSymbol {
-  symbol: string
-  trades: number
-  win_rate: number
-  avg_net_return_pct: number
-  total_net_return_pct: number
-}
-
-export interface MultiDeriveCandidate {
-  symbol: string
-  trade_date: string
-  setup_family: string
-  close: number
-  next_open: number
-  composite_alpha_score: number
-  rank_score: number
-  regime_label: string
-  market_stress_score: number
-  trend_regime: string
-  volatility_regime: string
-  rs60_rank: number
-  relvol: number
-  atr_pct: number
-  gap_pct: number
-  mfe_10d_pct: number
-  mae_10d_pct: number
-  hit_2pct_10d: boolean
-  drawdown_3pct_10d: boolean
-}
-
-export interface MultiDeriveResponse {
-  updated_at: string
-  manifest: Record<string, unknown> | null
-  champion_manifest: Record<string, unknown> | null
-  metrics: MultiDeriveMetric[]
-  splits: MultiDeriveSplit[]
-  yearly: MultiDeriveYear[]
-  exits: MultiDeriveExit[]
-  symbols: MultiDeriveSymbol[]
-  latest_candidates: MultiDeriveCandidate[]
-  message: string | null
-}
-
 async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const timeoutMs = options?.timeoutMs ?? 60000
   const controller = new AbortController()
@@ -577,11 +488,11 @@ async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: n
 }
 
 export async function getSwingHome(): Promise<SwingHomeResponse> {
-  return apiFetch<SwingHomeResponse>('/api/swing/home')
+  return apiFetch<SwingHomeResponse>('/api/swing/home', { timeoutMs: 10000 })
 }
 
 export async function getSwingScanner(limit = 24): Promise<SwingScannerResponse> {
-  return apiFetch<SwingScannerResponse>(`/api/swing/scanner?limit=${limit}`)
+  return apiFetch<SwingScannerResponse>(`/api/swing/scanner?limit=${limit}`, { timeoutMs: 15000 })
 }
 
 export async function getSwingCandidate(symbol: string): Promise<SwingCandidateResponse> {
@@ -606,7 +517,7 @@ export async function getHistoricalScreener(params?: {
   if (params?.minPrice) search.set('min_price', String(params.minPrice))
   if (params?.minAvgVolume) search.set('min_avg_volume', String(params.minAvgVolume))
   const query = search.toString()
-  return apiFetch<HistoricalScreenerResponse>(`/api/swing/historical-screener${query ? `?${query}` : ''}`)
+  return apiFetch<HistoricalScreenerResponse>(`/api/swing/historical-screener${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
 }
 
 export async function stageFreshSignals(params?: {
@@ -716,8 +627,4 @@ export async function runBacktest(): Promise<BacktestRunResponse> {
     method: 'POST',
     timeoutMs: 300000,
   })
-}
-
-export async function getMultiDeriveResearch(): Promise<MultiDeriveResponse> {
-  return apiFetch<MultiDeriveResponse>('/api/research/multi-derive')
 }

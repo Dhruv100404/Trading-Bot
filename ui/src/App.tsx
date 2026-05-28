@@ -6,7 +6,6 @@ import {
   ArrowUpRight,
   BarChart3,
   Bookmark,
-  BrainCircuit,
   BriefcaseBusiness,
   CalendarDays,
   ChevronLeft,
@@ -30,7 +29,7 @@ import {
   getBacktestDashboard,
   getBacktestDatewise,
   getBambooLatest,
-  getMultiDeriveResearch,
+  getHistoricalScreener,
   closePaperTrade,
   deletePaperTrade,
   getPaperBudget,
@@ -60,15 +59,13 @@ import {
   type LiveSignal,
   type PaperTrade,
   type PaperBudget,
-  type MultiDeriveResponse,
   type SymbolHistoryResponse,
-  type SetupMix,
   type SwingCandidate,
   type SwingHomeResponse,
   type SwingScannerResponse,
 } from './api'
 
-type View = 'home' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'research' | 'settings' | 'stock'
+type View = 'home' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'settings' | 'stock'
 type HistoryRange = '3m' | '6m' | '1y' | '3y' | '5y'
 type PaperDeskTab = 'open' | 'closed' | 'weekly' | 'strategy' | 'intake'
 
@@ -80,12 +77,11 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { id: 'home', label: 'Home', icon: LayoutDashboard, blurb: 'Regime and opportunity pulse' },
-  { id: 'scanner', label: 'Scanner', icon: Radar, blurb: 'Find fresh swing setups' },
+  { id: 'home', label: 'Dashboard', icon: LayoutDashboard, blurb: 'Market, risk, and top picks' },
+  { id: 'scanner', label: 'Scanner', icon: Radar, blurb: 'Strategy-first signal board' },
   { id: 'watchlist', label: 'Watchlist', icon: Bookmark, blurb: 'Organize stocks to monitor' },
-  { id: 'portfolio', label: 'Paper Desk', icon: WalletCards, blurb: 'Stage paper trade plans' },
-  { id: 'backtests', label: 'Backtests', icon: BarChart3, blurb: 'Strategy returns and analytics' },
-  { id: 'research', label: 'Research', icon: BrainCircuit, blurb: 'Setup mix and process notes' },
+  { id: 'backtests', label: 'Backtest', icon: BarChart3, blurb: 'Strategy returns and trades' },
+  { id: 'portfolio', label: 'Paper Desk', icon: WalletCards, blurb: 'Live paper execution' },
   { id: 'settings', label: 'Settings', icon: Compass, blurb: 'Dhan status and API direction' },
 ]
 
@@ -115,7 +111,7 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
   'near-52w-high-v1': {
     stopLossPct: 5,
     takeProfitPct: 10,
-    source: 'built-in near-52w-high rule',
+    source: 'engine near-52w-high model',
   },
   'near-52w-high-runner-v2': {
     stopLossPct: 5,
@@ -140,7 +136,7 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
   'pullback-20dma-v1': {
     stopLossPct: 3,
     takeProfitPct: 6,
-    source: 'built-in pullback-20dma rule',
+    source: 'engine pullback-20dma model',
   },
   'pullback-quality-v2': {
     stopLossPct: 3,
@@ -150,12 +146,12 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
   'rsi10-pullback-reversion-v1': {
     stopLossPct: 4,
     takeProfitPct: 4,
-    source: 'built-in RSI10 pullback rule',
+    source: 'engine RSI10 pullback model',
   },
   'swing-breakout-v1': {
     stopLossPct: 4,
     takeProfitPct: 8,
-    source: 'built-in swing-breakout rule',
+    source: 'engine swing-breakout model',
   },
   'breakout-volume-v2': {
     stopLossPct: 4,
@@ -183,153 +179,6 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
     source: 'relative-strength continuation model',
   },
 }
-
-interface ResearchStrategyCard {
-  name: string
-  status: string
-  tone: Tone
-  rule: string
-  trades: number
-  monthly: number
-  winRate: number
-  profitFactor: number
-  expectancy: number
-  oos: string
-  warning: string
-}
-
-const RESEARCH_STRATEGIES: ResearchStrategyCard[] = [
-  {
-    name: 'Regime Mean Reversion',
-    status: 'Watchlist from regime suite',
-    tone: 'positive',
-    rule: 'Liquid long-term uptrend stock, non-trending ADX-below-30 regime, z-score below -2.5, more than 1.5 ATR under EMA20, RSI14 below 30, and no severe gap.',
-    trades: 108,
-    monthly: 2.0,
-    winRate: 62.04,
-    profitFactor: 2.766,
-    expectancy: 2.453,
-    oos: 'Passed summary gates: OOS PF 1.591 with +1.067% OOS expectancy.',
-    warning: 'Sample is still small, especially OOS with 13 trades. Keep it paper/watchlist only until walk-forward and forward paper trades confirm.',
-  },
-  {
-    name: 'Regime Trend Breakout',
-    status: 'Rejected baseline',
-    tone: 'danger',
-    rule: 'Liquid RS leader in trending regime breaks a 20-day high with above-average volume, constructive breadth, strong close location, and no high-volatility flag.',
-    trades: 417,
-    monthly: 7.8,
-    winRate: 40.05,
-    profitFactor: 1.019,
-    expectancy: 0.070,
-    oos: 'Rejected: OOS PF 0.917 and stress-cost PF below the gate.',
-    warning: 'Useful as a tested regime baseline, but not good enough to promote into fresh signals yet.',
-  },
-  {
-    name: 'Breakout + Volume Confirmation',
-    status: 'Rejected baseline',
-    tone: 'danger',
-    rule: 'Liquid trending stock clears a prior 55-day high with 2.6x relative volume, ATR expansion, RS leadership, and a very strong close location.',
-    trades: 562,
-    monthly: 10.6,
-    winRate: 40.21,
-    profitFactor: 1.009,
-    expectancy: 0.040,
-    oos: 'Rejected: OOS PF 0.733 and -1.100% OOS expectancy.',
-    warning: 'The dataset is not rewarding this breakout shape after costs; keep it as research evidence only.',
-  },
-  {
-    name: 'Multi-Factor Score',
-    status: 'Rejected baseline',
-    tone: 'danger',
-    rule: 'Liquid 20-day high breakout with momentum, trend, volume, RSI/z-score, and close-location score at least 9 after risk penalties.',
-    trades: 1643,
-    monthly: 30.8,
-    winRate: 38.41,
-    profitFactor: 0.875,
-    expectancy: -0.387,
-    oos: 'Rejected: negative expectancy in base, validation, and OOS splits.',
-    warning: 'The scoring idea is directionally useful, but this first threshold model is too broad for promotion.',
-  },
-  {
-    name: 'Bamboo MTF Breakout',
-    status: 'Research only',
-    tone: 'danger',
-    rule: 'Long-term base breakout proxy first, then daily swing-high breakout. Stop is signal candle low; targets are 2R or 3R depending on the variant.',
-    trades: 1778,
-    monthly: 34.5,
-    winRate: 34.42,
-    profitFactor: 1.051,
-    expectancy: 0.169,
-    oos: 'Best variant was bamboo_2y_base_breakout_3r, but out-of-sample expectancy stayed negative.',
-    warning: 'Show latest raw signals for study only. Do not promote to live entries until new filters pass validation.',
-  },
-  {
-    name: 'RSI10 Pullback Reversion',
-    status: 'New research',
-    tone: 'warning',
-    rule: 'Long only when the stock is above SMA200 and RSI10 closes below 30; original rule exits when RSI10 crosses above 40 or after 10 trading days.',
-    trades: 0,
-    monthly: 0,
-    winRate: 0,
-    profitFactor: 0,
-    expectancy: 0,
-    oos: 'Added from the shared YouTube training link and adapted from broad-market rules to NSE individual-stock screening.',
-    warning: 'Needs local backtest validation before treating it as approved live edge. Paper proxy uses 4% target, 4% stop, and 5 trading-session tracking.',
-  },
-  {
-    name: 'ATR Stretch Liquid Only',
-    status: 'Paper-test watchlist',
-    tone: 'warning',
-    rule: 'Close above SMA200, more than 2.5 ATR below EMA20, RSI14 below 35, price at least 50, 20-day volume at least 100k; enter next session open.',
-    trades: 1881,
-    monthly: 32.9,
-    winRate: 54.01,
-    profitFactor: 1.464,
-    expectancy: 1.042,
-    oos: 'Second-pass OOS passed narrowly: 384 trades, PF 1.061, expectancy +0.144%.',
-    warning: 'Paper-test only. 2026 remains weak: 79 trades, PF 0.750, expectancy -0.839%.',
-  },
-  {
-    name: 'ATR Stretch Reversal',
-    status: 'Base variant rejected',
-    tone: 'danger',
-    rule: 'Close more than 2.5 ATR below EMA20 while still above SMA200, RSI14 below 35; enter next session open.',
-    trades: 2560,
-    monthly: 44.8,
-    winRate: 51.76,
-    profitFactor: 1.348,
-    expectancy: 0.839,
-    oos: 'Full-period strong, but 2026 failed: 101 trades, PF 0.538, expectancy -1.764%.',
-    warning: 'Use the liquid-only paper-test variant instead of this broad version.',
-  },
-  {
-    name: 'NR7 Breakout Close',
-    status: 'Rejected after second pass',
-    tone: 'danger',
-    rule: 'Narrowest 7-day range, close above prior 20-day high, relative volume above 1.0; enter next session open.',
-    trades: 1450,
-    monthly: 22.9,
-    winRate: 43.79,
-    profitFactor: 1.12,
-    expectancy: 0.318,
-    oos: 'Second-pass NR7 filters did not pass validation and walk-forward gates.',
-    warning: 'Do not show this as a tradable signal yet.',
-  },
-  {
-    name: 'Broad Trend/Pullback Setups',
-    status: 'Rejected for now',
-    tone: 'danger',
-    rule: 'EMA pullbacks, 20/55-day breakouts, squeeze breakouts, gap-down reversals, RSI2 reversion.',
-    trades: 100000,
-    monthly: 200,
-    winRate: 40.0,
-    profitFactor: 1.0,
-    expectancy: 0,
-    oos: 'Most collapsed in 2025-26 after fees and slippage.',
-    warning: 'Do not show these as tradable signals without new filters.',
-  },
-]
 
 interface DhanApiSurface {
   label: string
@@ -365,7 +214,7 @@ const DHAN_API_SURFACES: DhanApiSurface[] = [
     label: 'Platform Overview',
     endpoints: 'Market Feed, Statements, Margin Calculator, and more',
     summary: 'Useful as the top-level integration map while we expand beyond quote snapshots and account status.',
-    constraint: 'Good reference point for deciding what should stay in the swing workspace versus the research worker.',
+    constraint: 'Good reference point for deciding what should stay in the swing workspace versus the analysis worker.',
     docUrl: 'https://docs.dhanhq.co/',
   },
 ]
@@ -437,8 +286,16 @@ function signalClass(status: LiveSignal['status']) {
 function parseRouteHash(): { view: View; symbol: string | null } {
   const path = window.location.pathname.replace(/^\/+/, '')
   const [viewPart, symbolPart] = path.split('/')
-  const knownViews: View[] = ['home', 'scanner', 'watchlist', 'portfolio', 'backtests', 'research', 'settings', 'stock']
-  const view = knownViews.includes(viewPart as View) ? (viewPart as View) : 'home'
+  const aliases: Record<string, View> = {
+    dashboard: 'home',
+    backtest: 'backtests',
+    'paper-desk': 'portfolio',
+  }
+  const knownViews: View[] = ['home', 'scanner', 'watchlist', 'portfolio', 'backtests', 'settings', 'stock']
+  const view = aliases[viewPart] ?? (knownViews.includes(viewPart as View) ? (viewPart as View) : 'home')
+  if (viewPart && !aliases[viewPart] && !knownViews.includes(viewPart as View)) {
+    window.history.replaceState(null, '', '/home')
+  }
   return {
     view,
     symbol: view === 'stock' && symbolPart ? decodeURIComponent(symbolPart).toUpperCase() : null,
@@ -507,8 +364,8 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
     ],
     source: 'parquet-screener',
     live_signal: defaultLiveSignal({
-      status: row.strategy_status === 'Research' ? 'WAIT_FOR_TRIGGER' : row.strategy_status === 'Watch' ? 'WATCH' : 'NO_TRADE',
-      label: row.strategy_status === 'Research' ? 'Needs Live Trigger' : row.strategy_status === 'Watch' ? 'Watch Only' : 'No Trade',
+      status: row.strategy_status === 'Watch' ? 'WATCH' : row.strategy_status === 'Rejected' ? 'NO_TRADE' : 'WAIT_FOR_TRIGGER',
+      label: row.strategy_status === 'Watch' ? 'Watch Only' : row.strategy_status === 'Rejected' ? 'No Trade' : 'Needs Live Trigger',
       reason: `Historical screener row maps to ${strategyLabel}; live Dhan confirmation is still required before entry.`,
       strategy_id: row.strategy_id,
       strategy_label: strategyLabel,
@@ -530,36 +387,36 @@ function createCandidateFromBambooSignal(signal: BambooLatestSignal): SwingCandi
     setup_family: 'Bamboo MTF Breakout',
     bias: 'Long',
     score,
-    confidence: 'Research Signal',
+    confidence: 'Review Signal',
     regime_fit: Math.max(55, Math.min(90, score - 4)),
     risk_reward: Number((reward / risk).toFixed(2)),
     last_price: signal.close,
     day_change_pct: 0,
     open_gap_pct: signal.gap_pct,
     distance_to_high_pct: Number((((signal.prior_high20 - signal.close) / Math.max(signal.prior_high20, 0.01)) * 100).toFixed(2)),
-    liquidity_bucket: 'RESEARCH',
+    liquidity_bucket: 'REVIEW',
     entry_zone: `Next open / live confirmation above Rs ${signal.prior_high20.toFixed(2)}`,
     stop_loss: signal.stop,
     target_price: signal.target_from_close,
     expected_hold: signal.risk_multiple >= 3 ? 'Up to 20 sessions' : 'Up to 15 sessions',
-    thesis: `${signal.symbol} matched the Bamboo multi-timeframe breakout research rules on ${signal.signal_date}: long-term resistance proxy cleared, daily prior high broken, and volume expanded to ${signal.relvol.toFixed(2)}x.`,
+    thesis: `${signal.symbol} matched the Bamboo multi-timeframe breakout rules on ${signal.signal_date}: long-term resistance proxy cleared, daily prior high broken, and volume expanded to ${signal.relvol.toFixed(2)}x.`,
     reasons: [
       `Prior 20-day high trigger: Rs ${signal.prior_high20.toFixed(2)}.`,
       `Signal candle close location: ${(signal.close_loc * 100).toFixed(1)}% of range.`,
       `52-week range position: ${(signal.range_position_52w * 100).toFixed(1)}%.`,
     ],
     risks: [
-      `Research-only setup. Latest Bamboo variants failed robustness gates overall.`,
+      `Review-only setup. Latest Bamboo variants failed robustness gates overall.`,
       `Signal-candle-low stop is Rs ${signal.stop.toFixed(2)}, about ${signal.risk_pct_vs_close.toFixed(2)}% below close.`,
     ],
-    source: 'bamboo-research',
+    source: 'bamboo-analysis',
     live_signal: defaultLiveSignal({
       status: 'WATCH',
-      label: 'Research Only',
+      label: 'Review Only',
       reason: 'Bamboo signal is visible for study/paper review only; the strategy is not approved for fresh live entries.',
       strategy_id: signal.strategy,
       strategy_label: 'Bamboo MTF Breakout',
-      strategy_status: 'Research Only',
+      strategy_status: 'Review Only',
       setup_family: 'Bamboo MTF Breakout',
       score,
       as_of: signal.signal_date,
@@ -632,6 +489,51 @@ function paperSourceLabel(trade: PaperTrade) {
   if (isSystemPaperTrade(trade)) return 'System intake'
   if (trade.notes.includes('Manual paper-stage')) return 'Manual'
   return trade.setup_family || 'Paper'
+}
+
+function createHistoricalRowFromCandidate(candidate: SwingCandidate): HistoricalScreenerRow {
+  return {
+    symbol: candidate.symbol,
+    as_of: candidate.live_signal.as_of,
+    setup_family: candidate.setup_family,
+    strategy_id: candidate.live_signal.strategy_id,
+    strategy_label: candidate.live_signal.strategy_label || candidate.setup_family,
+    strategy_status: candidate.live_signal.strategy_status || 'Candidate',
+    score: candidate.score,
+    trend_label: candidate.regime_fit >= 70 ? 'Constructive' : 'Mixed',
+    close: candidate.last_price,
+    sma20: candidate.last_price,
+    sma50: candidate.last_price,
+    avg_volume20: 0,
+    volume_ratio: 0,
+    distance_to_20d_high_pct: candidate.distance_to_high_pct,
+    distance_to_52w_high_pct: candidate.distance_to_high_pct,
+    range_position_pct: 0,
+    atr14: 0,
+    atr_pct: 0,
+    close_location: 0,
+    gap_pct: candidate.open_gap_pct,
+    rs60_rank: candidate.regime_fit,
+    rs120_rank: candidate.regime_fit,
+    market_breadth200: 0,
+    planned_entry: candidate.entry_zone,
+    stop_loss: candidate.stop_loss,
+    target_price: candidate.target_price,
+    risk_reward: candidate.risk_reward,
+  }
+}
+
+function createHistoricalScreenerFromScanner(scanner: SwingScannerResponse): HistoricalScreenerResponse {
+  return {
+    updated_at: scanner.updated_at,
+    range: 'live',
+    signal_date: scanner.updated_at,
+    total_rows: scanner.total_candidates,
+    rows: scanner.candidates.map(createHistoricalRowFromCandidate),
+    message: scanner.live_data
+      ? null
+      : 'Showing scanner candidates because the historical screener feed is unavailable.',
+  }
 }
 
 function isSystemPaperTrade(trade: PaperTrade) {
@@ -1106,7 +1008,7 @@ function StockAnalysisPanel({
     return (
       <Surface className="stock-analysis-panel empty-panel">
         <div className="empty-icon-shell">
-          <BrainCircuit size={18} />
+          <Target size={18} />
         </div>
         <h3>No analysis loaded</h3>
         <p>Pick a stock from Home, Scanner, Watchlist, or Paper Desk to open the full reasoning view.</p>
@@ -1237,20 +1139,81 @@ function StockDetailView({
 
 function HomeView({
   home,
+  loading,
+  loadError,
   watchlistCount,
   paperCount,
   selectedSymbol,
   onSelect,
+  onNavigate,
+  onQueue,
+  onReload,
 }: {
   home: SwingHomeResponse | null
+  loading: boolean
+  loadError: string
   watchlistCount: number
   paperCount: number
   selectedSymbol: string | null
   onSelect: (symbol: string) => void
+  onNavigate: (view: View) => void
+  onQueue: (candidate: SwingCandidate) => void
+  onReload: () => void
 }) {
-  if (!home) return <PageSkeleton />
+  const [strategyFilter, setStrategyFilter] = useState('All')
+  const [directionFilter, setDirectionFilter] = useState<'all' | 'long' | 'short' | 'high'>('all')
+  const [sortBy, setSortBy] = useState<'score' | 'risk' | 'strategy' | 'latest'>('score')
+  const [detailSymbol, setDetailSymbol] = useState<string | null>(null)
+
+  if (!home) {
+    if (loading) return <PageSkeleton />
+    return (
+      <div className="page-stack">
+        <Surface>
+          <div className="empty-action-panel">
+            <LayoutDashboard size={22} />
+            <div>
+              <span className="eyebrow">Dashboard</span>
+              <h2>Dashboard data did not load</h2>
+              <p>{loadError || 'The dashboard is ready to fetch the market overview and top picks.'}</p>
+              <div className="empty-action-buttons">
+                <button type="button" className="primary-button" onClick={onReload}>
+                  <RefreshCw size={14} />
+                  <span>Reload Dashboard</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </Surface>
+      </div>
+    )
+  }
 
   const entryNowCount = home.top_candidates.filter((candidate) => candidate.live_signal.status === 'ENTRY_NOW').length
+  const strategies = ['All', ...Array.from(new Set(home.top_candidates.map((candidate) => candidate.live_signal.strategy_label || candidate.setup_family)))]
+  const filteredTopPicks = home.top_candidates
+    .filter((candidate) => {
+      const strategyName = candidate.live_signal.strategy_label || candidate.setup_family
+      const matchesStrategy = strategyFilter === 'All' || strategyName === strategyFilter
+      const matchesDirection =
+        directionFilter === 'all'
+        || (directionFilter === 'long' && candidate.bias.toLowerCase().includes('long'))
+        || (directionFilter === 'short' && candidate.bias.toLowerCase().includes('short'))
+        || (directionFilter === 'high' && candidate.score >= 85)
+      return matchesStrategy && matchesDirection
+    })
+    .sort((a, b) => {
+      if (sortBy === 'risk') return b.risk_reward - a.risk_reward
+      if (sortBy === 'strategy') return (a.live_signal.strategy_label || a.setup_family).localeCompare(b.live_signal.strategy_label || b.setup_family)
+      if (sortBy === 'latest') return b.live_signal.as_of.localeCompare(a.live_signal.as_of)
+      return b.score - a.score
+    })
+  const detailCandidate =
+    filteredTopPicks.find((candidate) => candidate.symbol === detailSymbol)
+    ?? filteredTopPicks.find((candidate) => candidate.symbol === selectedSymbol)
+    ?? filteredTopPicks[0]
+    ?? null
+  const topStrategy = home.setup_mix[0]?.family ?? strategies.find((strategy) => strategy !== 'All') ?? 'No active strategy'
 
   return (
     <div className="home-dashboard">
@@ -1263,9 +1226,10 @@ function HomeView({
         <div className="home-kpi-grid">
           <CandidateStat label="Adv / Dec" value={`${home.market_regime.advances} / ${home.market_regime.declines}`} />
           <CandidateStat label="Breadth" value={home.market_regime.breadth_ratio.toFixed(2)} tone={home.market_regime.breadth_ratio >= 1 ? 'positive' : 'warning'} />
-          <CandidateStat label="Scanner" value={String(home.scanner_count)} tone="positive" />
+          <CandidateStat label="Active Signals" value={String(home.scanner_count)} tone="positive" />
+          <CandidateStat label="Top Strategy" value={topStrategy} tone="positive" />
           <CandidateStat label="Enter Now" value={String(entryNowCount)} tone={entryNowCount > 0 ? 'positive' : 'warning'} />
-          <CandidateStat label="Broker" value={home.broker.state.toUpperCase()} tone={stateTone(home.broker.state)} />
+          <CandidateStat label="Paper P/L" value="Open desk" tone={paperCount > 0 ? 'warning' : 'neutral'} />
         </div>
       </Surface>
 
@@ -1291,27 +1255,62 @@ function HomeView({
         <Surface className="home-list-panel">
           <div className="compact-section-head">
             <div>
-              <span className="eyebrow">Top Opportunities</span>
-              <h2>Best names right now</h2>
+              <span className="eyebrow">Top Picks</span>
+              <h2>Ranked trade ideas</h2>
             </div>
             <div className="mini-chip">
               <Activity size={14} />
-              <span>{Math.min(home.top_candidates.length, 5)} shown</span>
+              <span>{filteredTopPicks.length} shown</span>
+            </div>
+          </div>
+          <div className="top-picks-toolbar">
+            <div className="filter-strip compact-filter-strip">
+              {strategies.slice(0, 6).map((strategy) => (
+                <button
+                  key={strategy}
+                  type="button"
+                  onClick={() => setStrategyFilter(strategy)}
+                  className={strategyFilter === strategy ? 'filter-chip active-ghost' : 'filter-chip'}
+                >
+                  {strategy}
+                </button>
+              ))}
+            </div>
+            <div className="filter-strip compact-filter-strip">
+              {[
+                ['all', 'All'],
+                ['long', 'Long'],
+                ['short', 'Short'],
+                ['high', 'High confidence'],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setDirectionFilter(id as typeof directionFilter)}
+                  className={directionFilter === id ? 'filter-chip active-ghost' : 'filter-chip'}
+                >
+                  {label}
+                </button>
+              ))}
+              <select className="select-input top-picks-sort" value={sortBy} onChange={(event) => setSortBy(event.currentTarget.value as typeof sortBy)}>
+                <option value="score">Score</option>
+                <option value="risk">Risk/reward</option>
+                <option value="strategy">Strategy</option>
+                <option value="latest">Latest signal</option>
+              </select>
             </div>
           </div>
           <div className="home-candidate-list">
-            {home.top_candidates.slice(0, 5).map((candidate, index) => (
-              <button
+            {filteredTopPicks.slice(0, 8).map((candidate, index) => (
+              <div
                 key={candidate.symbol}
-                type="button"
-                onClick={() => onSelect(candidate.symbol)}
                 className={candidate.symbol === selectedSymbol ? 'home-candidate-row home-candidate-row-active' : 'home-candidate-row'}
               >
                 <span className="rank-cell">{index + 1}</span>
-                <span className="home-symbol-cell">
+                <button type="button" className="home-symbol-cell row-link" onClick={() => setDetailSymbol(candidate.symbol)}>
                   <strong>{candidate.symbol}</strong>
                   <em>{candidate.company_name}</em>
-                </span>
+                </button>
                 <span className="home-setup-cell">{candidate.setup_family}</span>
                 <span className="home-price-cell">{currency(candidate.last_price)}</span>
                 <span className={`home-change-cell ${candidate.day_change_pct >= 0 ? 'tone-positive' : 'tone-danger'}`}>
@@ -1319,12 +1318,61 @@ function HomeView({
                 </span>
                 <span className="home-score-cell">{candidate.score}</span>
                 <span className={`home-signal-cell ${signalClass(candidate.live_signal.status)}`}>{candidate.live_signal.label}</span>
-              </button>
+                <span className="home-row-actions">
+                  <button type="button" title="View in Scanner" className="ghost-button ghost-button-small" onClick={() => onSelect(candidate.symbol)}>
+                    <Radar size={13} />
+                  </button>
+                  <button type="button" title="Backtest setup" className="ghost-button ghost-button-small" onClick={() => onNavigate('backtests')}>
+                    <BarChart3 size={13} />
+                  </button>
+                  <button type="button" title="Send to Paper Desk" className="ghost-button ghost-button-small" onClick={() => {
+                    onQueue(candidate)
+                    onNavigate('portfolio')
+                  }}>
+                    <WalletCards size={13} />
+                  </button>
+                </span>
+              </div>
             ))}
           </div>
         </Surface>
 
         <div className="home-side-stack">
+          {detailCandidate && (
+            <Surface className="home-mini-panel">
+              <div className="compact-section-head">
+                <div>
+                  <span className="eyebrow">Signal Details</span>
+                  <h2>{detailCandidate.symbol} under {detailCandidate.live_signal.strategy_label || detailCandidate.setup_family}</h2>
+                </div>
+              </div>
+              <div className="detail-metrics-grid compact-grid">
+                <CandidateStat label="Entry" value={currency(detailCandidate.last_price)} />
+                <CandidateStat label="Stop" value={currency(detailCandidate.stop_loss)} tone="danger" />
+                <CandidateStat label="Target" value={currency(detailCandidate.target_price)} tone="positive" />
+                <CandidateStat label="R/R" value={detailCandidate.risk_reward.toFixed(2)} tone={detailCandidate.risk_reward >= 1.5 ? 'positive' : 'warning'} />
+              </div>
+              <p className="settings-copy">{detailCandidate.live_signal.reason || detailCandidate.thesis}</p>
+              <div className="hero-actions">
+                <button type="button" className="ghost-button" onClick={() => onSelect(detailCandidate.symbol)}>
+                  <Radar size={14} />
+                  <span>Scanner</span>
+                </button>
+                <button type="button" className="ghost-button" onClick={() => onNavigate('backtests')}>
+                  <BarChart3 size={14} />
+                  <span>Backtest</span>
+                </button>
+                <button type="button" className="primary-button" onClick={() => {
+                  onQueue(detailCandidate)
+                  onNavigate('portfolio')
+                }}>
+                  <WalletCards size={14} />
+                  <span>Paper</span>
+                </button>
+              </div>
+            </Surface>
+          )}
+
           <Surface className="home-mini-panel">
             <div className="compact-section-head">
               <div>
@@ -1375,6 +1423,9 @@ function ScannerView({
   onSelect,
   onStageFresh,
   onRefreshCache,
+  onReload,
+  loading,
+  loadError,
   stagingFresh,
   refreshingCache,
 }: {
@@ -1386,12 +1437,15 @@ function ScannerView({
   onSelect: (symbol: string) => void
   onStageFresh: () => void
   onRefreshCache: () => void
+  onReload: () => void
+  loading: boolean
+  loadError: string
   stagingFresh: boolean
   refreshingCache: boolean
 }) {
   const [search, setSearch] = useState('')
   const [familyFilter, setFamilyFilter] = useState<string>('All')
-  const [strategyFilter, setStrategyFilter] = useState<string>('Fresh')
+  const [strategyFilter, setStrategyFilter] = useState<string>('All')
   const [page, setPage] = useState(1)
   const pageSize = 12
   const deferredSearch = useDeferredValue(search)
@@ -1404,7 +1458,7 @@ function ScannerView({
   }, [freshSignals, historicalScreener])
 
   const strategies = useMemo(() => {
-    const options = new Map<string, string>([['Fresh', 'Fresh signals'], ['All', 'All strategies']])
+    const options = new Map<string, string>([['All', 'All Strategies']])
     const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
     sourceRows.forEach((row) => {
       options.set(row.strategy_id, row.strategy_label)
@@ -1414,11 +1468,10 @@ function ScannerView({
 
   const filtered = useMemo(() => {
     const term = deferredSearch.trim().toLowerCase()
-    const sourceRows = freshSignals?.rows ?? []
+    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
     return sourceRows.filter((row) => {
       const matchesFamily = familyFilter === 'All' || row.setup_family === familyFilter
-      const matchesStrategy = strategyFilter === 'All'
-        || (strategyFilter === 'Fresh' ? ['Research', 'Watch'].includes(row.strategy_status) : row.strategy_id === strategyFilter)
+      const matchesStrategy = strategyFilter === 'All' || row.strategy_id === strategyFilter
       const matchesSearch =
         !term ||
         row.symbol.toLowerCase().includes(term)
@@ -1426,7 +1479,7 @@ function ScannerView({
         || row.strategy_status.toLowerCase().includes(term)
       return matchesFamily && matchesStrategy && matchesSearch
     })
-  }, [deferredSearch, familyFilter, freshSignals, strategyFilter])
+  }, [deferredSearch, familyFilter, freshSignals, historicalScreener, strategyFilter])
 
   useEffect(() => {
     setPage(1)
@@ -1435,8 +1488,22 @@ function ScannerView({
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
   const safePage = Math.min(page, totalPages)
   const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
+  const groupedRows = useMemo(() => {
+    const groups = new Map<string, HistoricalScreenerRow[]>()
+    filtered.forEach((row) => {
+      const key = row.strategy_label || strategyLabel(row.strategy_id)
+      groups.set(key, [...(groups.get(key) ?? []), row])
+    })
+    return Array.from(groups.entries()).map(([label, rows]) => ({
+      label,
+      rows: rows.sort((a, b) => b.score - a.score),
+      avgScore: rows.reduce((sum, row) => sum + row.score, 0) / Math.max(rows.length, 1),
+      best: rows.reduce((best, row) => (row.score > best.score ? row : best), rows[0]),
+    }))
+  }, [filtered])
 
   if (!scanner || !historicalScreener) {
+    if (loading) return <PageSkeleton />
     return (
       <div className="page-stack">
         <Surface>
@@ -1444,9 +1511,13 @@ function ScannerView({
             <Radar size={22} />
             <div>
               <span className="eyebrow">Scanner</span>
-              <h2>Load scanner data when you need it</h2>
-              <p>Fresh signal staging now runs only from the scanner button, not automatically on app open.</p>
+              <h2>Scanner data did not load</h2>
+              <p>{loadError || 'The scanner is ready to fetch strategy signals and grouped opportunity rows.'}</p>
               <div className="empty-action-buttons">
+                <button type="button" className="primary-button" onClick={onReload}>
+                  <RefreshCw size={14} />
+                  <span>Reload Scanner</span>
+                </button>
                 <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache}>
                   <Database size={14} />
                   <span>{refreshingCache ? 'Refreshing Cache' : 'Refresh Feature Cache'}</span>
@@ -1468,7 +1539,7 @@ function ScannerView({
         <div className="section-head scanner-toolbar">
           <div>
             <span className="eyebrow">Bamboo MTF Breakout</span>
-            <h2>Latest raw Vijay-style research signals</h2>
+            <h2>Latest raw strategy signals</h2>
           </div>
           <div className="toolbar-right screener-toolbar-meta">
             <div className="mini-chip">
@@ -1507,7 +1578,7 @@ function ScannerView({
                   {signal.risk_pct_vs_close.toFixed(2)}%
                 </span>
                 <span>{signal.relvol.toFixed(2)}x</span>
-                <span className="watch-signal-pill signal-watch">Research</span>
+                <span className="watch-signal-pill signal-watch">Review</span>
               </button>
             ))}
           </div>
@@ -1522,8 +1593,8 @@ function ScannerView({
       <Surface>
         <div className="section-head scanner-toolbar">
           <div>
-            <span className="eyebrow">Historical Screener</span>
-              <h2>New unique signals from {latestSignalDate}</h2>
+            <span className="eyebrow">Strategy Scanner</span>
+              <h2>Signals grouped by active strategy from {latestSignalDate}</h2>
           </div>
           <div className="toolbar-right screener-toolbar-meta">
             <div className="mini-chip">
@@ -1584,7 +1655,58 @@ function ScannerView({
           ))}
         </div>
 
-        <div className="scanner-layout scanner-layout-full">
+          <div className="scanner-layout scanner-layout-full">
+          {strategyFilter === 'All' ? (
+            <div className="scanner-strategy-groups">
+              {groupedRows.map((group) => (
+                <Surface key={group.label} className="inner-surface scanner-strategy-section">
+                  <div className="scanner-strategy-head">
+                    <div>
+                      <span className="eyebrow">{group.rows.length} signals</span>
+                      <h3>{group.label}</h3>
+                    </div>
+                    <div className="hero-actions">
+                      <CandidateStat label="Avg Score" value={group.avgScore.toFixed(1)} tone={group.avgScore >= 80 ? 'positive' : 'warning'} />
+                      <CandidateStat label="Pinned Best" value={group.best?.symbol ?? 'N/A'} tone="positive" />
+                    </div>
+                  </div>
+                  <div className="scanner-table-shell">
+                    <table className="scanner-table">
+                      <thead>
+                        <tr>
+                          <th>Symbol</th>
+                          <th>Strategy</th>
+                          <th>Setup</th>
+                          <th>Score</th>
+                          <th>Trend</th>
+                          <th>Close</th>
+                          <th>Vol Ratio</th>
+                          <th>20D High</th>
+                          <th>52W High</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {group.rows.slice(0, 6).map((row) => (
+                          <HistoricalScreenerTableRow
+                            key={`${group.label}-${row.symbol}`}
+                            row={row}
+                            active={row.symbol === selectedSymbol}
+                            onSelect={onSelect}
+                          />
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </Surface>
+              ))}
+              {groupedRows.length === 0 && (
+                <div className="empty-table">
+                  <CircleAlert size={18} />
+                  <p>{historicalScreener.message ?? 'No strategy signals matched the current filters.'}</p>
+                </div>
+              )}
+            </div>
+          ) : (
           <div className="scanner-table-shell">
             <table className="scanner-table">
               <thead>
@@ -1618,7 +1740,8 @@ function ScannerView({
               </div>
             )}
           </div>
-          {filtered.length > 0 && (
+          )}
+          {strategyFilter !== 'All' && filtered.length > 0 && (
             <div className="pagination-bar">
               <div>
                 Showing {(safePage - 1) * pageSize + 1}-{Math.min(safePage * pageSize, filtered.length)} of {filtered.length}
@@ -1945,7 +2068,7 @@ function PortfolioView({
         <div className="paper-policy-strip">
           <div>
             <span className="micro-label">Intake</span>
-            <strong>Newest Research / Watch signals</strong>
+            <strong>Newest Candidate / Watch signals</strong>
           </div>
           <div>
             <span className="micro-label">Hold</span>
@@ -3329,7 +3452,7 @@ function StrategyAnalysisPanel({
     ? 'Historically constructive'
     : (diagnostic?.profit_factor ?? 0) > 1
       ? 'Positive but needs forward evidence'
-      : 'Research only'
+      : 'Review only'
 
   return (
     <Surface className="inner-surface strategy-analysis-panel">
@@ -3378,237 +3501,6 @@ function StrategyAnalysisPanel({
         </div>
       </div>
     </Surface>
-  )
-}
-
-function ResearchView({
-  setupMix,
-  bambooLatest,
-  multiDerive,
-  loadingMultiDerive,
-  onReloadMultiDerive,
-  onSelect,
-}: {
-  setupMix: SetupMix[]
-  bambooLatest: BambooLatestResponse | null
-  multiDerive: MultiDeriveResponse | null
-  loadingMultiDerive: boolean
-  onReloadMultiDerive: () => void
-  onSelect: (symbol: string) => void
-}) {
-  const baseMetric = multiDerive?.metrics.find((metric) => metric.cost_scenario === 'base') ?? null
-  const stressMetric = multiDerive?.metrics.find((metric) => metric.cost_scenario === 'stress') ?? null
-  const oosSplit = multiDerive?.splits.find((split) => split.strategy === 'out_of_sample') ?? null
-  const latestCandidates = multiDerive?.latest_candidates.slice(0, 10) ?? []
-  const generatedAt = typeof multiDerive?.manifest?.generated_at === 'string' ? multiDerive.manifest.generated_at : null
-
-  return (
-    <div className="page-stack">
-      <Surface>
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Research Layer</span>
-            <h2>What the swing engine is currently emphasizing</h2>
-          </div>
-          <div className="mini-chip">
-            <Database size={14} />
-            <span>Nightly Python worker is still the right place for full calibration and backtests</span>
-          </div>
-        </div>
-
-        <div className="strategy-research-panel">
-          <div className="compact-section-head">
-            <div>
-              <span className="eyebrow">Script Replay Candidate</span>
-              <h2>ATR stretch reversal research replay</h2>
-            </div>
-            <button type="button" className="ghost-button" onClick={onReloadMultiDerive} disabled={loadingMultiDerive}>
-              <RefreshCw size={14} className={loadingMultiDerive ? 'spin' : ''} />
-              <span>{loadingMultiDerive ? 'Loading' : 'Reload'}</span>
-            </button>
-          </div>
-          {multiDerive?.message ? (
-            <div className="backtest-run-note">
-              <CircleAlert size={16} />
-              <span>{multiDerive.message}</span>
-            </div>
-          ) : (
-            <>
-              <div className="backtest-run-note research-replay-note">
-                <CircleAlert size={16} />
-                <span>
-                  File-backed Python replay only. This is not yet a promoted engine backtest, and the setup/rank slice came from proxy research,
-                  so these numbers are evidence for review, not live approval. Latest strict forward-validation audit fails promotion:
-                  train-only selection produced zero validation trades and about 1.06 forward base PF.
-                </span>
-              </div>
-              <div className="backtest-kpi-grid">
-                <CandidateStat label="Base PF" value={baseMetric ? baseMetric.profit_factor.toFixed(2) : 'N/A'} tone={(baseMetric?.profit_factor ?? 0) >= 1.5 ? 'positive' : 'warning'} />
-                <CandidateStat label="Stress PF" value={stressMetric ? stressMetric.profit_factor.toFixed(2) : 'N/A'} tone={(stressMetric?.profit_factor ?? 0) >= 1.2 ? 'positive' : 'warning'} />
-                <CandidateStat label="Expectancy" value={baseMetric ? pct(baseMetric.expectancy_pct) : 'N/A'} tone={(baseMetric?.expectancy_pct ?? 0) > 0 ? 'positive' : 'danger'} />
-                <CandidateStat label="Drawdown" value={baseMetric ? pct(baseMetric.max_drawdown_proxy_pct) : 'N/A'} tone={(baseMetric?.max_drawdown_proxy_pct ?? -99) > -5 ? 'positive' : 'warning'} />
-                <CandidateStat label="Trades" value={baseMetric ? baseMetric.trades.toLocaleString('en-IN') : 'N/A'} />
-                <CandidateStat label="OOS PF" value={oosSplit ? oosSplit.profit_factor.toFixed(2) : 'N/A'} tone={(oosSplit?.profit_factor ?? 0) >= 1 ? 'positive' : 'warning'} />
-              </div>
-              <div className="research-verdict multi-derive-verdict">
-                <strong>Replay mechanics are real OHLC path simulation, but promotion is still pending.</strong>
-                <span>Signal day enters next open, stop {baseMetric?.stop_atr ?? 1.6} ATR, target {baseMetric?.target_atr ?? 3} ATR, max hold {baseMetric?.max_hold_days ?? 10} sessions. Generated {generatedAt ? compactDate(generatedAt) : 'from latest files'}.</span>
-                <span>Proper promotion needs a frozen rule wired into the engine backtest path and a clean forward window that survives base and stress costs.</span>
-              </div>
-              <div className="multi-derive-grid">
-                <Surface className="inner-surface research-card">
-                  <span className="micro-label">Chronological Splits</span>
-                  <div className="mini-data-table">
-                    <div className="mini-data-row mini-data-head">
-                      <span>Split</span>
-                      <span>Trades</span>
-                      <span>PF</span>
-                      <span>Exp</span>
-                    </div>
-                    {(multiDerive?.splits ?? []).map((split) => (
-                      <div key={split.strategy} className="mini-data-row">
-                        <span>{split.strategy.replace('_', ' ')}</span>
-                        <span>{split.trades}</span>
-                        <span>{split.profit_factor.toFixed(2)}</span>
-                        <span>{pct(split.expectancy_pct)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </Surface>
-                <Surface className="inner-surface research-card">
-                  <span className="micro-label">Exit Quality</span>
-                  <div className="mini-data-table">
-                    <div className="mini-data-row mini-data-head">
-                      <span>Exit</span>
-                      <span>Trades</span>
-                      <span>Win</span>
-                      <span>Avg</span>
-                    </div>
-                    {(multiDerive?.exits ?? []).map((row) => (
-                      <div key={row.exit_reason} className="mini-data-row">
-                        <span>{row.exit_reason}</span>
-                        <span>{row.trades}</span>
-                        <span>{row.win_rate.toFixed(0)}%</span>
-                        <span>{pct(row.avg_net_return_pct)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </Surface>
-                <Surface className="inner-surface research-card">
-                  <span className="micro-label">Top Contributors</span>
-                  <div className="bamboo-mini-list">
-                    {(multiDerive?.symbols.slice(0, 5) ?? []).map((row) => (
-                      <button key={row.symbol} type="button" onClick={() => onSelect(row.symbol)}>
-                        <span>{row.symbol}</span>
-                        <strong>{pct(row.total_net_return_pct)}</strong>
-                      </button>
-                    ))}
-                  </div>
-                </Surface>
-              </div>
-              <div className="latest-derived-table">
-                <div className="mini-data-row mini-data-head">
-                  <span>Symbol</span>
-                  <span>Setup</span>
-                  <span>Rank</span>
-                  <span>Regime</span>
-                  <span>RelVol</span>
-                  <span>MFE</span>
-                </div>
-                {latestCandidates.map((candidate) => (
-                  <button key={`${candidate.symbol}-${candidate.trade_date}`} type="button" className="mini-data-row" onClick={() => onSelect(candidate.symbol)}>
-                    <span>{candidate.symbol}</span>
-                    <span>{candidate.setup_family.replace('_', ' ')}</span>
-                    <span>{candidate.rank_score.toFixed(1)}</span>
-                    <span>{candidate.regime_label}</span>
-                    <span>{candidate.relvol.toFixed(2)}x</span>
-                    <span>{pct(candidate.mfe_10d_pct)}</span>
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-
-        <div className="strategy-research-panel">
-          <div className="compact-section-head">
-            <div>
-              <span className="eyebrow">Validated Research Output</span>
-              <h2>What is actually worth showing from the parquet study</h2>
-            </div>
-            <div className="mini-chip">
-              <ShieldCheck size={14} />
-              <span>No 100% setup found with enough sample</span>
-            </div>
-          </div>
-          <div className="strategy-research-grid">
-            {RESEARCH_STRATEGIES.map((strategy) => (
-              <Surface key={strategy.name} className={`inner-surface strategy-research-card tone-${strategy.tone}`}>
-                <div className="strategy-research-head">
-                  <div>
-                    <span className="micro-label">{strategy.status}</span>
-                    <strong>{strategy.name}</strong>
-                  </div>
-                  <span className={`status-dot tone-${strategy.tone}`} />
-                </div>
-                <p>{strategy.rule}</p>
-                <div className="strategy-metric-grid">
-                  <CandidateStat label="Trades" value={strategy.trades >= 100000 ? 'Many' : strategy.trades.toLocaleString('en-IN')} />
-                  <CandidateStat label="Monthly" value={strategy.monthly >= 200 ? 'Too many' : strategy.monthly.toFixed(1)} />
-                  <CandidateStat label="Win" value={`${strategy.winRate.toFixed(2)}%`} tone={strategy.winRate >= 50 ? 'positive' : 'warning'} />
-                  <CandidateStat label="PF" value={strategy.profitFactor.toFixed(2)} tone={strategy.profitFactor > 1.1 ? 'positive' : strategy.profitFactor > 1 ? 'warning' : 'danger'} />
-                  <CandidateStat label="Expectancy" value={`${strategy.expectancy >= 0 ? '+' : ''}${strategy.expectancy.toFixed(3)}%`} tone={strategy.expectancy > 0 ? 'positive' : 'danger'} />
-                </div>
-                <div className="research-verdict">
-                  <strong>{strategy.oos}</strong>
-                  <span>{strategy.warning}</span>
-                </div>
-              </Surface>
-            ))}
-          </div>
-        </div>
-
-        <div className="research-grid">
-          <Surface className="inner-surface research-card bamboo-latest-card">
-            <span className="micro-label">Bamboo Latest Signals</span>
-            <strong>{bambooLatest?.unique_symbols ?? 0} unique stocks from {bambooLatest?.signal_date ?? 'latest run'}</strong>
-            <p>Raw multi-timeframe breakout signals are visible for research and paper review only.</p>
-            {(bambooLatest?.top_signals ?? []).length > 0 && (
-              <div className="bamboo-mini-list">
-                {bambooLatest?.top_signals.map((signal) => (
-                  <button key={`${signal.strategy}-${signal.symbol}`} type="button" onClick={() => onSelect(signal.symbol)}>
-                    <span>{signal.symbol}</span>
-                    <strong>{signal.risk_pct_vs_close.toFixed(2)}% risk</strong>
-                  </button>
-                ))}
-              </div>
-            )}
-          </Surface>
-          {setupMix.map((mix) => (
-            <Surface key={mix.family} className="inner-surface research-card">
-              <span className="micro-label">{mix.family}</span>
-              <strong>{mix.count} active names</strong>
-              <p>Average score {mix.avg_score.toFixed(1)} across the current live scanner cut.</p>
-            </Surface>
-          ))}
-        </div>
-
-        <div className="research-notes">
-          <div>
-            <ShieldCheck size={16} />
-            <span>Current build uses explainable rule scoring, not a black-box model.</span>
-          </div>
-          <div>
-            <TrendingUp size={16} />
-            <span>The next real upgrade is historical setup-family validation, not just more UI polish.</span>
-          </div>
-          <div>
-            <BarChart3 size={16} />
-            <span>Watchlist and paper-trade organization are now split cleanly from raw scanner discovery.</span>
-          </div>
-        </div>
-      </Surface>
-    </div>
   )
 }
 
@@ -3699,29 +3591,29 @@ function SettingsView({
             <h2>The endpoints we should build around next</h2>
           </div>
         </div>
-        <div className="research-grid">
-          <Surface className="inner-surface research-card">
+        <div className="api-grid">
+          <Surface className="inner-surface api-card">
             <span className="micro-label">Market Quote</span>
             <strong>`/marketfeed/ltp`, `/marketfeed/ohlc`, `/marketfeed/quote`</strong>
             <p>Best for scanner snapshots. Official docs say quote requests support up to 1000 instruments and are rate-limited to 1 request per second.</p>
           </Surface>
-          <Surface className="inner-surface research-card">
+          <Surface className="inner-surface api-card">
             <span className="micro-label">Funds & Margin</span>
             <strong>`/fundlimit`, `/margincalculator`</strong>
             <p>Use this for paper-trade buying power, position sizing hints, and eventually a cleaner capital allocator.</p>
           </Surface>
-          <Surface className="inner-surface research-card">
+          <Surface className="inner-surface api-card">
             <span className="micro-label">Portfolio & Positions</span>
             <strong>`/holdings`, `/positions`, `/positions/convert`</strong>
             <p>These are the right official APIs for account snapshots and live position awareness beside our paper-trade workflow.</p>
           </Surface>
-          <Surface className="inner-surface research-card">
+          <Surface className="inner-surface api-card">
             <span className="micro-label">Orders</span>
             <strong>`/orders`, `/trades`</strong>
             <p>Official Dhan docs note order APIs need static IP whitelisting, so paper trading should stay primary until we’re ready for that constraint.</p>
           </Surface>
           {DHAN_API_SURFACES.map((surface) => (
-            <Surface key={surface.docUrl} className="inner-surface research-card">
+            <Surface key={surface.docUrl} className="inner-surface api-card">
               <span className="micro-label">{surface.label} Doc</span>
               <strong>{surface.endpoints}</strong>
               <p>{surface.summary}</p>
@@ -3761,8 +3653,6 @@ export default function App() {
   const [historicalScreener, setHistoricalScreener] = useState<HistoricalScreenerResponse | null>(null)
   const [freshSignals, setFreshSignals] = useState<FreshSignalsResponse | null>(null)
   const [bambooLatest, setBambooLatest] = useState<BambooLatestResponse | null>(null)
-  const [multiDerive, setMultiDerive] = useState<MultiDeriveResponse | null>(null)
-  const [loadingMultiDerive, setLoadingMultiDerive] = useState(false)
   const [accounts, setAccounts] = useState<BrokerAccountSnapshot[]>([])
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([])
   const [paperBudget, setPaperBudget] = useState<PaperBudget | null>(null)
@@ -3774,6 +3664,8 @@ export default function App() {
   const [historyRange, setHistoryRange] = useState<HistoryRange>('1y')
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [loadingHome, setLoadingHome] = useState(false)
+  const [loadingScanner, setLoadingScanner] = useState(false)
   const [runningBacktest, setRunningBacktest] = useState(false)
   const [loadingBacktestDashboard, setLoadingBacktestDashboard] = useState(false)
   const [refreshingBacktestCache, setRefreshingBacktestCache] = useState(false)
@@ -3782,6 +3674,8 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const autoClosingSymbols = useRef(new Set<string>())
+  const autoLoadedHome = useRef(false)
+  const autoLoadedScanner = useRef(false)
   const [watchlist, setWatchlist] = useState<SwingCandidate[]>(() => {
     try {
       const raw = localStorage.getItem(WATCHLIST_STORAGE_KEY)
@@ -3805,45 +3699,105 @@ export default function App() {
     localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist))
   }, [watchlist])
 
+  const loadHomeDashboard = async () => {
+    setLoadingHome(true)
+    setError('')
+    try {
+      const homeData = await getSwingHome()
+      startTransition(() => {
+        setHome(homeData)
+        setSelectedSymbol((current) => current ?? homeData.top_candidates[0]?.symbol ?? null)
+      })
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setLoadingHome(false)
+    }
+  }
+
+  const loadScannerData = async () => {
+    setLoadingScanner(true)
+    setError('')
+    try {
+      const [scannerData, historicalData, bambooData] = await Promise.all([
+        getSwingScanner(80),
+        getHistoricalScreener({ limit: 120 }).catch(() => null),
+        getBambooLatest().catch(() => null),
+      ])
+      const screenerData = historicalData ?? createHistoricalScreenerFromScanner(scannerData)
+      startTransition(() => {
+        setScanner(scannerData)
+        setHistoricalScreener(screenerData)
+        setBambooLatest(bambooData)
+        setSelectedSymbol((current) => current ?? screenerData.rows[0]?.symbol ?? bambooData?.top_signals[0]?.symbol ?? scannerData.candidates[0]?.symbol ?? null)
+      })
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setLoadingScanner(false)
+    }
+  }
+
   const refreshAll = async () => {
     setRefreshing(true)
     setError('')
     try {
-      const [homeData, scannerData, bambooData, multiDeriveData, accountData, nextPaperTrades, nextPaperBudget] = await Promise.all([
-        getSwingHome(),
-        getSwingScanner(28),
-        getBambooLatest().catch(() => null),
-        getMultiDeriveResearch().catch(() => null),
-        getBrokerAccounts().catch(() => []),
-        getPaperTrades().catch(() => []),
-        getPaperBudget().catch(() => null),
-      ])
-      startTransition(() => {
-        setHome(homeData)
-        setScanner(scannerData)
-        setBambooLatest(bambooData)
-        setMultiDerive(multiDeriveData)
-        setAccounts(accountData)
-        setPaperTrades(nextPaperTrades)
-        setPaperBudget(nextPaperBudget)
-        const defaultSymbol =
-          selectedSymbol ??
-          freshSignals?.rows[0]?.symbol ??
-          historicalScreener?.rows[0]?.symbol ??
-          bambooData?.top_signals[0]?.symbol ??
-          homeData.top_candidates[0]?.symbol ??
-          scannerData.candidates[0]?.symbol ??
-          watchlist[0]?.symbol ??
-          nextPaperTrades.find((trade) => trade.enabled === 1)?.symbol ??
-          null
-        setSelectedSymbol(defaultSymbol)
-      })
+      if (view === 'home') {
+        await loadHomeDashboard()
+        return
+      }
+
+      if (view === 'scanner' || view === 'stock') {
+        await loadScannerData()
+        return
+      }
+
+      if (view === 'portfolio' || view === 'watchlist') {
+        const [nextPaperTrades, nextPaperBudget] = await Promise.all([
+          getPaperTrades().catch(() => []),
+          getPaperBudget().catch(() => null),
+        ])
+        startTransition(() => {
+          setPaperTrades(nextPaperTrades)
+          setPaperBudget(nextPaperBudget)
+          setSelectedSymbol((current) => current ?? nextPaperTrades.find((trade) => trade.enabled === 1)?.symbol ?? watchlist[0]?.symbol ?? null)
+        })
+        return
+      }
+
+      if (view === 'settings') {
+        const [homeData, accountData] = await Promise.all([
+          getSwingHome(),
+          getBrokerAccounts().catch(() => []),
+        ])
+        startTransition(() => {
+          setHome(homeData)
+          setAccounts(accountData)
+        })
+        return
+      }
+
+      if (view === 'backtests') {
+        await loadBacktestDashboard()
+      }
     } catch (err) {
       setError(errorMessage(err))
     } finally {
       setRefreshing(false)
     }
   }
+
+  useEffect(() => {
+    if (view !== 'home' || home || loadingHome || autoLoadedHome.current) return
+    autoLoadedHome.current = true
+    void loadHomeDashboard()
+  }, [view, home, loadingHome])
+
+  useEffect(() => {
+    if ((view !== 'scanner' && view !== 'stock') || (scanner && historicalScreener) || loadingScanner || autoLoadedScanner.current) return
+    autoLoadedScanner.current = true
+    void loadScannerData()
+  }, [view, scanner, historicalScreener, loadingScanner])
 
   const stageFreshNow = async () => {
     setStagingFresh(true)
@@ -3920,19 +3874,6 @@ export default function App() {
     }
   }
 
-  const loadMultiDeriveResearch = async () => {
-    setLoadingMultiDerive(true)
-    setError('')
-    try {
-      const payload = await getMultiDeriveResearch()
-      setMultiDerive(payload)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setLoadingMultiDerive(false)
-    }
-  }
-
   const refreshBacktestCacheNow = async () => {
     setRefreshingBacktestCache(true)
     setError('')
@@ -3950,11 +3891,6 @@ export default function App() {
     if (view !== 'backtests' || backtests || loadingBacktestDashboard) return
     void loadBacktestDashboard()
   }, [view, backtests, loadingBacktestDashboard])
-
-  useEffect(() => {
-    if (view !== 'research' || multiDerive || loadingMultiDerive) return
-    void loadMultiDeriveResearch()
-  }, [view, multiDerive, loadingMultiDerive])
 
   useEffect(() => {
     if (!selectedSymbol) return
@@ -4245,10 +4181,15 @@ export default function App() {
             {view === 'home' && (
               <HomeView
                 home={home}
+                loading={loadingHome}
+                loadError={error}
                 watchlistCount={watchlist.length}
                 paperCount={queueSymbols.size}
                 selectedSymbol={selectedSymbol}
                 onSelect={openStock}
+                onNavigate={navigateView}
+                onQueue={addToPaperDesk}
+                onReload={loadHomeDashboard}
               />
             )}
             {view === 'scanner' && (
@@ -4261,6 +4202,9 @@ export default function App() {
                 onSelect={openStock}
                 onStageFresh={stageFreshNow}
                 onRefreshCache={refreshFeatureCacheNow}
+                onReload={loadScannerData}
+                loading={loadingScanner}
+                loadError={error}
                 stagingFresh={stagingFresh}
                 refreshingCache={refreshingFeatureCache}
               />
@@ -4295,16 +4239,6 @@ export default function App() {
                 onLoad={loadBacktestDashboard}
                 onRefreshCache={refreshBacktestCacheNow}
                 onRun={runBacktestNow}
-              />
-            )}
-            {view === 'research' && (
-              <ResearchView
-                setupMix={home?.setup_mix ?? []}
-                bambooLatest={bambooLatest}
-                multiDerive={multiDerive}
-                loadingMultiDerive={loadingMultiDerive}
-                onReloadMultiDerive={loadMultiDeriveResearch}
-                onSelect={openStock}
               />
             )}
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}
