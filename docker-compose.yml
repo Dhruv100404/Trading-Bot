@@ -30,7 +30,9 @@ services:
       - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
       - DEBUG=${DEBUG:-false}
     volumes:
-      - ./docs:/app/docs:ro
+      - ./docs:/app/docs
+      - ./scripts:/app/scripts:ro
+      - ./parquets:/app/parquets:ro
     depends_on:
       clickhouse:
         condition: service_healthy

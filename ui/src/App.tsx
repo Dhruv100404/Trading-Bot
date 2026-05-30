@@ -38,9 +38,12 @@ import {
   getSwingHistory,
   getSwingHome,
   getSwingScanner,
+  getPythonBacktestLab,
+  pythonBacktestChartUrl,
   refreshBacktestCache,
   refreshFeatureCache,
   runBacktest,
+  runPythonBacktestLab,
   savePaperTrade,
   stageFreshSignals,
   type BrokerAccountSnapshot,
@@ -51,6 +54,9 @@ import {
   type BacktestDayQuality,
   type BacktestRunSummary,
   type BacktestStrategyDiagnostic,
+  type PythonBacktestLabResponse,
+  type PythonBacktestMetricRow,
+  type PythonBacktestPeriodRow,
   type BambooLatestResponse,
   type BambooLatestSignal,
   type HistoricalScreenerResponse,
@@ -2630,6 +2636,27 @@ function pct(value: number) {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
 }
 
+function metricValue(row: PythonBacktestMetricRow | undefined, key: string) {
+  const value = row?.[key]
+  if (typeof value === 'number') return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+function metricLabel(row: PythonBacktestMetricRow | undefined, key: string) {
+  const value = row?.[key]
+  if (value === null || value === undefined || value === '') return 'N/A'
+  return String(value)
+}
+
+function formatMetric(row: PythonBacktestMetricRow | undefined, key: string, suffix = '') {
+  const value = metricValue(row, key)
+  return `${value.toLocaleString('en-IN', { maximumFractionDigits: 3 })}${suffix}`
+}
+
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 const STRATEGY_ANALYSIS_NOTES: Record<string, {
@@ -2650,24 +2677,209 @@ const STRATEGY_ANALYSIS_NOTES: Record<string, {
   },
 }
 
+function PythonBacktestLabPanel({
+  lab,
+  running,
+  loading,
+  onLoad,
+  onRun,
+}: {
+  lab: PythonBacktestLabResponse | null
+  running: boolean
+  loading: boolean
+  onLoad: () => void
+  onRun: () => void
+}) {
+  const payload = lab?.payload
+  const maBest = payload?.best.ma[0]
+  const panicBest = payload?.best.panic[0]
+  const predictions = payload?.predictions ?? []
+  const yearlyRows: Array<PythonBacktestPeriodRow & { label: string }> = [
+    ...(payload?.period_returns.ma_yearly ?? []).map((row) => ({ ...row, label: 'MA Breakout' })),
+    ...(payload?.period_returns.panic_yearly ?? []).map((row) => ({ ...row, label: 'Panic Reversal' })),
+  ].sort((a, b) => b.year - a.year || a.label.localeCompare(b.label))
+  const monthlyRows: Array<PythonBacktestPeriodRow & { label: string }> = [
+    ...(payload?.period_returns.ma_monthly ?? []).map((row) => ({ ...row, label: 'MA' })),
+    ...(payload?.period_returns.panic_monthly ?? []).map((row) => ({ ...row, label: 'Panic' })),
+  ].slice(-18)
+  const chartNames = [
+    { title: 'MA Equity', name: 'ma_top_equity_curves.png' },
+    { title: 'MA Monthly', name: 'ma_best_monthly_heatmap.png' },
+    { title: 'MA Yearly', name: 'ma_best_yearly_returns.png' },
+    { title: 'Panic Equity', name: 'panic_top_equity_curves.png' },
+    { title: 'Panic Monthly', name: 'panic_best_monthly_heatmap.png' },
+    { title: 'Panic Yearly', name: 'panic_best_yearly_returns.png' },
+  ]
+
+  return (
+    <Surface className="inner-surface python-lab-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Python/NumPy Strategy Engine</span>
+          <h2>MA breakout and panic reversal optimizer</h2>
+        </div>
+        <div className="hero-actions">
+          <button type="button" className="ghost-button" onClick={onLoad} disabled={loading || running}>
+            <Database size={14} className={loading ? 'spin' : ''} />
+            <span>{loading ? 'Loading Lab' : 'Load Results'}</span>
+          </button>
+          <button type="button" className="primary-button" onClick={onRun} disabled={running}>
+            <RefreshCw size={14} className={running ? 'spin' : ''} />
+            <span>{running ? 'Running Python' : 'Run Python/NumPy Lab'}</span>
+          </button>
+        </div>
+      </div>
+
+      {lab ? (
+        <>
+          <div className="backtest-run-note python-lab-status">
+            <Activity size={16} />
+            <span>{lab.message}</span>
+          </div>
+
+          <div className="python-lab-best-grid">
+            <div className="python-best-card">
+              <span className="eyebrow">Best Moving Average Variant</span>
+              <h3>{metricLabel(maBest, 'name')}</h3>
+              <div className="python-metric-grid">
+                <CandidateStat label="Score" value={formatMetric(maBest, 'score')} />
+                <CandidateStat label="Full Trades" value={formatMetric(maBest, 'full_trades')} />
+                <CandidateStat label="Full Exp" value={formatMetric(maBest, 'full_expectancy_pct', '%')} tone={metricValue(maBest, 'full_expectancy_pct') >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="OOS Exp" value={formatMetric(maBest, 'oos_expectancy_pct', '%')} tone={metricValue(maBest, 'oos_expectancy_pct') >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="OOS PF" value={formatMetric(maBest, 'oos_profit_factor')} tone={metricValue(maBest, 'oos_profit_factor') >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="OOS Trades" value={formatMetric(maBest, 'oos_trades')} />
+              </div>
+            </div>
+            <div className="python-best-card">
+              <span className="eyebrow">Best Panic Reversal Variant</span>
+              <h3>{metricLabel(panicBest, 'name')}</h3>
+              <div className="python-metric-grid">
+                <CandidateStat label="Score" value={formatMetric(panicBest, 'score')} />
+                <CandidateStat label="Full Trades" value={formatMetric(panicBest, 'full_trades')} />
+                <CandidateStat label="Full Exp" value={formatMetric(panicBest, 'full_expectancy_pct', '%')} tone={metricValue(panicBest, 'full_expectancy_pct') >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="OOS Exp" value={formatMetric(panicBest, 'oos_expectancy_pct', '%')} tone={metricValue(panicBest, 'oos_expectancy_pct') >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="OOS PF" value={formatMetric(panicBest, 'oos_profit_factor')} tone={metricValue(panicBest, 'oos_profit_factor') >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="OOS Trades" value={formatMetric(panicBest, 'oos_trades')} />
+              </div>
+            </div>
+          </div>
+
+          <div className="python-chart-grid">
+            {chartNames.map((chart) => (
+              <figure key={chart.name} className="python-chart-card">
+                <img src={pythonBacktestChartUrl(chart.name)} alt={chart.title} loading="lazy" />
+                <figcaption>{chart.title}</figcaption>
+              </figure>
+            ))}
+          </div>
+
+          <div className="python-table-grid">
+            <div className="python-data-table">
+              <div className="python-data-row python-data-head">
+                <span>Strategy</span>
+                <span>Year</span>
+                <span>Trades</span>
+                <span>Win</span>
+                <span>Return</span>
+              </div>
+              {yearlyRows.slice(0, 16).map((row) => (
+                <div key={`${row.label}-${row.year}`} className="python-data-row">
+                  <strong>{row.label}</strong>
+                  <span>{row.year}</span>
+                  <span>{row.trades.toLocaleString('en-IN')}</span>
+                  <span>{row.win_rate.toFixed(2)}%</span>
+                  <strong className={row.return_proxy_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.return_proxy_pct)}</strong>
+                </div>
+              ))}
+            </div>
+
+            <div className="python-data-table">
+              <div className="python-data-row python-data-head">
+                <span>Family</span>
+                <span>Month</span>
+                <span>Trades</span>
+                <span>Win</span>
+                <span>Return</span>
+              </div>
+              {monthlyRows.map((row) => (
+                <div key={`${row.label}-${row.month_label}`} className="python-data-row">
+                  <strong>{row.label}</strong>
+                  <span>{row.month_label ?? `${row.year}-${row.month}`}</span>
+                  <span>{row.trades.toLocaleString('en-IN')}</span>
+                  <span>{row.win_rate.toFixed(2)}%</span>
+                  <strong className={row.return_proxy_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.return_proxy_pct)}</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="python-signal-table">
+            <div className="python-signal-row python-data-head">
+              <span>Signal</span>
+              <span>Strategy</span>
+              <span>Entry</span>
+              <span>Stop</span>
+              <span>Target</span>
+              <span>Score</span>
+            </div>
+            {predictions.slice(0, 18).map((signal) => (
+              <div key={`${signal.strategy_family}-${signal.symbol}-${signal.signal_date}`} className="python-signal-row">
+                <strong>{signal.symbol}<small>{signal.signal_date}</small></strong>
+                <span>{signal.strategy_family.replace(/_/g, ' ')}<small>{signal.reason}</small></span>
+                <span>{currency(signal.entry)}</span>
+                <span>{currency(signal.stop)}</span>
+                <span>{currency(signal.target)}</span>
+                <strong>{signal.score.toFixed(2)}</strong>
+              </div>
+            ))}
+            {predictions.length === 0 && (
+              <div className="python-signal-row">
+                <span>No fresh Python signals in the latest window.</span>
+              </div>
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="empty-action-panel">
+          <Sparkles size={24} />
+          <div>
+            <h2>No Python lab results loaded</h2>
+            <p>Run the optimizer to generate tuned MA breakout and panic reversal results, signal predictions, and chart artifacts.</p>
+          </div>
+        </div>
+      )}
+    </Surface>
+  )
+}
+
 function BacktestsView({
   dashboard,
   cache,
+  pythonLab,
   running,
+  pythonRunning,
   loading,
+  pythonLoading,
   refreshingCache,
   onLoad,
+  onLoadPythonLab,
   onRefreshCache,
   onRun,
+  onRunPythonLab,
 }: {
   dashboard: BacktestDashboardResponse | null
   cache: BacktestCacheStatus | null
+  pythonLab: PythonBacktestLabResponse | null
   running: boolean
+  pythonRunning: boolean
   loading: boolean
+  pythonLoading: boolean
   refreshingCache: boolean
   onLoad: () => void
+  onLoadPythonLab: () => void
   onRefreshCache: () => void
   onRun: () => void
+  onRunPythonLab: () => void
 }) {
   const [selectedStrategy, setSelectedStrategy] = useState<string>('near-52w-high-v1')
   const [selectedYear, setSelectedYear] = useState<number | null>(null)
@@ -2797,6 +3009,13 @@ function BacktestsView({
               <CandidateStat label="To" value={cache.to_date || 'N/A'} />
             </div>
           )}
+          <PythonBacktestLabPanel
+            lab={pythonLab}
+            running={pythonRunning}
+            loading={pythonLoading}
+            onLoad={onLoadPythonLab}
+            onRun={onRunPythonLab}
+          />
         </Surface>
       </div>
     )
@@ -2869,6 +3088,14 @@ function BacktestsView({
             <CandidateStat label="Cache To" value={cache.to_date || 'N/A'} />
           </div>
         )}
+
+        <PythonBacktestLabPanel
+          lab={pythonLab}
+          running={pythonRunning}
+          loading={pythonLoading}
+          onLoad={onLoadPythonLab}
+          onRun={onRunPythonLab}
+        />
 
         <div className="backtest-mode-toggle">
           <button
@@ -3658,6 +3885,7 @@ export default function App() {
   const [paperBudget, setPaperBudget] = useState<PaperBudget | null>(null)
   const [backtests, setBacktests] = useState<BacktestDashboardResponse | null>(null)
   const [backtestCache, setBacktestCache] = useState<BacktestCacheStatus | null>(null)
+  const [pythonBacktestLab, setPythonBacktestLab] = useState<PythonBacktestLabResponse | null>(null)
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(initialRoute.symbol)
   const [detailCandidate, setDetailCandidate] = useState<SwingCandidate | null>(null)
   const [history, setHistory] = useState<SymbolHistoryResponse | null>(null)
@@ -3667,7 +3895,9 @@ export default function App() {
   const [loadingHome, setLoadingHome] = useState(false)
   const [loadingScanner, setLoadingScanner] = useState(false)
   const [runningBacktest, setRunningBacktest] = useState(false)
+  const [runningPythonBacktestLab, setRunningPythonBacktestLab] = useState(false)
   const [loadingBacktestDashboard, setLoadingBacktestDashboard] = useState(false)
+  const [loadingPythonBacktestLab, setLoadingPythonBacktestLab] = useState(false)
   const [refreshingBacktestCache, setRefreshingBacktestCache] = useState(false)
   const [stagingFresh, setStagingFresh] = useState(false)
   const [refreshingFeatureCache, setRefreshingFeatureCache] = useState(false)
@@ -3778,7 +4008,10 @@ export default function App() {
       }
 
       if (view === 'backtests') {
-        await loadBacktestDashboard()
+        await Promise.all([
+          loadBacktestDashboard(),
+          loadPythonBacktestLab().catch(() => null),
+        ])
       }
     } catch (err) {
       setError(errorMessage(err))
@@ -3891,6 +4124,24 @@ export default function App() {
     if (view !== 'backtests' || backtests || loadingBacktestDashboard) return
     void loadBacktestDashboard()
   }, [view, backtests, loadingBacktestDashboard])
+
+  const loadPythonBacktestLab = async (silent = false) => {
+    setLoadingPythonBacktestLab(true)
+    if (!silent) setError('')
+    try {
+      const result = await getPythonBacktestLab()
+      setPythonBacktestLab(result)
+    } catch (err) {
+      if (!silent) setError(errorMessage(err))
+    } finally {
+      setLoadingPythonBacktestLab(false)
+    }
+  }
+
+  useEffect(() => {
+    if (view !== 'backtests' || pythonBacktestLab || loadingPythonBacktestLab || runningPythonBacktestLab) return
+    void loadPythonBacktestLab(true)
+  }, [view, pythonBacktestLab, loadingPythonBacktestLab, runningPythonBacktestLab])
 
   useEffect(() => {
     if (!selectedSymbol) return
@@ -4012,6 +4263,19 @@ export default function App() {
       setError(errorMessage(err))
     } finally {
       setRunningBacktest(false)
+    }
+  }
+
+  const runPythonBacktestLabNow = async () => {
+    setRunningPythonBacktestLab(true)
+    setError('')
+    try {
+      const result = await runPythonBacktestLab()
+      setPythonBacktestLab(result)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRunningPythonBacktestLab(false)
     }
   }
 
@@ -4233,12 +4497,17 @@ export default function App() {
               <BacktestsView
                 dashboard={backtests}
                 cache={backtestCache}
+                pythonLab={pythonBacktestLab}
                 running={runningBacktest}
+                pythonRunning={runningPythonBacktestLab}
                 loading={loadingBacktestDashboard}
+                pythonLoading={loadingPythonBacktestLab}
                 refreshingCache={refreshingBacktestCache}
                 onLoad={loadBacktestDashboard}
+                onLoadPythonLab={() => void loadPythonBacktestLab()}
                 onRefreshCache={refreshBacktestCacheNow}
                 onRun={runBacktestNow}
+                onRunPythonLab={runPythonBacktestLabNow}
               />
             )}
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import math
 import textwrap
 from dataclasses import asdict, dataclass
@@ -648,7 +649,300 @@ def save_charts(out_dir: Path, ma_results: pd.DataFrame, panic_results: pd.DataF
         plt.close()
 
 
-def write_report(out_dir: Path, ma_results: pd.DataFrame, panic_results: pd.DataFrame) -> None:
+def period_return_tables(best_trades: pd.DataFrame, prefix: str, out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if best_trades.empty:
+        monthly = pd.DataFrame(columns=["strategy_family", "year", "month", "month_label", "trades", "win_rate", "avg_return_pct", "return_proxy_pct"])
+        yearly = pd.DataFrame(columns=["strategy_family", "year", "trades", "win_rate", "avg_return_pct", "return_proxy_pct"])
+        monthly.to_csv(out_dir / f"{prefix}_monthly_returns.csv", index=False)
+        yearly.to_csv(out_dir / f"{prefix}_yearly_returns.csv", index=False)
+        return monthly, yearly
+
+    part = best_trades.copy()
+    part["entry_date"] = pd.to_datetime(part["entry_date"])
+    part["year"] = part["entry_date"].dt.year
+    part["month"] = part["entry_date"].dt.month
+    part["month_label"] = part["entry_date"].dt.strftime("%Y-%m")
+
+    monthly = (
+        part.groupby(["year", "month", "month_label"], sort=True)
+        .agg(
+            trades=("net_return", "size"),
+            win_rate=("net_return", lambda s: round(float((s > 0).mean() * 100), 2)),
+            avg_return_pct=("net_return", lambda s: round(float(s.mean() * 100), 3)),
+            return_proxy_pct=("net_return", lambda s: round(float((s / 10).sum() * 100), 3)),
+        )
+        .reset_index()
+    )
+    monthly.insert(0, "strategy_family", prefix)
+    yearly = (
+        part.groupby(["year"], sort=True)
+        .agg(
+            trades=("net_return", "size"),
+            win_rate=("net_return", lambda s: round(float((s > 0).mean() * 100), 2)),
+            avg_return_pct=("net_return", lambda s: round(float(s.mean() * 100), 3)),
+            return_proxy_pct=("net_return", lambda s: round(float((s / 10).sum() * 100), 3)),
+        )
+        .reset_index()
+    )
+    yearly.insert(0, "strategy_family", prefix)
+    monthly.to_csv(out_dir / f"{prefix}_monthly_returns.csv", index=False)
+    yearly.to_csv(out_dir / f"{prefix}_yearly_returns.csv", index=False)
+    return monthly, yearly
+
+
+def save_period_charts(out_dir: Path, ma_monthly: pd.DataFrame, ma_yearly: pd.DataFrame, panic_monthly: pd.DataFrame, panic_yearly: pd.DataFrame) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    chart_dir = out_dir / "charts"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+
+    for prefix, monthly, yearly in [
+        ("ma", ma_monthly, ma_yearly),
+        ("panic", panic_monthly, panic_yearly),
+    ]:
+        if not yearly.empty:
+            plt.figure(figsize=(10, 5))
+            colors = ["#1b998b" if value >= 0 else "#c44536" for value in yearly["return_proxy_pct"]]
+            plt.bar(yearly["year"].astype(str), yearly["return_proxy_pct"], color=colors)
+            plt.axhline(0, color="#333333", linewidth=1)
+            plt.title(f"{prefix.upper()} best model yearly return proxy")
+            plt.ylabel("Return proxy %")
+            plt.tight_layout()
+            plt.savefig(chart_dir / f"{prefix}_best_yearly_returns.png", dpi=160)
+            plt.close()
+
+        if not monthly.empty:
+            pivot = monthly.pivot_table(index="year", columns="month", values="return_proxy_pct", aggfunc="sum").fillna(0)
+            plt.figure(figsize=(12, 5))
+            plt.imshow(pivot, aspect="auto", cmap="RdYlGn", vmin=-12, vmax=12)
+            plt.colorbar(label="Return proxy %")
+            plt.xticks(range(len(pivot.columns)), [str(int(month)) for month in pivot.columns])
+            plt.yticks(range(len(pivot.index)), [str(int(year)) for year in pivot.index])
+            plt.title(f"{prefix.upper()} best model monthly return heatmap")
+            plt.xlabel("Month")
+            plt.ylabel("Year")
+            plt.tight_layout()
+            plt.savefig(chart_dir / f"{prefix}_best_monthly_heatmap.png", dpi=160)
+            plt.close()
+
+
+def ma_tune_from_row(row: pd.Series) -> MATune:
+    return MATune(
+        name=str(row["name"]),
+        lookback=int(row["lookback"]),
+        trail_ma=int(row["trail_ma"]),
+        rs_min=float(row["rs_min"]),
+        relvol_min=float(row["relvol_min"]),
+        breadth_min=float(row["breadth_min"]),
+        close_loc_min=float(row["close_loc_min"]),
+        max_hold=int(row["max_hold"]),
+        partial_day=int(row["partial_day"]),
+        partial_fraction=float(row["partial_fraction"]),
+        max_per_day=int(row["max_per_day"]),
+        stop_atr_mult=float(row["stop_atr_mult"]),
+    )
+
+
+def panic_tune_from_row(row: pd.Series) -> PanicTune:
+    return PanicTune(
+        name=str(row["name"]),
+        ret3_max=float(row["ret3_max"]),
+        range_atr_min=float(row["range_atr_min"]),
+        close_loc_min=float(row["close_loc_min"]),
+        recovery_min=float(row["recovery_min"]),
+        broad_only=bool(row["broad_only"]),
+        entry_model=str(row["entry_model"]),
+        target_model=str(row["target_model"]),
+        max_hold=int(row["max_hold"]),
+        partial_fraction=float(row["partial_fraction"]),
+        max_per_day=int(row["max_per_day"]),
+        stop_buffer_atr=float(row["stop_buffer_atr"]),
+    )
+
+
+def latest_ma_predictions(df: pd.DataFrame, tune: MATune, recent_dates: int = 20, limit: int = 40) -> pd.DataFrame:
+    high_col = f"prior_high{tune.lookback}"
+    trigger = df[high_col] * 1.001
+    trend_ok = (
+        df["prev_liquid"].fillna(False)
+        & (df["prev_market_breadth200"] >= tune.breadth_min)
+        & (df["prev_sma10"] > df["prev_sma20"])
+        & (df["prev_sma20"] > df["prev_sma50"])
+        & (df["prev_sma20_slope5"] > -0.002)
+        & (df["prev_sma50_slope5"] > -0.002)
+        & (df["prev_rs60_rank"] >= tune.rs_min)
+    )
+    mask = (
+        trend_ok
+        & df[high_col].notna()
+        & (df["high"] >= trigger)
+        & (df["close_location"] >= tune.close_loc_min)
+        & (df["relvol"] >= tune.relvol_min)
+        & (df["close"] >= trigger * 0.985)
+        & df["atr14"].notna()
+    )
+    candidates = df.loc[mask].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    dates = sorted(candidates["trade_date"].dropna().unique())[-recent_dates:]
+    candidates = candidates[candidates["trade_date"].isin(dates)].copy()
+    candidates["entry"] = trigger.loc[candidates.index]
+    candidates["breakout_pct"] = candidates["close"] / candidates[high_col] - 1
+    candidates["risk_per_share"] = (candidates["entry"] - np.minimum(candidates["low"], candidates["entry"] - tune.stop_atr_mult * candidates["atr14"])).clip(lower=0.01)
+    candidates["stop"] = candidates["entry"] - candidates["risk_per_share"]
+    candidates["target"] = candidates["entry"] + 2.5 * candidates["risk_per_share"]
+    ranked = candidate_rank(candidates).groupby("trade_date", group_keys=False).head(tune.max_per_day)
+    ranked = ranked.sort_values(["trade_date", "rank_score"], ascending=[False, False]).head(limit)
+    ranked["trade_date"] = pd.to_datetime(ranked["trade_date"])
+    return pd.DataFrame({
+        "strategy_family": "moving_average_breakout",
+        "model": tune.name,
+        "signal_date": ranked["trade_date"].dt.strftime("%Y-%m-%d"),
+        "symbol": ranked["symbol"],
+        "direction": "long",
+        "entry": ranked["entry"].round(2),
+        "stop": ranked["stop"].round(2),
+        "target": ranked["target"].round(2),
+        "score": ranked["rank_score"].round(3),
+        "close": ranked["close"].round(2),
+        "reason": "20/55D breakout trigger, MA trend alignment, relative strength, volume expansion",
+    })
+
+
+def latest_panic_predictions(df: pd.DataFrame, tune: PanicTune, recent_dates: int = 20, limit: int = 40) -> pd.DataFrame:
+    liquid = df["mega_liquid"] if tune.broad_only else df["liquid"]
+    panic = broad_panic_mask(df) if tune.broad_only else pd.Series(True, index=df.index)
+    mask = (
+        liquid
+        & panic
+        & (df["ret3"] <= tune.ret3_max)
+        & (df["range_atr"] >= tune.range_atr_min)
+        & (df["close_location"] >= tune.close_loc_min)
+        & (df["recovery_from_low_pct"] >= tune.recovery_min)
+        & df["atr14"].notna()
+    )
+    candidates = df.loc[mask].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    dates = sorted(candidates["trade_date"].dropna().unique())[-recent_dates:]
+    candidates = candidates[candidates["trade_date"].isin(dates)].copy()
+    candidates = panic_rank(candidates).groupby("trade_date", group_keys=False).head(tune.max_per_day)
+    entries = []
+    targets = []
+    stops = []
+    for row in candidates.itertuples(index=False):
+        entry, _, _ = panic_entry_price(float(row.low), float(row.high), float(row.close), tune, None)
+        entry = entry if entry and math.isfinite(entry) else float(row.close)
+        target = panic_target(float(row.sma20), float(row.pre_panic_close3), float(row.low), tune, entry)
+        if target is None:
+            target = entry + 2.0 * max(entry - float(row.low), 0.01)
+        entries.append(entry)
+        targets.append(target)
+        stops.append(float(row.low) - tune.stop_buffer_atr * float(row.atr14))
+    candidates["entry"] = entries
+    candidates["target"] = targets
+    candidates["stop"] = stops
+    candidates = candidates.sort_values(["trade_date", "rank_score"], ascending=[False, False]).head(limit)
+    candidates["trade_date"] = pd.to_datetime(candidates["trade_date"])
+    return pd.DataFrame({
+        "strategy_family": "panic_reversal",
+        "model": tune.name,
+        "signal_date": candidates["trade_date"].dt.strftime("%Y-%m-%d"),
+        "symbol": candidates["symbol"],
+        "direction": "long",
+        "entry": candidates["entry"].round(2),
+        "stop": candidates["stop"].round(2),
+        "target": candidates["target"].round(2),
+        "score": candidates["rank_score"].round(3),
+        "close": candidates["close"].round(2),
+        "reason": "capitulation selloff, reclaim/off-low confirmation, volatility expansion",
+    })
+
+
+def write_signal_predictions(out_dir: Path, ma_df: pd.DataFrame, panic_df: pd.DataFrame, ma_results: pd.DataFrame, panic_results: pd.DataFrame) -> pd.DataFrame:
+    predictions = []
+    if not ma_results.empty:
+        predictions.append(latest_ma_predictions(ma_df, ma_tune_from_row(ma_results.iloc[0])))
+    if not panic_results.empty:
+        predictions.append(latest_panic_predictions(panic_df, panic_tune_from_row(panic_results.iloc[0])))
+    all_predictions = pd.concat([item for item in predictions if not item.empty], ignore_index=True) if predictions else pd.DataFrame()
+    if not all_predictions.empty:
+        all_predictions = all_predictions.sort_values(["signal_date", "score"], ascending=[False, False])
+        latest_date = all_predictions["signal_date"].max()
+        current = all_predictions[all_predictions["signal_date"] == latest_date].copy()
+    else:
+        current = pd.DataFrame()
+    all_predictions.to_csv(out_dir / "latest_signal_predictions.csv", index=False)
+    current.to_csv(out_dir / "current_signal_predictions.csv", index=False)
+    return all_predictions
+
+
+def write_engine_payload(
+    out_dir: Path,
+    ma_results: pd.DataFrame,
+    panic_results: pd.DataFrame,
+    ma_monthly: pd.DataFrame,
+    ma_yearly: pd.DataFrame,
+    panic_monthly: pd.DataFrame,
+    panic_yearly: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> None:
+    chart_dir = out_dir / "charts"
+    payload = {
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
+        "output_dir": str(out_dir),
+        "best": {
+            "ma": ma_results.head(1).to_dict(orient="records"),
+            "panic": panic_results.head(1).to_dict(orient="records"),
+        },
+        "scorecards": {
+            "ma": ma_results.head(20).to_dict(orient="records"),
+            "panic": panic_results.head(20).to_dict(orient="records"),
+        },
+        "period_returns": {
+            "ma_monthly": ma_monthly.tail(36).to_dict(orient="records"),
+            "ma_yearly": ma_yearly.to_dict(orient="records"),
+            "panic_monthly": panic_monthly.tail(36).to_dict(orient="records"),
+            "panic_yearly": panic_yearly.to_dict(orient="records"),
+        },
+        "predictions": predictions.head(80).to_dict(orient="records") if not predictions.empty else [],
+        "charts": {
+            "ma_equity": str(chart_dir / "ma_top_equity_curves.png"),
+            "ma_monthly_heatmap": str(chart_dir / "ma_best_monthly_heatmap.png"),
+            "ma_yearly": str(chart_dir / "ma_best_yearly_returns.png"),
+            "panic_equity": str(chart_dir / "panic_top_equity_curves.png"),
+            "panic_monthly_heatmap": str(chart_dir / "panic_best_monthly_heatmap.png"),
+            "panic_yearly": str(chart_dir / "panic_best_yearly_returns.png"),
+            "ma_validation_vs_oos": str(chart_dir / "ma_validation_vs_oos.png"),
+            "panic_validation_vs_oos": str(chart_dir / "panic_validation_vs_oos.png"),
+        },
+        "files": {
+            "report": str(out_dir / "final_report.md"),
+            "combined_scorecard": str(out_dir / "combined_top_scorecard.csv"),
+            "ma_monthly": str(out_dir / "ma_monthly_returns.csv"),
+            "ma_yearly": str(out_dir / "ma_yearly_returns.csv"),
+            "panic_monthly": str(out_dir / "panic_monthly_returns.csv"),
+            "panic_yearly": str(out_dir / "panic_yearly_returns.csv"),
+            "predictions": str(out_dir / "latest_signal_predictions.csv"),
+            "current_predictions": str(out_dir / "current_signal_predictions.csv"),
+        },
+    }
+    (out_dir / "engine_payload.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def write_report(
+    out_dir: Path,
+    ma_results: pd.DataFrame,
+    panic_results: pd.DataFrame,
+    ma_monthly: pd.DataFrame,
+    ma_yearly: pd.DataFrame,
+    panic_monthly: pd.DataFrame,
+    panic_yearly: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> None:
     best_ma = ma_results.iloc[0].to_dict()
     best_panic = panic_results.iloc[0].to_dict()
     report = out_dir / "final_report.md"
@@ -688,6 +982,26 @@ def write_report(out_dir: Path, ma_results: pd.DataFrame, panic_results: pd.Data
         "## Top 10 panic parameter sets",
         "",
         panic_results.head(10).to_markdown(index=False),
+        "",
+        "## Moving-average monthly return proxy",
+        "",
+        ma_monthly.tail(18).to_markdown(index=False) if not ma_monthly.empty else "No MA monthly rows.",
+        "",
+        "## Moving-average yearly return proxy",
+        "",
+        ma_yearly.to_markdown(index=False) if not ma_yearly.empty else "No MA yearly rows.",
+        "",
+        "## Panic reversal monthly return proxy",
+        "",
+        panic_monthly.tail(18).to_markdown(index=False) if not panic_monthly.empty else "No panic monthly rows.",
+        "",
+        "## Panic reversal yearly return proxy",
+        "",
+        panic_yearly.to_markdown(index=False) if not panic_yearly.empty else "No panic yearly rows.",
+        "",
+        "## Latest model signal predictions",
+        "",
+        predictions.head(30).to_markdown(index=False) if not predictions.empty else "No fresh signals in the latest lookback window.",
         "",
         "## Production read",
         "",
@@ -737,8 +1051,18 @@ def run(args: argparse.Namespace) -> None:
         out_dir,
         "panic",
     )
+    ma_best_name = str(ma_results.iloc[0]["name"]) if not ma_results.empty else ""
+    panic_best_name = str(panic_results.iloc[0]["name"]) if not panic_results.empty else ""
+    ma_best_trades = ma_trades[ma_trades["param_name"] == ma_best_name].copy() if ma_best_name and not ma_trades.empty else pd.DataFrame()
+    panic_best_trades = panic_trades[panic_trades["param_name"] == panic_best_name].copy() if panic_best_name and not panic_trades.empty else pd.DataFrame()
+
+    ma_monthly, ma_yearly = period_return_tables(ma_best_trades, "ma", out_dir)
+    panic_monthly, panic_yearly = period_return_tables(panic_best_trades, "panic", out_dir)
+    predictions = write_signal_predictions(out_dir, ma_df, panic_df, ma_results, panic_results)
+
     save_charts(out_dir, ma_results, panic_results, ma_trades, panic_trades)
-    write_report(out_dir, ma_results, panic_results)
+    save_period_charts(out_dir, ma_monthly, ma_yearly, panic_monthly, panic_yearly)
+    write_report(out_dir, ma_results, panic_results, ma_monthly, ma_yearly, panic_monthly, panic_yearly, predictions)
 
     combined = pd.concat(
         [
@@ -748,6 +1072,16 @@ def run(args: argparse.Namespace) -> None:
         ignore_index=True,
     ).sort_values("score", ascending=False)
     combined.to_csv(out_dir / "combined_top_scorecard.csv", index=False)
+    write_engine_payload(
+        out_dir,
+        ma_results,
+        panic_results,
+        ma_monthly,
+        ma_yearly,
+        panic_monthly,
+        panic_yearly,
+        predictions,
+    )
 
     print("Best MA")
     print(ma_results.head(5).to_string(index=False))

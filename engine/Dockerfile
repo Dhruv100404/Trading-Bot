@@ -12,7 +12,7 @@ RUN touch src/main.rs \
  && cargo build --release --bin engine
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk add --no-cache ca-certificates tzdata curl python3 py3-numpy py3-pandas py3-pyarrow py3-matplotlib py3-tabulate
 WORKDIR /app
 COPY --from=builder /build/engine/target/release/engine .
 COPY data/volume_groups.json ./data/volume_groups.json

@@ -1,6 +1,20 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    body::Body,
+    extract::{Path as AxumPath, Query, State},
+    http::{header, StatusCode},
+    response::Response,
+    Json,
+};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    env, fs,
+    io::ErrorKind,
+    path::PathBuf,
+    process::Command,
+    time::Instant,
+};
 
 use crate::api::AppState;
 use crate::types::now_ist;
@@ -254,6 +268,15 @@ pub struct BacktestCacheRefreshResponse {
     message: String,
 }
 
+#[derive(Serialize)]
+pub struct PythonBacktestLabResponse {
+    ok: bool,
+    updated_at: String,
+    duration_ms: Option<u128>,
+    message: String,
+    payload: Value,
+}
+
 #[derive(Clone)]
 struct BacktestStrategySpec {
     strategy_id: String,
@@ -342,6 +365,152 @@ pub async fn refresh_cache(
         cache,
         message: "Backtest feature cache refreshed from parquet. Future backtest runs read ClickHouse cached features instead of rebuilding indicators from raw parquet.".to_string(),
     }))
+}
+
+pub async fn python_latest() -> Result<Json<PythonBacktestLabResponse>, (StatusCode, String)> {
+    let payload = read_python_lab_payload()
+        .map_err(|err| (StatusCode::NOT_FOUND, format!("python backtest lab output not found: {err}")))?;
+
+    Ok(Json(PythonBacktestLabResponse {
+        ok: true,
+        updated_at: now_ist().to_rfc3339(),
+        duration_ms: None,
+        message: "Loaded latest Python/NumPy strategy lab results.".to_string(),
+        payload,
+    }))
+}
+
+pub async fn run_python_lab() -> Result<Json<PythonBacktestLabResponse>, (StatusCode, String)> {
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(run_python_optimizer)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("python optimizer task failed: {err}")))?;
+    let message = result
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("python optimizer failed: {err}")))?;
+    let payload = read_python_lab_payload()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("python optimizer completed but payload could not be read: {err}")))?;
+
+    Ok(Json(PythonBacktestLabResponse {
+        ok: true,
+        updated_at: now_ist().to_rfc3339(),
+        duration_ms: Some(started.elapsed().as_millis()),
+        message,
+        payload,
+    }))
+}
+
+pub async fn python_chart(
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    if name.contains('/') || name.contains('\\') || !name.ends_with(".png") {
+        return Err((StatusCode::BAD_REQUEST, "invalid chart name".to_string()));
+    }
+
+    let path = python_lab_output_dir().join("charts").join(name);
+    let bytes = fs::read(&path)
+        .map_err(|err| (StatusCode::NOT_FOUND, format!("chart not found: {} ({err})", path.display())))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("chart response failed: {err}")))
+}
+
+fn run_python_optimizer() -> anyhow::Result<String> {
+    let root = repo_root();
+    let script = env::var("BACKTEST_LAB_SCRIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("scripts").join("complex_strategy_optimizer.py"));
+    let out_dir = python_lab_output_dir();
+    fs::create_dir_all(&out_dir)?;
+
+    if !script.exists() {
+        anyhow::bail!("script does not exist: {}", script.display());
+    }
+
+    let ma_grid = env::var("BACKTEST_LAB_MA_GRID").unwrap_or_else(|_| "140".to_string());
+    let panic_grid = env::var("BACKTEST_LAB_PANIC_GRID").unwrap_or_else(|_| "180".to_string());
+    let python_env = env::var("BACKTEST_PYTHON").ok();
+    let mut attempts: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(python) = python_env {
+        attempts.push((python, Vec::new()));
+    } else {
+        attempts.push(("python".to_string(), Vec::new()));
+        attempts.push(("py".to_string(), vec!["-3".to_string()]));
+        attempts.push(("python3".to_string(), Vec::new()));
+    }
+
+    let mut last_not_found = None;
+    for (program, prefix_args) in attempts {
+        let mut command = Command::new(&program);
+        command
+            .current_dir(&root)
+            .env("PYTHONUNBUFFERED", "1");
+        for arg in prefix_args {
+            command.arg(arg);
+        }
+        command
+            .arg("-u")
+            .arg(&script)
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("--max-ma-grid")
+            .arg(&ma_grid)
+            .arg("--max-panic-grid")
+            .arg(&panic_grid);
+
+        match command.output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if output.status.success() {
+                    let tail = stdout.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                    return Ok(format!(
+                        "Python/NumPy backtest lab completed with {} MA grid rows and {} panic grid rows.{}",
+                        ma_grid,
+                        panic_grid,
+                        if tail.is_empty() { String::new() } else { format!("\n{tail}") }
+                    ));
+                }
+                anyhow::bail!(
+                    "command `{}` exited with {}.\nstdout:\n{}\nstderr:\n{}",
+                    program,
+                    output.status,
+                    stdout,
+                    stderr
+                );
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                last_not_found = Some(format!("{program}: {err}"));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    anyhow::bail!(
+        "no Python executable found. Set BACKTEST_PYTHON, or install python on PATH. Last error: {}",
+        last_not_found.unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn read_python_lab_payload() -> anyhow::Result<Value> {
+    let path = python_lab_output_dir().join("engine_payload.json");
+    let text = fs::read_to_string(&path)
+        .map_err(|err| anyhow::anyhow!("{} ({err})", path.display()))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn python_lab_output_dir() -> PathBuf {
+    env::var("BACKTEST_LAB_OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("docs").join("complex_strategy_tuning_lab"))
+}
+
+fn repo_root() -> PathBuf {
+    env::var("BACKTEST_LAB_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardResponse {

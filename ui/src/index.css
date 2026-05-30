@@ -2537,6 +2537,128 @@
     overflow: hidden;
   }
 
+  .python-lab-panel {
+    margin: 0 18px 14px;
+    overflow: hidden;
+  }
+
+  .python-lab-status {
+    margin: 12px 0 0;
+    padding: 11px 0 0;
+  }
+
+  .python-lab-best-grid,
+  .python-table-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin-top: 14px;
+  }
+
+  .python-best-card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 14px;
+  }
+
+  .python-best-card h3 {
+    margin: 6px 0 12px;
+    font-size: 0.98rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .python-metric-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .python-chart-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .python-chart-card {
+    margin: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #f6f8fb;
+  }
+
+  .python-chart-card img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: contain;
+    background: #ffffff;
+  }
+
+  .python-chart-card figcaption {
+    padding: 9px 10px;
+    color: #172033;
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0;
+  }
+
+  .python-data-table,
+  .python-signal-table {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+
+  .python-signal-table {
+    margin-top: 14px;
+  }
+
+  .python-data-row,
+  .python-signal-row {
+    display: grid;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .python-data-row {
+    grid-template-columns: minmax(120px, 1fr) 66px 70px 70px 82px;
+  }
+
+  .python-signal-row {
+    grid-template-columns: minmax(110px, 0.75fr) minmax(180px, 1.35fr) 86px 86px 86px 64px;
+  }
+
+  .python-data-row:last-child,
+  .python-signal-row:last-child {
+    border-bottom: 0;
+  }
+
+  .python-data-head {
+    background: var(--surface-strong);
+    color: var(--subtle);
+    font-size: 0.68rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .python-signal-row small {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    line-height: 1.35;
+  }
+
   .monthly-panel {
     margin: 0 18px 14px;
   }
@@ -3005,7 +3127,10 @@
   .desk-control-panel,
   .datewise-toolbar,
   .api-grid,
-  .scanner-summary-strip {
+  .scanner-summary-strip,
+  .python-lab-best-grid,
+  .python-table-grid,
+  .python-chart-grid {
     grid-template-columns: 1fr;
   }
 
@@ -3124,8 +3249,18 @@
 
   .datewise-panel,
   .datewise-trade-log,
-  .datewise-strategy-table {
+  .datewise-strategy-table,
+  .python-data-table,
+  .python-signal-table {
     overflow-x: auto;
+  }
+
+  .python-data-row {
+    min-width: 560px;
+  }
+
+  .python-signal-row {
+    min-width: 780px;
   }
 
   .datewise-strategy-row {
@@ -3159,7 +3294,8 @@
   }
 
   .desk-status-grid,
-  .compact-workflow {
+  .compact-workflow,
+  .python-metric-grid {
     grid-template-columns: 1fr;
   }
 }

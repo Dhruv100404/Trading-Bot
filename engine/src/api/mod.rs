@@ -62,6 +62,9 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         .route("/api/backtests/datewise",        get(backtest::datewise))
         .route("/api/backtests/feature-cache/refresh", post(backtest::refresh_cache))
         .route("/api/backtests/run",             post(backtest::run))
+        .route("/api/backtests/python/latest",   get(backtest::python_latest))
+        .route("/api/backtests/python/run",      post(backtest::run_python_lab))
+        .route("/api/backtests/python/charts/:name", get(backtest::python_chart))
         .layer(cors)
         .with_state(state);
 

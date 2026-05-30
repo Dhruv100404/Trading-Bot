@@ -448,6 +448,63 @@ export interface BacktestCacheRefreshResponse {
   message: string
 }
 
+export type PythonBacktestMetricRow = Record<string, string | number | boolean | null>
+
+export interface PythonBacktestPeriodRow {
+  strategy_family: string
+  year: number
+  month?: number
+  month_label?: string
+  trades: number
+  win_rate: number
+  avg_return_pct: number
+  return_proxy_pct: number
+}
+
+export interface PythonBacktestPrediction {
+  strategy_family: string
+  model: string
+  signal_date: string
+  symbol: string
+  direction: string
+  entry: number
+  stop: number
+  target: number
+  score: number
+  close: number
+  reason: string
+}
+
+export interface PythonBacktestLabPayload {
+  updated_at: string
+  output_dir: string
+  best: {
+    ma: PythonBacktestMetricRow[]
+    panic: PythonBacktestMetricRow[]
+  }
+  scorecards: {
+    ma: PythonBacktestMetricRow[]
+    panic: PythonBacktestMetricRow[]
+  }
+  period_returns: {
+    ma_monthly: PythonBacktestPeriodRow[]
+    ma_yearly: PythonBacktestPeriodRow[]
+    panic_monthly: PythonBacktestPeriodRow[]
+    panic_yearly: PythonBacktestPeriodRow[]
+  }
+  predictions: PythonBacktestPrediction[]
+  charts: Record<string, string>
+  files: Record<string, string>
+}
+
+export interface PythonBacktestLabResponse {
+  ok: boolean
+  updated_at: string
+  duration_ms: number | null
+  message: string
+  payload: PythonBacktestLabPayload
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const timeoutMs = options?.timeoutMs ?? 60000
   const controller = new AbortController()
@@ -627,4 +684,21 @@ export async function runBacktest(): Promise<BacktestRunResponse> {
     method: 'POST',
     timeoutMs: 300000,
   })
+}
+
+export async function getPythonBacktestLab(): Promise<PythonBacktestLabResponse> {
+  return apiFetch<PythonBacktestLabResponse>('/api/backtests/python/latest', {
+    timeoutMs: 15000,
+  })
+}
+
+export async function runPythonBacktestLab(): Promise<PythonBacktestLabResponse> {
+  return apiFetch<PythonBacktestLabResponse>('/api/backtests/python/run', {
+    method: 'POST',
+    timeoutMs: 900000,
+  })
+}
+
+export function pythonBacktestChartUrl(name: string) {
+  return `/api/backtests/python/charts/${encodeURIComponent(name)}`
 }
