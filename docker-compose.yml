@@ -28,6 +28,8 @@ services:
       - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - DEBUG=${DEBUG:-false}
     volumes:
       - ./docs:/app/docs

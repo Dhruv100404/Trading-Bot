@@ -5,6 +5,7 @@ import {
   Activity,
   ArrowUpRight,
   BarChart3,
+  BellRing,
   Bookmark,
   BriefcaseBusiness,
   CalendarDays,
@@ -18,7 +19,6 @@ import {
   ListTodo,
   Radar,
   RefreshCw,
-  ShieldCheck,
   Sparkles,
   Target,
   TrendingUp,
@@ -52,6 +52,7 @@ import {
   type BacktestCacheStatus,
   type BacktestDatewiseResponse,
   type BacktestDayQuality,
+  type BacktestEquityPoint,
   type BacktestRunSummary,
   type BacktestStrategyDiagnostic,
   type PythonBacktestLabResponse,
@@ -62,6 +63,8 @@ import {
   type HistoricalScreenerResponse,
   type HistoricalScreenerRow,
   type FreshSignalsResponse,
+  type LiveStrategySnapshot,
+  type LiveStrategyRow,
   type LiveSignal,
   type PaperTrade,
   type PaperBudget,
@@ -69,10 +72,11 @@ import {
   type SwingCandidate,
   type SwingHomeResponse,
   type SwingScannerResponse,
+  type SetupMix,
 } from './api'
 
 type View = 'home' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'settings' | 'stock'
-type HistoryRange = '3m' | '6m' | '1y' | '3y' | '5y'
+type HistoryRange = '1d' | '3m' | '6m' | '1y' | '3y' | '5y'
 type PaperDeskTab = 'open' | 'closed' | 'weekly' | 'strategy' | 'intake'
 
 interface NavItem {
@@ -92,9 +96,11 @@ const NAV_ITEMS: NavItem[] = [
 ]
 
 const WATCHLIST_STORAGE_KEY = 'swing-watchlist'
+const LIVE_ALERTS_STORAGE_KEY = 'swing-live-trigger-alerts'
 const PAPER_CAPITAL_PER_STOCK = 50000
 const PAPER_HOLD_SESSIONS = 5
 const AUTO_PAPER_MAX_SUGGESTIONS = 7
+const MIN_BACKTEST_STRATEGY_TRADES = 30
 const NSE_HOLIDAYS = new Set([
   '2025-01-26', '2025-02-26', '2025-03-14', '2025-03-31', '2025-04-10', '2025-04-14',
   '2025-04-18', '2025-05-01', '2025-06-26', '2025-07-06', '2025-08-15', '2025-08-16',
@@ -114,6 +120,16 @@ interface BacktestPaperRule {
 }
 
 const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
+  'tuned-ma-breakout-v1': {
+    stopLossPct: 6,
+    takeProfitPct: 12,
+    source: 'tuned MA breakout lab model',
+  },
+  'tuned-panic-reversal-v1': {
+    stopLossPct: 4,
+    takeProfitPct: 10,
+    source: 'tuned panic reversal lab model',
+  },
   'near-52w-high-v1': {
     stopLossPct: 5,
     takeProfitPct: 10,
@@ -225,10 +241,25 @@ const DHAN_API_SURFACES: DhanApiSurface[] = [
   },
 ]
 
-const HISTORY_RANGES: HistoryRange[] = ['3m', '6m', '1y', '3y', '5y']
+const HISTORY_RANGES: HistoryRange[] = ['1d', '3m', '6m', '1y', '3y', '5y']
 
 function currency(value: number) {
   return `Rs ${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+function compactCurrency(value: number) {
+  const absValue = Math.abs(value)
+  if (absValue >= 100000) return `Rs ${(value / 100000).toFixed(1)}L`
+  if (absValue >= 1000) return `Rs ${(value / 1000).toFixed(1)}k`
+  return currency(value)
+}
+
+function compactNumber(value: number) {
+  const absValue = Math.abs(value)
+  if (absValue >= 10000000) return `${(value / 10000000).toFixed(2)}Cr`
+  if (absValue >= 100000) return `${(value / 100000).toFixed(2)}L`
+  if (absValue >= 1000) return `${(value / 1000).toFixed(1)}k`
+  return value.toLocaleString('en-IN')
 }
 
 function errorMessage(err: unknown) {
@@ -267,6 +298,7 @@ function defaultLiveSignal(overrides: Partial<LiveSignal> = {}): LiveSignal {
     score: 0,
     as_of: 'local',
     trigger_price: null,
+    trigger_source: null,
     ...overrides,
   }
 }
@@ -325,7 +357,7 @@ function removeCandidate(list: SwingCandidate[], symbol: string) {
   return list.filter((item) => item.symbol !== symbol)
 }
 
-void [upsertCandidate, removeCandidate]
+void [upsertCandidate, removeCandidate, createCandidateFromHistoricalRow, createCandidateFromBambooSignal]
 
 function ruleForStrategy(strategyId: string) {
   return BACKTEST_PAPER_RULES[strategyId] ?? null
@@ -427,6 +459,7 @@ function createCandidateFromBambooSignal(signal: BambooLatestSignal): SwingCandi
       score,
       as_of: signal.signal_date,
       trigger_price: signal.prior_high20,
+      trigger_source: 'Prior 20D high',
     }),
   }
 }
@@ -464,6 +497,133 @@ function createCandidateFromPaperTrade(trade: PaperTrade): SwingCandidate {
       setup_family: trade.setup_family || 'Paper Plan',
     }),
   }
+}
+
+function createCandidateFromLiveRow(row: LiveStrategyRow): SwingCandidate {
+  const strategyLabel = row.strategy_label || row.setup_family || strategyLabelForDisplay(row.strategy_id)
+  const triggerText = row.trigger_price && row.trigger_price > 0
+    ? `Live trigger Rs ${row.trigger_price.toFixed(2)}`
+    : `Live LTP Rs ${row.last_price.toFixed(2)}`
+  const status = row.signal_status as LiveSignal['status']
+  const confidence =
+    status === 'ENTRY_NOW' ? 'Enter Now'
+      : status === 'WATCH' ? 'Watch Only'
+      : status === 'NO_TRADE' || status === 'INVALIDATED' ? 'No Trade'
+      : row.score >= 88 ? 'Wait For Trigger'
+      : 'Live Candidate'
+  return {
+    symbol: row.symbol,
+    company_name: row.company_name || row.symbol,
+    setup_family: row.setup_family || strategyLabel,
+    bias: 'Long',
+    score: row.score,
+    confidence,
+    regime_fit: Math.max(50, Math.min(95, row.score - 4)),
+    risk_reward: row.risk_reward,
+    last_price: row.last_price,
+    day_change_pct: row.day_change_pct,
+    open_gap_pct: row.open_gap_pct,
+    distance_to_high_pct: 0,
+    liquidity_bucket: 'LIVE',
+    entry_zone: triggerText,
+    stop_loss: row.stop_loss,
+    target_price: row.target_price,
+    expected_hold: 'Live strategy plan',
+    thesis: row.reason,
+    reasons: [
+      row.reason,
+      `Live Dhan source ${row.source}; volume ${row.volume.toLocaleString('en-IN')}.`,
+      `Signal status is ${row.signal_label} under ${strategyLabel}.`,
+    ],
+    risks: [
+      `Stop loss is ${currency(row.stop_loss)}.`,
+      status === 'ENTRY_NOW'
+        ? 'Live signal is active now; size still needs manual risk control.'
+        : 'Do not treat this as an entry until the live status says Enter Now.',
+    ],
+    source: row.source,
+    live_signal: {
+      status,
+      label: row.signal_label,
+      reason: row.reason,
+      strategy_id: row.strategy_id,
+      strategy_label: strategyLabel,
+      strategy_status: row.strategy_status,
+      setup_family: row.setup_family,
+      score: row.score,
+      as_of: row.updated_at,
+      trigger_price: row.trigger_price,
+      trigger_source: row.trigger_source,
+    },
+  }
+}
+
+function createHistoricalRowFromLiveRow(row: LiveStrategyRow): HistoricalScreenerRow {
+  const triggerCleared = !!row.trigger_price && row.trigger_price > 0 && row.last_price >= row.trigger_price
+  const plannedEntry = row.signal_status === 'ENTRY_NOW'
+    ? `Live entry Rs ${row.last_price.toFixed(2)}`
+    : triggerCleared
+      ? `Live LTP Rs ${row.last_price.toFixed(2)}`
+      : row.trigger_price && row.trigger_price > 0
+      ? `Trigger Rs ${row.trigger_price.toFixed(2)}`
+      : `Live LTP Rs ${row.last_price.toFixed(2)}`
+  return {
+    symbol: row.symbol,
+    as_of: row.updated_at,
+    setup_family: row.setup_family || row.strategy_label,
+    strategy_id: row.strategy_id,
+    strategy_label: row.strategy_label,
+    strategy_status: row.strategy_status,
+    score: row.score,
+    trend_label: row.signal_label,
+    close: row.last_price,
+    sma20: row.last_price,
+    sma50: row.last_price,
+    avg_volume20: row.volume,
+    volume_ratio: 0,
+    distance_to_20d_high_pct: 0,
+    distance_to_52w_high_pct: 0,
+    range_position_pct: 0,
+    atr14: 0,
+    atr_pct: 0,
+    close_location: 0,
+    gap_pct: row.open_gap_pct,
+    rs60_rank: row.score,
+    rs120_rank: row.score,
+    market_breadth200: 0,
+    planned_entry: plannedEntry,
+    trigger_price: row.trigger_price,
+    trigger_source: row.trigger_source,
+    stop_loss: row.stop_loss,
+    target_price: row.target_price,
+    risk_reward: row.risk_reward,
+  }
+}
+
+function strategyLabelForDisplay(strategyId: string) {
+  return strategyId
+    .split('-')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ') || 'Live Strategy'
+}
+
+function setupMixFromCandidates(candidates: SwingCandidate[]): SetupMix[] {
+  const groups = new Map<string, { count: number; score: number }>()
+  candidates.forEach((candidate) => {
+    const family = candidate.setup_family || candidate.live_signal.strategy_label || 'Live Strategy'
+    const next = groups.get(family) ?? { count: 0, score: 0 }
+    next.count += 1
+    next.score += candidate.score
+    groups.set(family, next)
+  })
+  return Array.from(groups.entries())
+    .map(([family, value]) => ({
+      family,
+      count: value.count,
+      avg_score: value.score / Math.max(value.count, 1),
+    }))
+    .sort((a, b) => b.count - a.count || b.avg_score - a.avg_score)
 }
 
 function riskPerShare(candidate: SwingCandidate) {
@@ -523,6 +683,8 @@ function createHistoricalRowFromCandidate(candidate: SwingCandidate): Historical
     rs120_rank: candidate.regime_fit,
     market_breadth200: 0,
     planned_entry: candidate.entry_zone,
+    trigger_price: candidate.live_signal.trigger_price,
+    trigger_source: candidate.live_signal.trigger_source,
     stop_loss: candidate.stop_loss,
     target_price: candidate.target_price,
     risk_reward: candidate.risk_reward,
@@ -731,6 +893,7 @@ function HistoricalChart({
   }
 
   const candles = history.candles
+  const isDhanIntraday = history.source === 'dhan-intraday'
   const highs = candles.map((candle) => candle.high)
   const lows = candles.map((candle) => candle.low)
   const minPrice = Math.min(...lows)
@@ -757,7 +920,7 @@ function HistoricalChart({
       <div className="chart-topbar">
         <div>
           <span className="eyebrow">Historical Chart</span>
-          <h3>{history.symbol} price structure from parquet history</h3>
+          <h3>{history.symbol} {isDhanIntraday ? 'live intraday chart from Dhan' : 'price structure from parquet history'}</h3>
         </div>
         <div className="filter-strip compact-strip">
           {HISTORY_RANGES.map((option) => (
@@ -792,10 +955,21 @@ function HistoricalChart({
 
       {summary && (
         <div className="chart-summary-grid">
-          <CandidateStat label="1M Return" value={`${summary.change_pct_1m >= 0 ? '+' : ''}${summary.change_pct_1m.toFixed(2)}%`} tone={summary.change_pct_1m >= 0 ? 'positive' : 'danger'} />
-          <CandidateStat label="3M Return" value={`${summary.change_pct_3m >= 0 ? '+' : ''}${summary.change_pct_3m.toFixed(2)}%`} tone={summary.change_pct_3m >= 0 ? 'positive' : 'danger'} />
-          <CandidateStat label="1Y Return" value={`${summary.change_pct_1y >= 0 ? '+' : ''}${summary.change_pct_1y.toFixed(2)}%`} tone={summary.change_pct_1y >= 0 ? 'positive' : 'danger'} />
-          <CandidateStat label="52W Range" value={`Rs ${summary.low_52w.toFixed(0)} - ${summary.high_52w.toFixed(0)}`} />
+          {isDhanIntraday ? (
+            <>
+              <CandidateStat label="Last Price" value={currency(summary.latest_close)} />
+              <CandidateStat label="Session High" value={currency(summary.high_52w)} tone="positive" />
+              <CandidateStat label="Session Low" value={currency(summary.low_52w)} tone="warning" />
+              <CandidateStat label="Avg Vol" value={compactNumber(summary.avg_volume_20d)} />
+            </>
+          ) : (
+            <>
+              <CandidateStat label="1M Return" value={`${summary.change_pct_1m >= 0 ? '+' : ''}${summary.change_pct_1m.toFixed(2)}%`} tone={summary.change_pct_1m >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="3M Return" value={`${summary.change_pct_3m >= 0 ? '+' : ''}${summary.change_pct_3m.toFixed(2)}%`} tone={summary.change_pct_3m >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="1Y Return" value={`${summary.change_pct_1y >= 0 ? '+' : ''}${summary.change_pct_1y.toFixed(2)}%`} tone={summary.change_pct_1y >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="52W Range" value={`Rs ${summary.low_52w.toFixed(0)} - ${summary.high_52w.toFixed(0)}`} />
+            </>
+          )}
         </div>
       )}
     </Surface>
@@ -811,6 +985,11 @@ function HistoricalScreenerTableRow({
   active: boolean
   onSelect: (symbol: string) => void
 }) {
+  const triggerLabel = row.trigger_price && row.trigger_price > 0
+    ? `${currency(row.trigger_price)}${row.close >= row.trigger_price ? ' passed' : ''}`
+    : 'N/A'
+  const triggerSource = row.trigger_source || ''
+
   return (
     <tr className={active ? 'scanner-row scanner-row-active' : 'scanner-row'}>
         <td>
@@ -825,20 +1004,21 @@ function HistoricalScreenerTableRow({
             <small>{row.strategy_status}</small>
           </span>
         </td>
-        <td>{row.setup_family}</td>
       <td>{row.score}</td>
-      <td>{row.trend_label}</td>
-      <td>Rs {row.close.toFixed(2)}</td>
-      <td>{row.volume_ratio.toFixed(2)}x</td>
-      <td>{row.distance_to_20d_high_pct.toFixed(2)}%</td>
-      <td>{row.distance_to_52w_high_pct.toFixed(2)}%</td>
+      <td>{currency(row.close)}</td>
+      <td className="trigger-cell">
+        <span>{triggerLabel}</span>
+        {triggerSource && <small>{triggerSource}</small>}
+      </td>
+      <td>{currency(row.stop_loss)}</td>
+      <td>{currency(row.target_price)}</td>
+      <td>{row.volume_ratio > 0 ? `${row.volume_ratio.toFixed(2)}x` : row.avg_volume20.toLocaleString('en-IN')}</td>
     </tr>
   )
 }
 
 function DetailPanel({
   candidate,
-  historicalRow,
   history,
   historyRange,
   watchlisted,
@@ -848,7 +1028,6 @@ function DetailPanel({
   onHistoryRangeChange,
 }: {
   candidate: SwingCandidate | null
-  historicalRow: HistoricalScreenerRow | null
   history: SymbolHistoryResponse | null
   historyRange: HistoryRange
   watchlisted: boolean
@@ -857,7 +1036,7 @@ function DetailPanel({
   onQueue: (candidate: SwingCandidate) => void
   onHistoryRangeChange: (range: HistoryRange) => void
 }) {
-  const resolvedCandidate = candidate ?? (historicalRow ? createCandidateFromHistoricalRow(historicalRow) : null)
+  const resolvedCandidate = candidate
 
   if (!resolvedCandidate) {
     return (
@@ -1008,7 +1187,7 @@ function StockAnalysisPanel({
   historicalRow: HistoricalScreenerRow | null
   history: SymbolHistoryResponse | null
 }) {
-  const resolvedCandidate = candidate ?? (historicalRow ? createCandidateFromHistoricalRow(historicalRow) : null)
+  const resolvedCandidate = candidate
 
   if (!resolvedCandidate) {
     return (
@@ -1108,7 +1287,7 @@ function StockDetailView({
   onHistoryRangeChange: (range: HistoryRange) => void
   onBack: () => void
 }) {
-  const resolvedCandidate = candidate ?? (historicalRow ? createCandidateFromHistoricalRow(historicalRow) : null)
+  const resolvedCandidate = candidate
 
   return (
     <div className="page-stack">
@@ -1128,7 +1307,6 @@ function StockDetailView({
       <div className="stock-detail-layout">
         <DetailPanel
           candidate={resolvedCandidate}
-          historicalRow={historicalRow}
           history={history}
           historyRange={historyRange}
           watchlisted={watchlisted}
@@ -1145,6 +1323,8 @@ function StockDetailView({
 
 function HomeView({
   home,
+  liveSnapshot,
+  liveSocketState,
   loading,
   loadError,
   watchlistCount,
@@ -1156,6 +1336,8 @@ function HomeView({
   onReload,
 }: {
   home: SwingHomeResponse | null
+  liveSnapshot: LiveStrategySnapshot | null
+  liveSocketState: 'connecting' | 'open' | 'closed' | 'error'
   loading: boolean
   loadError: string
   watchlistCount: number
@@ -1170,8 +1352,28 @@ function HomeView({
   const [directionFilter, setDirectionFilter] = useState<'all' | 'long' | 'short' | 'high'>('all')
   const [sortBy, setSortBy] = useState<'score' | 'risk' | 'strategy' | 'latest'>('score')
   const [detailSymbol, setDetailSymbol] = useState<string | null>(null)
+  const liveCandidates = useMemo(
+    () => (liveSnapshot?.rows ?? [])
+      .filter((row) => row.source === 'dhan-live')
+      .map(createCandidateFromLiveRow),
+    [liveSnapshot],
+  )
+  const httpLiveCandidates = useMemo(
+    () => (home?.top_candidates ?? []).filter((candidate) => candidate.source === 'dhan-live'),
+    [home],
+  )
+  const displayHome = home ?? (liveSnapshot
+    ? {
+        updated_at: liveSnapshot.updated_at,
+        broker: liveSnapshot.broker,
+        market_regime: liveSnapshot.market_regime,
+        top_candidates: liveCandidates,
+        scanner_count: liveSnapshot.rows.length,
+        setup_mix: setupMixFromCandidates(liveCandidates),
+      }
+    : null)
 
-  if (!home) {
+  if (!displayHome) {
     if (loading) return <PageSkeleton />
     return (
       <div className="page-stack">
@@ -1195,9 +1397,13 @@ function HomeView({
     )
   }
 
-  const entryNowCount = home.top_candidates.filter((candidate) => candidate.live_signal.status === 'ENTRY_NOW').length
-  const strategies = ['All', ...Array.from(new Set(home.top_candidates.map((candidate) => candidate.live_signal.strategy_label || candidate.setup_family)))]
-  const filteredTopPicks = home.top_candidates
+  const topCandidates = liveCandidates.length > 0 ? liveCandidates : httpLiveCandidates
+  const marketRegime = liveSnapshot?.market_regime ?? displayHome.market_regime
+  const scannerCount = liveSnapshot?.rows.length ?? topCandidates.length
+  const setupMix = liveCandidates.length > 0 ? setupMixFromCandidates(liveCandidates) : setupMixFromCandidates(topCandidates)
+  const entryNowCount = topCandidates.filter((candidate) => candidate.live_signal.status === 'ENTRY_NOW').length
+  const strategies = ['All', ...Array.from(new Set(topCandidates.map((candidate) => candidate.live_signal.strategy_label || candidate.setup_family)))]
+  const filteredTopPicks = topCandidates
     .filter((candidate) => {
       const strategyName = candidate.live_signal.strategy_label || candidate.setup_family
       const matchesStrategy = strategyFilter === 'All' || strategyName === strategyFilter
@@ -1219,28 +1425,29 @@ function HomeView({
     ?? filteredTopPicks.find((candidate) => candidate.symbol === selectedSymbol)
     ?? filteredTopPicks[0]
     ?? null
-  const topStrategy = home.setup_mix[0]?.family ?? strategies.find((strategy) => strategy !== 'All') ?? 'No active strategy'
+  const topStrategy = setupMix[0]?.family ?? strategies.find((strategy) => strategy !== 'All') ?? 'No active strategy'
+  const socketTone: Tone = liveSocketState === 'open' ? 'positive' : liveSocketState === 'connecting' ? 'warning' : 'danger'
 
   return (
     <div className="home-dashboard">
       <Surface className="home-market-panel">
         <div className="home-market-copy">
-          <span className="eyebrow">Market Pulse</span>
-          <h2>{home.market_regime.label}</h2>
-          <p>{home.market_regime.summary}</p>
+          <span className="eyebrow">Live Market Pulse</span>
+          <h2>{marketRegime.label}</h2>
+          <p>{marketRegime.summary}</p>
         </div>
         <div className="home-kpi-grid">
-          <CandidateStat label="Adv / Dec" value={`${home.market_regime.advances} / ${home.market_regime.declines}`} />
-          <CandidateStat label="Breadth" value={home.market_regime.breadth_ratio.toFixed(2)} tone={home.market_regime.breadth_ratio >= 1 ? 'positive' : 'warning'} />
-          <CandidateStat label="Active Signals" value={String(home.scanner_count)} tone="positive" />
+          <CandidateStat label="WebSocket" value={liveSocketState} tone={socketTone} />
+          <CandidateStat label="Adv / Dec" value={`${marketRegime.advances} / ${marketRegime.declines}`} />
+          <CandidateStat label="Breadth" value={marketRegime.breadth_ratio.toFixed(2)} tone={marketRegime.breadth_ratio >= 1 ? 'positive' : 'warning'} />
+          <CandidateStat label="Live Rows" value={String(scannerCount)} tone={scannerCount > 0 ? 'positive' : 'warning'} />
           <CandidateStat label="Top Strategy" value={topStrategy} tone="positive" />
           <CandidateStat label="Enter Now" value={String(entryNowCount)} tone={entryNowCount > 0 ? 'positive' : 'warning'} />
-          <CandidateStat label="Paper P/L" value="Open desk" tone={paperCount > 0 ? 'warning' : 'neutral'} />
         </div>
       </Surface>
 
       <div className="market-ribbon compact-market-ribbon">
-        {home.top_candidates.slice(0, 5).map((candidate) => (
+        {topCandidates.slice(0, 5).map((candidate) => (
           <button
             key={candidate.symbol}
             type="button"
@@ -1255,6 +1462,12 @@ function HomeView({
             <small className={`ticker-signal ${signalClass(candidate.live_signal.status)}`}>{candidate.live_signal.label}</small>
           </button>
         ))}
+        {topCandidates.length === 0 && (
+          <div className="empty-table live-empty-row">
+            <Activity size={18} />
+            <p>No live strategy recommendations are being shown until Dhan quote data arrives.</p>
+          </div>
+        )}
       </div>
 
       <div className="home-grid">
@@ -1340,6 +1553,12 @@ function HomeView({
                 </span>
               </div>
             ))}
+            {filteredTopPicks.length === 0 && (
+              <div className="empty-table">
+                <Activity size={18} />
+                <p>Waiting for live strategy rows from the websocket. Historical backtest rows stay in the Backtest view.</p>
+              </div>
+            )}
           </div>
         </Surface>
 
@@ -1405,13 +1624,14 @@ function HomeView({
               </div>
             </div>
             <div className="setup-mix-compact">
-              {home.setup_mix.slice(0, 4).map((mix) => (
+              {setupMix.slice(0, 4).map((mix) => (
                 <div key={mix.family} className="setup-mix-row">
                   <span>{mix.family}</span>
                   <strong>{mix.count}</strong>
                   <em>{mix.avg_score.toFixed(1)}</em>
                 </div>
               ))}
+              {setupMix.length === 0 && <p className="settings-copy">No live setup mix yet.</p>}
             </div>
           </Surface>
         </div>
@@ -1425,11 +1645,15 @@ function ScannerView({
   historicalScreener,
   freshSignals,
   bambooLatest,
+  liveSnapshot,
+  liveSocketState,
+  liveAlertsEnabled,
   selectedSymbol,
   onSelect,
   onStageFresh,
   onRefreshCache,
   onReload,
+  onEnableLiveAlerts,
   loading,
   loadError,
   stagingFresh,
@@ -1439,11 +1663,15 @@ function ScannerView({
   historicalScreener: HistoricalScreenerResponse | null
   freshSignals: FreshSignalsResponse | null
   bambooLatest: BambooLatestResponse | null
+  liveSnapshot: LiveStrategySnapshot | null
+  liveSocketState: 'connecting' | 'open' | 'closed' | 'error'
+  liveAlertsEnabled: boolean
   selectedSymbol: string | null
   onSelect: (symbol: string) => void
   onStageFresh: () => void
   onRefreshCache: () => void
   onReload: () => void
+  onEnableLiveAlerts: () => void
   loading: boolean
   loadError: string
   stagingFresh: boolean
@@ -1455,26 +1683,30 @@ function ScannerView({
   const [page, setPage] = useState(1)
   const pageSize = 12
   const deferredSearch = useDeferredValue(search)
+  const liveRows = useMemo(
+    () => (liveSnapshot?.rows ?? [])
+      .filter((row) => row.source === 'dhan-live')
+      .map(createHistoricalRowFromLiveRow),
+    [liveSnapshot],
+  )
+  const sourceRows = liveRows
 
   const families = useMemo(() => {
     const options = new Set<string>(['All'])
-    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
     sourceRows.forEach((row) => options.add(row.setup_family))
     return Array.from(options)
-  }, [freshSignals, historicalScreener])
+  }, [sourceRows])
 
   const strategies = useMemo(() => {
     const options = new Map<string, string>([['All', 'All Strategies']])
-    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
     sourceRows.forEach((row) => {
       options.set(row.strategy_id, row.strategy_label)
     })
     return Array.from(options.entries()).map(([id, label]) => ({ id, label }))
-  }, [freshSignals, historicalScreener])
+  }, [sourceRows])
 
   const filtered = useMemo(() => {
     const term = deferredSearch.trim().toLowerCase()
-    const sourceRows = freshSignals?.rows.length ? freshSignals.rows : historicalScreener?.rows ?? []
     return sourceRows.filter((row) => {
       const matchesFamily = familyFilter === 'All' || row.setup_family === familyFilter
       const matchesStrategy = strategyFilter === 'All' || row.strategy_id === strategyFilter
@@ -1485,7 +1717,7 @@ function ScannerView({
         || row.strategy_status.toLowerCase().includes(term)
       return matchesFamily && matchesStrategy && matchesSearch
     })
-  }, [deferredSearch, familyFilter, freshSignals, historicalScreener, strategyFilter])
+  }, [deferredSearch, familyFilter, sourceRows, strategyFilter])
 
   useEffect(() => {
     setPage(1)
@@ -1508,7 +1740,7 @@ function ScannerView({
     }))
   }, [filtered])
 
-  if (!scanner || !historicalScreener) {
+  if (!scanner && !liveSnapshot) {
     if (loading) return <PageSkeleton />
     return (
       <div className="page-stack">
@@ -1537,7 +1769,12 @@ function ScannerView({
   }
   const bambooSignals = bambooLatest?.top_signals ?? []
   const freshSignalCount = freshSignals?.new_rows ?? 0
-  const latestSignalDate = freshSignals?.signal_date ?? historicalScreener.signal_date ?? historicalScreener.rows[0]?.as_of ?? 'not available'
+  const latestSignalDate = liveSnapshot?.updated_at ?? freshSignals?.signal_date ?? historicalScreener?.signal_date ?? historicalScreener?.rows[0]?.as_of ?? 'not available'
+  const liveFeedLabel = liveSnapshot?.feed_status === 'streaming'
+    ? 'Dhan websocket live'
+    : liveRows.length > 0
+      ? `Live rows via ${liveSnapshot?.mode ?? 'websocket'}`
+      : 'Waiting for live quote rows'
 
   return (
     <div className="page-stack">
@@ -1605,11 +1842,11 @@ function ScannerView({
           <div className="toolbar-right screener-toolbar-meta">
             <div className="mini-chip">
               <Database size={14} />
-              <span>{historicalScreener.total_rows} screened names</span>
+              <span>{liveRows.length} live strategy rows</span>
             </div>
             <div className="mini-chip">
               <Activity size={14} />
-              <span>{scanner.live_data ? 'Live Dhan overlay active' : 'Live quote overlay unavailable'}</span>
+              <span>{liveFeedLabel}</span>
             </div>
             <input
               value={search}
@@ -1620,6 +1857,10 @@ function ScannerView({
             <button type="button" className="primary-button" onClick={onStageFresh} disabled={stagingFresh}>
               <RefreshCw size={14} className={stagingFresh ? 'spin' : ''} />
               <span>{stagingFresh ? 'Staging' : 'Stage Fresh Signals'}</span>
+            </button>
+            <button type="button" className="ghost-button" onClick={onEnableLiveAlerts} disabled={liveAlertsEnabled}>
+              <BellRing size={14} />
+              <span>{liveAlertsEnabled ? 'Alerts On' : 'Enable Alerts'}</span>
             </button>
             <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache}>
               <Database size={14} />
@@ -1632,8 +1873,10 @@ function ScannerView({
           <CandidateStat label="New Signals" value={String(freshSignalCount)} tone={freshSignalCount > 0 ? 'positive' : 'neutral'} />
           <CandidateStat label="Auto-Staged" value={String(freshSignals?.staged_rows ?? 0)} tone={(freshSignals?.staged_rows ?? 0) > 0 ? 'positive' : 'neutral'} />
           <CandidateStat label="Already Seen" value={String(freshSignals?.seen_rows ?? 0)} tone={(freshSignals?.seen_rows ?? 0) > 0 ? 'warning' : 'neutral'} />
-          <CandidateStat label="Last Data Date" value={latestSignalDate} />
+          <CandidateStat label="Live Updated" value={compactDate(latestSignalDate)} />
         </div>
+
+        <LiveStrategyTape snapshot={liveSnapshot} socketState={liveSocketState} selectedStrategy={strategyFilter} onSelect={onSelect} />
 
         <div className="filter-strip">
           {strategies.map((strategy) => (
@@ -1682,13 +1925,12 @@ function ScannerView({
                         <tr>
                           <th>Symbol</th>
                           <th>Strategy</th>
-                          <th>Setup</th>
                           <th>Score</th>
-                          <th>Trend</th>
-                          <th>Close</th>
-                          <th>Vol Ratio</th>
-                          <th>20D High</th>
-                          <th>52W High</th>
+                          <th>Live LTP</th>
+                          <th>Trigger</th>
+                          <th>Stop</th>
+                          <th>Target</th>
+                          <th>Volume</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1708,7 +1950,7 @@ function ScannerView({
               {groupedRows.length === 0 && (
                 <div className="empty-table">
                   <CircleAlert size={18} />
-                  <p>{historicalScreener.message ?? 'No strategy signals matched the current filters.'}</p>
+                  <p>{liveSnapshot?.message ?? historicalScreener?.message ?? 'No live strategy signals matched the current filters.'}</p>
                 </div>
               )}
             </div>
@@ -1719,13 +1961,12 @@ function ScannerView({
                 <tr>
                   <th>Symbol</th>
                   <th>Strategy</th>
-                  <th>Setup</th>
                   <th>Score</th>
-                  <th>Trend</th>
-                  <th>Close</th>
-                  <th>Vol Ratio</th>
-                  <th>20D High</th>
-                  <th>52W High</th>
+                  <th>Live LTP</th>
+                  <th>Trigger</th>
+                  <th>Stop</th>
+                  <th>Target</th>
+                  <th>Volume</th>
                 </tr>
               </thead>
               <tbody>
@@ -1742,7 +1983,7 @@ function ScannerView({
             {filtered.length === 0 && (
               <div className="empty-table">
                 <CircleAlert size={18} />
-                <p>{freshSignals?.message ?? 'No new unique signals matched the current filters. Existing names are tracked in Paper Desk instead of being shown again.'}</p>
+                <p>{liveSnapshot?.message ?? freshSignals?.message ?? 'No live strategy rows matched the current filters.'}</p>
               </div>
             )}
           </div>
@@ -2624,7 +2865,17 @@ function tradingWeekStart(signalDate: string) {
   return localIsoDate(date)
 }
 
+const STRATEGY_LABELS: Record<string, string> = {
+  'tuned-ma-breakout-v1': 'MA Breakout Lab',
+  'tuned-panic-reversal-v1': 'Panic Reversal Lab',
+  'weekly-supertrend-10-3': 'Weekly Supertrend 10-3',
+  'king-candle-supertrend-breakout-v1': 'King Candle Supertrend Breakout',
+  'king-candle-quality-v1': 'King Candle Quality',
+}
+
 function strategyLabel(strategyId: string) {
+  const fixedLabel = STRATEGY_LABELS[strategyId]
+  if (fixedLabel) return fixedLabel
   return strategyId
     .replace('-v1', '')
     .split('-')
@@ -2659,22 +2910,91 @@ function formatMetric(row: PythonBacktestMetricRow | undefined, key: string, suf
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-const STRATEGY_ANALYSIS_NOTES: Record<string, {
-  title: string
-  idea: string
-  entry: string
-  exit: string
-  interpretation: string
-  caveat: string
-}> = {
-  'rsi10-pullback-reversion-v1': {
-    title: 'RSI10 Pullback Reversion',
-    idea: 'Mean-reversion setup: buy a sharp pullback only when the stock is still in a long-term uptrend.',
-    entry: 'Close must be above SMA200 and RSI10 must close below 30. The simulated entry is the next session open.',
-    exit: 'Primary exit is RSI10 recovery above 40. The backtest also tracks the 4% stop, 4% target, and 10-session time stop used for risk comparison.',
-    interpretation: 'This strategy is working when RSI40 exits dominate, win rate stays above the baseline, and profit factor stays comfortably above 1.',
-    caveat: 'Paper Desk still tracks this with a stricter 5 trading-session clock, so live forward evidence can differ from the 10-session historical test.',
-  },
+function LiveStrategyTape({
+  snapshot,
+  socketState,
+  selectedStrategy,
+  onSelect,
+}: {
+  snapshot: LiveStrategySnapshot | null
+  socketState: 'connecting' | 'open' | 'closed' | 'error'
+  selectedStrategy: string
+  onSelect: (symbol: string) => void
+}) {
+  const rows = useMemo(() => {
+    const source = (snapshot?.rows ?? []).filter((row) => row.source === 'dhan-live')
+    return (selectedStrategy === 'All'
+      ? source
+      : source.filter((row) => row.strategy_id === selectedStrategy)
+    ).slice(0, 10)
+  }, [selectedStrategy, snapshot])
+  const stateTone: Tone = socketState === 'open' ? 'positive' : socketState === 'connecting' ? 'warning' : 'danger'
+  const feedTone: Tone = snapshot?.feed_status === 'streaming' ? 'positive' : snapshot?.feed_status === 'connecting' ? 'warning' : snapshot ? 'danger' : stateTone
+
+  return (
+    <Surface className="inner-surface live-strategy-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Live Strategy Feed</span>
+          <h2>Today onward websocket signals</h2>
+        </div>
+        <div className="hero-actions">
+          <StagePill label={socketState} tone={stateTone} />
+          <StagePill label={snapshot?.feed_status ?? 'waiting'} tone={feedTone} />
+          <div className="mini-chip">
+            <Activity size={14} />
+            <span>{snapshot ? compactDate(snapshot.updated_at) : 'Connecting'}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="live-strategy-kpis">
+        <CandidateStat label="Mode" value={snapshot?.mode ?? 'websocket'} tone={snapshot?.mode === 'dhan-websocket' ? 'positive' : 'warning'} />
+        <CandidateStat label="Watching" value={(snapshot?.total_watching ?? 0).toLocaleString('en-IN')} />
+        <CandidateStat label="Entry Now" value={(snapshot?.triggered ?? 0).toLocaleString('en-IN')} tone={(snapshot?.triggered ?? 0) > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Broker" value={snapshot?.broker.state ?? 'checking'} tone={snapshot?.broker.state === 'ready' ? 'positive' : 'warning'} />
+      </div>
+
+      {snapshot?.message && (
+        <div className="backtest-run-note live-strategy-note">
+          <CircleAlert size={16} />
+          <span>{snapshot.message}</span>
+        </div>
+      )}
+
+      <div className="live-strategy-table">
+        <div className="live-strategy-row live-strategy-head">
+          <span>Stock</span>
+          <span>Strategy</span>
+          <span>Status</span>
+          <span>LTP</span>
+          <span>Day</span>
+          <span>Stop</span>
+          <span>Target</span>
+          <span>Score</span>
+        </div>
+        {rows.map((row) => (
+          <button key={`${row.strategy_id}-${row.symbol}`} type="button" className="live-strategy-row live-strategy-button" onClick={() => onSelect(row.symbol)}>
+            <strong>{row.symbol}<small>{row.company_name}</small></strong>
+            <span>{row.strategy_label}<small>{row.setup_family}</small></span>
+            <span className={`watch-signal-pill signal-${row.signal_status.toLowerCase().replace(/_/g, '-')}`}>{row.signal_label}</span>
+            <strong>{currency(row.last_price)}</strong>
+            <span className={row.day_change_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.day_change_pct)}</span>
+            <span>{currency(row.stop_loss)}</span>
+            <span>{currency(row.target_price)}</span>
+            <strong>{row.score}</strong>
+          </button>
+        ))}
+      </div>
+
+      {rows.length === 0 && (
+        <div className="empty-table">
+          <Activity size={18} />
+          <p>{snapshot ? 'No live strategy rows match this filter yet.' : 'Connecting to the live strategy websocket.'}</p>
+        </div>
+      )}
+    </Surface>
+  )
 }
 
 function PythonBacktestLabPanel({
@@ -2715,8 +3035,8 @@ function PythonBacktestLabPanel({
     <Surface className="inner-surface python-lab-panel">
       <div className="compact-section-head">
         <div>
-          <span className="eyebrow">Python/NumPy Strategy Engine</span>
-          <h2>MA breakout and panic reversal optimizer</h2>
+          <span className="eyebrow">CSV Strategy Files</span>
+          <h2>MA breakout and panic reversal results</h2>
         </div>
         <div className="hero-actions">
           <button type="button" className="ghost-button" onClick={onLoad} disabled={loading || running}>
@@ -2887,7 +3207,7 @@ function BacktestsView({
   const [familyFilter, setFamilyFilter] = useState('all')
   const [backtestSort, setBacktestSort] = useState('stability')
   const [backtestSearch, setBacktestSearch] = useState('')
-  const [backtestMode, setBacktestMode] = useState<'datewise' | 'strategy'>('datewise')
+  const [backtestMode] = useState<'datewise' | 'strategy'>('strategy')
   const [datewise, setDatewise] = useState<BacktestDatewiseResponse | null>(null)
   const [datewiseDate, setDatewiseDate] = useState('')
   const [datewiseStrategy, setDatewiseStrategy] = useState('all')
@@ -2896,7 +3216,7 @@ function BacktestsView({
   const [loadingDatewise, setLoadingDatewise] = useState(false)
 
   useEffect(() => {
-    if (!dashboard) return
+    if (!dashboard || backtestMode !== 'datewise') return
     let cancelled = false
     setLoadingDatewise(true)
     getBacktestDatewise({
@@ -2921,11 +3241,20 @@ function BacktestsView({
     return () => {
       cancelled = true
     }
-  }, [dashboard, datewiseDate, datewisePage, datewisePageSize, datewiseStrategy])
+  }, [backtestMode, dashboard, datewiseDate, datewisePage, datewisePageSize, datewiseStrategy])
 
   const methodFamilies = useMemo(() => {
     if (!dashboard) return []
-    return Array.from(new Set(dashboard.diagnostics.map((row) => row.method_family))).sort()
+    const eligibleStrategyIds = new Set(
+      dashboard.summaries
+        .filter((summary) => summary.total_trades >= MIN_BACKTEST_STRATEGY_TRADES)
+        .map((summary) => summary.strategy_id),
+    )
+    return Array.from(new Set(
+      dashboard.diagnostics
+        .filter((row) => eligibleStrategyIds.has(row.strategy_id))
+        .map((row) => row.method_family),
+    )).sort()
   }, [dashboard])
   const methodStatuses = useMemo(() => {
     if (!dashboard) return []
@@ -2953,7 +3282,7 @@ function BacktestsView({
           || summary.strategy_id.toLowerCase().includes(term)
           || label.includes(term)
           || family.toLowerCase().includes(term)
-        return matchesStatus && matchesFamily && matchesSearch
+        return summary.total_trades >= MIN_BACKTEST_STRATEGY_TRADES && matchesStatus && matchesFamily && matchesSearch
       })
       .sort((a, b) => {
         const aDiagnostic = diagnosticsById.get(a.strategy_id)
@@ -3031,13 +3360,38 @@ function BacktestsView({
   const activeYear = selectedYearExists ? selectedYear : yearlyRows[yearlyRows.length - 1]?.year ?? null
   const monthlyRows = dashboard.monthly_returns.filter((row) => row.strategy_id === selectedStrategy)
   const selectedYearMonths = activeYear ? monthlyRows.filter((row) => row.year === activeYear) : []
+  const selectedEquity = dashboard.equity_curve.filter((row) => row.strategy_id === selectedStrategy)
   const dayQuality = dashboard.day_quality.find((row) => row.strategy_id === selectedStrategy)
-  const winners = dashboard.winners.filter((row) => row.strategy_id === selectedStrategy).slice(0, 8)
-  const losers = dashboard.losers.filter((row) => row.strategy_id === selectedStrategy).slice(0, 8)
-  const trades = dashboard.trades.filter((row) => row.strategy_id === selectedStrategy).slice(0, 18)
   const visibleStrategyIds = new Set(visibleSummaries.map((summary) => summary.strategy_id))
   const visibleDiagnostics = dashboard.diagnostics.filter((row) => visibleStrategyIds.has(row.strategy_id))
   const dayQualityByStrategy = new Map(dashboard.day_quality.map((row) => [row.strategy_id, row]))
+  const summaryByStrategy = new Map(visibleSummaries.map((summary) => [summary.strategy_id, summary]))
+  const strategyRollups = new Map(visibleSummaries.map((summary) => {
+    const months = dashboard.monthly_returns.filter((row) => row.strategy_id === summary.strategy_id)
+    const profitableMonths = months.filter((row) => row.pnl > 0).length
+    const monthPct = months.length > 0 ? (profitableMonths / months.length) * 100 : 0
+    const equityRows = dashboard.equity_curve.filter((row) => row.strategy_id === summary.strategy_id)
+    const latestEquity = equityRows[equityRows.length - 1]
+    return [
+      summary.strategy_id,
+      {
+        finalReturnPct: latestEquity?.cumulative_return_pct ?? summary.deployed_return_pct,
+        profitableMonths,
+        totalMonths: months.length,
+        monthPct,
+      },
+    ]
+  }))
+  const profitableMonths = monthlyRows.filter((row) => row.pnl > 0).length
+  const profitableMonthPct = monthlyRows.length > 0 ? (profitableMonths / monthlyRows.length) * 100 : 0
+  const bestMonth = monthlyRows.reduce<BacktestDashboardResponse['monthly_returns'][number] | null>(
+    (best, row) => (!best || row.pnl > best.pnl ? row : best),
+    null,
+  )
+  const worstMonth = monthlyRows.reduce<BacktestDashboardResponse['monthly_returns'][number] | null>(
+    (worst, row) => (!worst || row.pnl < worst.pnl ? row : worst),
+    null,
+  )
   const dateOptions = datewise?.available_dates ?? []
   const activeDate = datewise?.selected_date ?? datewiseDate
   const activeDateIndex = activeDate ? dateOptions.indexOf(activeDate) : -1
@@ -3053,13 +3407,14 @@ function BacktestsView({
 
   return (
     <div className="page-stack">
-      <Surface>
-        <div className="section-head">
+      <Surface className="backtest-page-surface">
+        <div className="backtest-hero">
           <div>
-            <span className="eyebrow">Strategy Lab</span>
-            <h2>Backtested swing strategy returns from parquet history</h2>
+            <span className="eyebrow">Strategy Backtest</span>
+            <h2>Pre-live strategy review</h2>
+            <p>Compare every strategy by profitability, drawdown, consistency, and return over time before choosing what can move toward live execution.</p>
           </div>
-          <div className="hero-actions">
+          <div className="backtest-actions">
             <button type="button" className="ghost-button" onClick={onRefreshCache} disabled={refreshingCache || running}>
               <Database size={14} className={refreshingCache ? 'spin' : ''} />
               <span>{refreshingCache ? 'Refreshing Cache' : 'Refresh Cache'}</span>
@@ -3068,52 +3423,16 @@ function BacktestsView({
               <RefreshCw size={14} className={running ? 'spin' : ''} />
               <span>{running ? 'Running Backtest' : 'Run Backtest'}</span>
             </button>
-            <CandidateStat label="Run" value={dashboard.run_id.replace('watchlist-swing-', '')} />
-            <CandidateStat label="Methods" value={String(dashboard.summaries.length)} />
-            <CandidateStat label="Shown" value={String(visibleSummaries.length)} tone={visibleSummaries.length > 0 ? 'positive' : 'warning'} />
-            <CandidateStat label="Trades Stored" value={String(dashboard.summaries.reduce((sum, item) => sum + item.total_trades, 0).toLocaleString('en-IN'))} />
           </div>
         </div>
 
-        <div className="backtest-run-note">
-          <Database size={16} />
-          <span>Run Backtest refreshes the cache first, dedupes duplicate stock signals, and caps the simulation at 3 new positions per day with Rs 10k per trade.</span>
-        </div>
-
-        {cache && (
-          <div className="backtest-kpi-grid">
-            <CandidateStat label="Cache Rows" value={cache.cached_rows.toLocaleString('en-IN')} />
-            <CandidateStat label="Cache Symbols" value={cache.symbols.toLocaleString('en-IN')} />
-            <CandidateStat label="Cache From" value={cache.from_date || 'N/A'} />
-            <CandidateStat label="Cache To" value={cache.to_date || 'N/A'} />
-          </div>
-        )}
-
-        <PythonBacktestLabPanel
-          lab={pythonLab}
-          running={pythonRunning}
-          loading={pythonLoading}
-          onLoad={onLoadPythonLab}
-          onRun={onRunPythonLab}
-        />
-
-        <div className="backtest-mode-toggle">
-          <button
-            type="button"
-            className={backtestMode === 'datewise' ? 'filter-chip active-ghost' : 'filter-chip'}
-            onClick={() => setBacktestMode('datewise')}
-          >
-            <CalendarDays size={14} />
-            <span>Datewise</span>
-          </button>
-          <button
-            type="button"
-            className={backtestMode === 'strategy' ? 'filter-chip active-ghost' : 'filter-chip'}
-            onClick={() => setBacktestMode('strategy')}
-          >
-            <BarChart3 size={14} />
-            <span>Strategy View</span>
-          </button>
+        <div className="backtest-summary-strip">
+          <CandidateStat label="Run" value={dashboard.run_id.replace('watchlist-swing-', '')} />
+          <CandidateStat label="Strategies" value={String(dashboard.summaries.length)} />
+          <CandidateStat label="Shown" value={String(visibleSummaries.length)} tone={visibleSummaries.length > 0 ? 'positive' : 'warning'} />
+          <CandidateStat label="Trades Stored" value={dashboard.summaries.reduce((sum, item) => sum + item.total_trades, 0).toLocaleString('en-IN')} />
+          <CandidateStat label="Min Sample" value={`${MIN_BACKTEST_STRATEGY_TRADES}+ trades`} />
+          {cache && <CandidateStat label="Data Window" value={`${cache.from_date || 'N/A'} to ${cache.to_date || 'N/A'}`} />}
         </div>
 
         {backtestMode === 'datewise' ? (
@@ -3142,7 +3461,7 @@ function BacktestsView({
           />
         ) : (
           <>
-        <div className="desk-control-panel backtest-control-panel">
+        <div className="desk-control-panel backtest-control-panel strategy-filter-panel">
           <label>
             <span>Show</span>
             <select className="select-input" value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value)}>
@@ -3191,27 +3510,31 @@ function BacktestsView({
           <Surface className="inner-surface method-score-panel">
             <div className="compact-section-head">
               <div>
-                <span className="eyebrow">Method Scorecard</span>
-                <h2>Strategy families under test</h2>
+                <span className="eyebrow">Strategy Wise Overall</span>
+                <h2>All strategies</h2>
               </div>
               <div className="mini-chip">
                 <Target size={14} />
-                <span>{dashboard.diagnostics.filter((row) => row.status !== 'Rejected').length} methods still worth watching</span>
+                <span>{visibleSummaries.length} visible</span>
               </div>
             </div>
             <div className="method-score-table">
               <div className="method-score-row method-score-head">
-                <span>Method</span>
+                <span>Strategy</span>
                 <span>Status</span>
-                <span>Stability</span>
-                <span>Win</span>
-                <span>Positive Days</span>
-                <span>Profit Factor</span>
+                <span>Return</span>
                 <span>P&L</span>
+                <span>Win</span>
+                <span>Profit Factor</span>
+                <span>Profitable Months</span>
+                <span>Positive Days</span>
+                <span>Max DD</span>
               </div>
               {visibleDiagnostics.map((row) => {
                 const canOpen = visibleSummaries.some((summary) => summary.strategy_id === row.strategy_id)
                 const positiveDaysPct = dayQualityByStrategy.get(row.strategy_id)?.positive_days_pct ?? 0
+                const summary = summaryByStrategy.get(row.strategy_id)
+                const rollup = strategyRollups.get(row.strategy_id)
                 return (
                   <button
                     key={row.strategy_id}
@@ -3224,31 +3547,19 @@ function BacktestsView({
                   >
                     <strong>{strategyLabel(row.strategy_id)}<small>{row.method_family}</small></strong>
                     <span>{row.status}</span>
-                    <strong>{row.stability_score.toFixed(1)}</strong>
+                    <strong className={(rollup?.finalReturnPct ?? 0) >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(rollup?.finalReturnPct ?? 0)}</strong>
+                    <strong className={(summary?.total_pnl ?? row.total_pnl) >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(summary?.total_pnl ?? row.total_pnl)}</strong>
                     <span>{row.win_rate.toFixed(2)}%</span>
-                    <span>{positiveDaysPct.toFixed(2)}%</span>
                     <span>{row.profit_factor.toFixed(2)}</span>
-                    <strong className={row.total_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.total_pnl)}</strong>
+                    <span>{rollup ? `${rollup.profitableMonths}/${rollup.totalMonths} (${rollup.monthPct.toFixed(0)}%)` : 'N/A'}</span>
+                    <span>{positiveDaysPct.toFixed(2)}%</span>
+                    <strong className="tone-danger">{currency(row.max_drawdown_rs)}</strong>
                   </button>
                 )
               })}
             </div>
           </Surface>
         )}
-
-        <div className="backtest-tabs">
-          {visibleSummaries.map((summary) => (
-            <button
-              key={summary.strategy_id}
-              type="button"
-              className={summary.strategy_id === selectedStrategy ? 'backtest-tab backtest-tab-active' : 'backtest-tab'}
-              onClick={() => setSelectedStrategy(summary.strategy_id)}
-            >
-              <span>{strategyLabel(summary.strategy_id)}</span>
-              <strong className={summary.total_pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(summary.total_pnl)}</strong>
-            </button>
-          ))}
-        </div>
 
         {!selectedSummary && (
           <div className="portfolio-empty">
@@ -3259,18 +3570,33 @@ function BacktestsView({
 
         {selectedSummary && (
           <>
-            <div className="backtest-kpi-grid">
-              <CandidateStat label="Total P&L" value={currency(selectedSummary.total_pnl)} tone={selectedSummary.total_pnl >= 0 ? 'positive' : 'danger'} />
-              <CandidateStat label="Deployed Return" value={pct(selectedSummary.deployed_return_pct)} tone={selectedSummary.deployed_return_pct >= 0 ? 'positive' : 'danger'} />
-              <CandidateStat label="Win Rate" value={`${selectedSummary.win_rate.toFixed(2)}%`} tone={selectedSummary.win_rate >= 50 ? 'positive' : 'warning'} />
-              <CandidateStat label="Stability" value={selectedDiagnostic ? selectedDiagnostic.stability_score.toFixed(1) : 'N/A'} tone={(selectedDiagnostic?.stability_score ?? 0) >= 62 ? 'positive' : 'warning'} />
-              <CandidateStat label="Profit Factor" value={selectedDiagnostic ? selectedDiagnostic.profit_factor.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.profit_factor ?? 0) >= 1.05 ? 'positive' : 'warning'} />
-              <CandidateStat label="Positive Months" value={selectedDiagnostic ? `${selectedDiagnostic.positive_months_pct.toFixed(2)}%` : 'N/A'} tone={(selectedDiagnostic?.positive_months_pct ?? 0) >= 52 ? 'positive' : 'warning'} />
-              <CandidateStat label="Avg Trade" value={pct(selectedSummary.avg_return_pct)} tone={selectedSummary.avg_return_pct >= 0 ? 'positive' : 'danger'} />
-              <CandidateStat label="Trades" value={selectedSummary.total_trades.toLocaleString('en-IN')} />
-              <CandidateStat label="Avg Hold" value={`${selectedSummary.avg_hold_sessions.toFixed(1)} sessions`} />
-              <CandidateStat label="Positive Days" value={dayQuality ? `${dayQuality.positive_days_pct.toFixed(2)}%` : 'N/A'} tone={(dayQuality?.positive_days_pct ?? 0) >= 55 ? 'positive' : 'warning'} />
-              <CandidateStat label="Max Drawdown" value={dayQuality ? currency(dayQuality.max_drawdown_rs) : 'N/A'} tone="danger" />
+            <Surface className="inner-surface selected-strategy-panel">
+              <div className="compact-section-head">
+                <div>
+                  <span className="eyebrow">Selected Strategy</span>
+                  <h2>{strategyLabel(selectedStrategy)}</h2>
+                </div>
+                <StagePill label={selectedDiagnostic?.status ?? 'Review'} tone={(selectedDiagnostic?.status ?? '') === 'Candidate' ? 'positive' : (selectedDiagnostic?.status ?? '') === 'Rejected' ? 'danger' : 'warning'} />
+              </div>
+              <div className="backtest-kpi-grid selected-kpi-grid">
+                <CandidateStat label="Total P&L" value={currency(selectedSummary.total_pnl)} tone={selectedSummary.total_pnl >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Return" value={pct(selectedEquity[selectedEquity.length - 1]?.cumulative_return_pct ?? selectedSummary.deployed_return_pct)} tone={selectedSummary.deployed_return_pct >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Win Rate" value={`${selectedSummary.win_rate.toFixed(2)}%`} tone={selectedSummary.win_rate >= 50 ? 'positive' : 'warning'} />
+                <CandidateStat label="Profit Factor" value={selectedDiagnostic ? selectedDiagnostic.profit_factor.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.profit_factor ?? 0) >= 1.05 ? 'positive' : 'warning'} />
+                <CandidateStat label="Profitable Months" value={`${profitableMonths}/${monthlyRows.length || 0}`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
+                <CandidateStat label="Monthly Hit Rate" value={`${profitableMonthPct.toFixed(1)}%`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
+                <CandidateStat label="Positive Days" value={dayQuality ? `${dayQuality.positive_days_pct.toFixed(2)}%` : 'N/A'} tone={(dayQuality?.positive_days_pct ?? 0) >= 55 ? 'positive' : 'warning'} />
+                <CandidateStat label="Max Drawdown" value={dayQuality ? currency(dayQuality.max_drawdown_rs) : 'N/A'} tone="danger" />
+              </div>
+            </Surface>
+
+            <div className="backtest-grid backtest-insight-grid">
+              <StrategyEquityCurvePanel strategyId={selectedStrategy} rows={selectedEquity} />
+              <StrategySuccessMetricsPanel
+                summary={selectedSummary}
+                diagnostic={selectedDiagnostic}
+                dayQuality={dayQuality}
+              />
             </div>
 
             <div className="backtest-grid">
@@ -3303,33 +3629,7 @@ function BacktestsView({
                 </div>
               </Surface>
 
-              <Surface className="inner-surface backtest-panel">
-                <div className="compact-section-head">
-                  <div>
-                    <span className="eyebrow">Exit Quality</span>
-                    <h2>Where the money came from</h2>
-                  </div>
-                </div>
-                <div className="exit-quality-grid">
-              <CandidateStat label="Target Hits" value={selectedSummary.tp_exits.toLocaleString('en-IN')} tone="positive" />
-              <CandidateStat label="Stop Loss" value={selectedSummary.sl_exits.toLocaleString('en-IN')} tone="danger" />
-              <CandidateStat label="RSI40 Exits" value={(selectedSummary.rsi_exits ?? 0).toLocaleString('en-IN')} tone="positive" />
-              <CandidateStat label="Time Exits" value={selectedSummary.time_exits.toLocaleString('en-IN')} tone="warning" />
-              <CandidateStat label="Worst Day" value={dayQuality ? currency(dayQuality.worst_day) : 'N/A'} tone="danger" />
-              <CandidateStat label="Best Day" value={dayQuality ? currency(dayQuality.best_day) : 'N/A'} tone="positive" />
-                  <CandidateStat label="Days Tested" value={dayQuality ? String(dayQuality.trading_days) : 'N/A'} />
-                </div>
-              </Surface>
-            </div>
-
-            <StrategyAnalysisPanel
-              strategyId={selectedStrategy}
-              summary={selectedSummary}
-              diagnostic={selectedDiagnostic}
-              dayQuality={dayQuality}
-            />
-
-            <Surface className="inner-surface backtest-panel monthly-panel">
+              <Surface className="inner-surface backtest-panel monthly-panel">
               <div className="compact-section-head">
                 <div>
                   <span className="eyebrow">Monthly P&L</span>
@@ -3348,6 +3648,13 @@ function BacktestsView({
                   ))}
                 </div>
               </div>
+              <div className="monthly-summary-grid">
+                <CandidateStat label="Profitable Months" value={`${profitableMonths}/${monthlyRows.length || 0}`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
+                <CandidateStat label="Monthly Hit Rate" value={`${profitableMonthPct.toFixed(1)}%`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
+                <CandidateStat label="Best Month" value={bestMonth ? `${bestMonth.month_label} ${bestMonth.year} ${currency(bestMonth.pnl)}` : 'N/A'} tone="positive" />
+                <CandidateStat label="Worst Month" value={worstMonth ? `${worstMonth.month_label} ${worstMonth.year} ${currency(worstMonth.pnl)}` : 'N/A'} tone="danger" />
+              </div>
+              <MonthlyReturnBars rows={selectedYearMonths} activeYear={activeYear} />
               <div className="monthly-pnl-grid">
                 {MONTH_LABELS.map((label, index) => {
                   const month = selectedYearMonths.find((row) => row.month === index + 1)
@@ -3363,49 +3670,240 @@ function BacktestsView({
                 })}
               </div>
             </Surface>
-
-            <div className="backtest-grid">
-              <BacktestSymbolList title="Best Strategy-Stock Edge" rows={winners} positive />
-              <BacktestSymbolList title="Weak Stock Matches" rows={losers} />
             </div>
-
-            <Surface className="inner-surface backtest-panel">
-              <div className="compact-section-head">
-                <div>
-                  <span className="eyebrow">Trade Log</span>
-                  <h2>Latest high-impact trades</h2>
-                </div>
-              </div>
-              <div className="trade-log-table">
-                <div className="trade-log-row trade-log-head">
-                  <span>Stock</span>
-                  <span>Entry</span>
-                  <span>Exit</span>
-                  <span>Qty</span>
-                  <span>P&L</span>
-                  <span>Reason</span>
-                </div>
-                {trades.map((trade) => (
-                  <div key={`${trade.symbol}-${trade.entry_date}-${trade.exit_date}-${trade.pnl}`} className="trade-log-row">
-                    <strong>{trade.symbol}<small>{trade.setup_family}</small></strong>
-                    <span>{trade.entry_date}<small>{currency(trade.entry_price)}</small></span>
-                    <span>{trade.exit_date}<small>{currency(trade.exit_price)}</small></span>
-                    <span>{trade.quantity}</span>
-                    <strong className={trade.pnl >= 0 ? 'tone-positive' : 'tone-danger'}>
-                      {currency(trade.pnl)}
-                      <small>{pct(trade.return_pct)}</small>
-                    </strong>
-                    <span>{trade.exit_reason}<small>{trade.hold_sessions} sessions | score {trade.score}</small></span>
-                  </div>
-                ))}
-              </div>
-            </Surface>
           </>
         )}
           </>
         )}
       </Surface>
     </div>
+  )
+}
+
+function StrategyEquityCurvePanel({
+  strategyId,
+  rows,
+}: {
+  strategyId: string
+  rows: BacktestEquityPoint[]
+}) {
+  if (rows.length === 0) {
+    return (
+      <Surface className="inner-surface backtest-panel equity-panel empty-panel">
+        <div className="empty-icon-shell">
+          <BarChart3 size={18} />
+        </div>
+        <h3>No equity curve yet</h3>
+        <p>Run the backtest again so the dashboard can build daily cumulative P&L points.</p>
+      </Surface>
+    )
+  }
+
+  const width = 760
+  const height = 260
+  const padX = 38
+  const padY = 24
+  const innerWidth = width - padX * 2
+  const innerHeight = height - padY * 2
+  const values = rows.map((row) => row.cumulative_return_pct)
+  const minValue = Math.min(0, ...values)
+  const maxValue = Math.max(0, ...values)
+  const span = Math.max(maxValue - minValue, 1)
+  const pointFor = (value: number, index: number) => {
+    const x = padX + (index / Math.max(rows.length - 1, 1)) * innerWidth
+    const y = padY + ((maxValue - value) / span) * innerHeight
+    return { x, y }
+  }
+  const points = rows.map((row, index) => pointFor(row.cumulative_return_pct, index))
+  const linePath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ')
+  const zeroY = pointFor(0, 0).y
+  const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${zeroY.toFixed(2)} L ${points[0].x.toFixed(2)} ${zeroY.toFixed(2)} Z`
+  const latest = rows[rows.length - 1]
+  const worstDrawdown = Math.min(...rows.map((row) => row.drawdown_rs))
+  const bestPoint = rows.reduce((best, row) => (row.cumulative_pnl > best.cumulative_pnl ? row : best), rows[0])
+  const returnBarWidth = Math.min(100, Math.max(6, (Math.abs(latest.cumulative_return_pct) / 200) * 100))
+  const drawdownBarWidth = Math.min(100, Math.max(6, (Math.abs(worstDrawdown) / Math.max(Math.abs(bestPoint.cumulative_pnl), 1)) * 100))
+
+  return (
+    <Surface className="inner-surface backtest-panel equity-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Equity Curve</span>
+          <h2>{strategyLabel(strategyId)} return percentage over time</h2>
+        </div>
+        <div className="mini-chip">
+          <Activity size={14} />
+          <span>{rows.length.toLocaleString('en-IN')} trading days</span>
+        </div>
+      </div>
+
+      <div className="equity-chart-shell">
+        <svg viewBox={`0 0 ${width} ${height}`} className="equity-chart" role="img" aria-label={`${strategyLabel(strategyId)} equity curve`}>
+          <defs>
+            <linearGradient id={`equity-fill-${strategyId}`} x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor="rgba(38,223,154,0.28)" />
+              <stop offset="100%" stopColor="rgba(38,223,154,0.02)" />
+            </linearGradient>
+          </defs>
+          {[0, 1, 2, 3].map((line) => {
+            const y = padY + (line / 3) * innerHeight
+            return <line key={line} x1={padX} x2={padX + innerWidth} y1={y} y2={y} className="chart-grid-line" />
+          })}
+          <line x1={padX} x2={padX + innerWidth} y1={zeroY} y2={zeroY} className="equity-zero-line" />
+          <path d={areaPath} className="equity-area" fill={`url(#equity-fill-${strategyId})`} />
+          <path d={linePath} className="equity-line" />
+        </svg>
+        <div className="equity-axis-labels">
+          <span>{rows[0].trade_date}</span>
+          <span>{latest.trade_date}</span>
+        </div>
+      </div>
+
+      <div className="equity-value-bars">
+        <div className="equity-value-row">
+          <div>
+            <span className="micro-label">Net return</span>
+            <strong className={latest.cumulative_return_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(latest.cumulative_return_pct)}</strong>
+          </div>
+          <div className="equity-value-track">
+            <span
+              className={latest.cumulative_return_pct >= 0 ? 'equity-value-fill equity-value-positive' : 'equity-value-fill equity-value-negative'}
+              style={{ width: `${returnBarWidth}%` }}
+            />
+          </div>
+        </div>
+        <div className="equity-value-row">
+          <div>
+            <span className="micro-label">Max drawdown</span>
+            <strong className="tone-danger">{currency(worstDrawdown)}</strong>
+          </div>
+          <div className="equity-value-track">
+            <span className="equity-value-fill equity-value-negative" style={{ width: `${drawdownBarWidth}%` }} />
+          </div>
+        </div>
+      </div>
+
+      <div className="chart-summary-grid">
+        <CandidateStat label="Final P&L" value={currency(latest.cumulative_pnl)} tone={latest.cumulative_pnl >= 0 ? 'positive' : 'danger'} />
+        <CandidateStat label="Return Over Time" value={pct(latest.cumulative_return_pct)} tone={latest.cumulative_return_pct >= 0 ? 'positive' : 'danger'} />
+        <CandidateStat label="Worst Drawdown" value={currency(worstDrawdown)} tone="danger" />
+        <CandidateStat label="Peak Date" value={`${bestPoint.trade_date} ${currency(bestPoint.cumulative_pnl)}`} tone="positive" />
+      </div>
+    </Surface>
+  )
+}
+
+function MonthlyReturnBars({
+  rows,
+  activeYear,
+}: {
+  rows: BacktestDashboardResponse['monthly_returns']
+  activeYear: number | null
+}) {
+  const rowsByMonth = new Map(rows.map((row) => [row.month, row]))
+  const maxAbsPnl = Math.max(1, ...rows.map((row) => Math.abs(row.pnl)))
+
+  return (
+    <div className="monthly-bar-chart">
+      <div className="monthly-bar-head">
+        <div>
+          <span className="eyebrow">Monthly Graph</span>
+          <h3>{activeYear ?? 'Selected year'} P&L bars</h3>
+        </div>
+        <span className="mini-chip">{rows.filter((row) => row.pnl > 0).length} green months</span>
+      </div>
+      <div className="monthly-bar-area" role="img" aria-label={`${activeYear ?? 'Selected year'} monthly P&L bar chart`}>
+        {MONTH_LABELS.map((label, index) => {
+          const month = rowsByMonth.get(index + 1)
+          const pnl = month?.pnl ?? 0
+          const height = month ? Math.max(8, (Math.abs(pnl) / maxAbsPnl) * 100) : 0
+          const tone = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'flat'
+          return (
+            <div key={`monthly-bar-${activeYear}-${label}`} className="monthly-bar-column">
+              <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{month ? compactCurrency(pnl) : '-'}</strong>
+              <div className="monthly-bar-track">
+                <span className={`monthly-bar-fill monthly-bar-${tone}`} style={{ height: `${height}%` }} />
+              </div>
+              <small>{label}</small>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function StrategySuccessMetricsPanel({
+  summary,
+  diagnostic,
+  dayQuality,
+}: {
+  summary: BacktestRunSummary
+  diagnostic?: BacktestStrategyDiagnostic
+  dayQuality?: BacktestDayQuality
+}) {
+  const recoveryFactor = diagnostic && diagnostic.max_drawdown_rs < 0
+    ? summary.total_pnl / Math.abs(diagnostic.max_drawdown_rs)
+    : null
+  const stopShare = summary.total_trades > 0 ? (summary.sl_exits / summary.total_trades) * 100 : 0
+  const timeExitShare = summary.total_trades > 0 ? (summary.time_exits / summary.total_trades) * 100 : 0
+  const checks = [
+    {
+      label: 'Profit factor',
+      value: diagnostic ? diagnostic.profit_factor.toFixed(2) : 'N/A',
+      note: 'Above 1.30 is healthier; below 1.10 is thin edge.',
+      tone: (diagnostic?.profit_factor ?? 0) >= 1.3 ? 'positive' : (diagnostic?.profit_factor ?? 0) >= 1.1 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Expectancy',
+      value: diagnostic ? pct(diagnostic.expectancy_pct) : pct(summary.avg_return_pct),
+      note: 'Average trade should stay positive after fees and slippage.',
+      tone: (diagnostic?.expectancy_pct ?? summary.avg_return_pct) > 0 ? 'positive' : 'danger',
+    },
+    {
+      label: 'Recovery factor',
+      value: recoveryFactor === null ? 'N/A' : recoveryFactor.toFixed(2),
+      note: 'Total profit divided by max drawdown; higher means smoother compounding.',
+      tone: (recoveryFactor ?? 0) >= 2 ? 'positive' : (recoveryFactor ?? 0) >= 1 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Consistency',
+      value: diagnostic ? `${diagnostic.positive_months_pct.toFixed(1)}% months` : 'N/A',
+      note: 'Positive months plus positive days tell you if returns are not one lucky burst.',
+      tone: (diagnostic?.positive_months_pct ?? 0) >= 55 && (dayQuality?.positive_days_pct ?? 0) >= 50 ? 'positive' : 'warning',
+    },
+    {
+      label: 'Sample size',
+      value: summary.total_trades.toLocaleString('en-IN'),
+      note: 'More trades across many months beats a tiny perfect-looking backtest.',
+      tone: summary.total_trades >= 200 ? 'positive' : summary.total_trades >= 60 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Exit mix',
+      value: `${stopShare.toFixed(0)}% SL / ${timeExitShare.toFixed(0)}% time`,
+      note: 'Too many stop or time exits usually means entry quality needs tightening.',
+      tone: stopShare <= 35 && timeExitShare <= 45 ? 'positive' : 'warning',
+    },
+  ] as const
+
+  return (
+    <Surface className="inner-surface backtest-panel success-metrics-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Strategy Success</span>
+          <h2>Metrics to judge before going live</h2>
+        </div>
+      </div>
+      <div className="metric-check-grid">
+        {checks.map((check) => (
+          <div key={check.label} className={`metric-check-card tone-${check.tone}`}>
+            <span className="micro-label">{check.label}</span>
+            <strong>{check.value}</strong>
+            <p>{check.note}</p>
+          </div>
+        ))}
+      </div>
+    </Surface>
   )
 }
 
@@ -3622,115 +4120,6 @@ function DatewiseMoverList({
   )
 }
 
-function BacktestSymbolList({
-  title,
-  rows,
-  positive = false,
-}: {
-  title: string
-  rows: BacktestDashboardResponse['winners']
-  positive?: boolean
-}) {
-  return (
-    <Surface className="inner-surface backtest-panel">
-      <div className="compact-section-head">
-        <div>
-          <span className="eyebrow">{positive ? 'Leaders' : 'Avoid List'}</span>
-          <h2>{title}</h2>
-        </div>
-      </div>
-      <div className="symbol-result-list">
-        {rows.map((row) => (
-          <div key={`${row.strategy_id}-${row.symbol}`} className="symbol-result-row">
-            <strong>{row.symbol}</strong>
-            <span>{row.trades} trades</span>
-            <span>{row.win_rate.toFixed(2)}% win</span>
-            <strong className={row.pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(row.pnl)}</strong>
-            <span className={row.avg_return_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.avg_return_pct)}</span>
-          </div>
-        ))}
-        {rows.length === 0 && (
-          <div className="symbol-result-row symbol-result-empty">
-            <span>Need at least 5 trades on a stock for this strategy before calling it an edge.</span>
-          </div>
-        )}
-      </div>
-    </Surface>
-  )
-}
-
-function StrategyAnalysisPanel({
-  strategyId,
-  summary,
-  diagnostic,
-  dayQuality,
-}: {
-  strategyId: string
-  summary: BacktestRunSummary
-  diagnostic?: BacktestStrategyDiagnostic
-  dayQuality?: BacktestDayQuality
-}) {
-  const note = STRATEGY_ANALYSIS_NOTES[strategyId]
-  if (!note) return null
-
-  const rsiExitShare = summary.total_trades > 0 ? ((summary.rsi_exits ?? 0) / summary.total_trades) * 100 : 0
-  const stopShare = summary.total_trades > 0 ? (summary.sl_exits / summary.total_trades) * 100 : 0
-  const verdict = (diagnostic?.profit_factor ?? 0) >= 1.4 && summary.win_rate >= 60
-    ? 'Historically constructive'
-    : (diagnostic?.profit_factor ?? 0) > 1
-      ? 'Positive but needs forward evidence'
-      : 'Review only'
-
-  return (
-    <Surface className="inner-surface strategy-analysis-panel">
-      <div className="compact-section-head">
-        <div>
-          <span className="eyebrow">Strategy Breakdown</span>
-          <h2>{note.title}</h2>
-        </div>
-        <div className="mini-chip">
-          <ShieldCheck size={14} />
-          <span>{verdict}</span>
-        </div>
-      </div>
-      <div className="strategy-analysis-grid">
-        <div className="strategy-rule-card">
-          <span className="micro-label">How it works</span>
-          <p>{note.idea}</p>
-          <div className="strategy-rule-steps">
-            <div>
-              <strong>Entry</strong>
-              <span>{note.entry}</span>
-            </div>
-            <div>
-              <strong>Exit</strong>
-              <span>{note.exit}</span>
-            </div>
-            <div>
-              <strong>Read</strong>
-              <span>{note.interpretation}</span>
-            </div>
-          </div>
-        </div>
-        <div className="strategy-rule-card">
-          <span className="micro-label">Latest run analysis</span>
-          <div className="strategy-analysis-metrics">
-            <CandidateStat label="Trades" value={summary.total_trades.toLocaleString('en-IN')} />
-            <CandidateStat label="P&L" value={currency(summary.total_pnl)} tone={summary.total_pnl >= 0 ? 'positive' : 'danger'} />
-            <CandidateStat label="Win Rate" value={`${summary.win_rate.toFixed(2)}%`} tone={summary.win_rate >= 55 ? 'positive' : 'warning'} />
-            <CandidateStat label="Profit Factor" value={diagnostic ? diagnostic.profit_factor.toFixed(2) : 'N/A'} tone={(diagnostic?.profit_factor ?? 0) >= 1.2 ? 'positive' : 'warning'} />
-            <CandidateStat label="RSI Exit Share" value={`${rsiExitShare.toFixed(1)}%`} tone={rsiExitShare >= 50 ? 'positive' : 'warning'} />
-            <CandidateStat label="Stop Share" value={`${stopShare.toFixed(1)}%`} tone={stopShare <= 20 ? 'positive' : 'warning'} />
-            <CandidateStat label="Positive Days" value={dayQuality ? `${dayQuality.positive_days_pct.toFixed(2)}%` : 'N/A'} tone={(dayQuality?.positive_days_pct ?? 0) >= 55 ? 'positive' : 'warning'} />
-            <CandidateStat label="Avg Hold" value={`${summary.avg_hold_sessions.toFixed(1)} sessions`} />
-          </div>
-          <p className="strategy-analysis-note">{note.caveat}</p>
-        </div>
-      </div>
-    </Surface>
-  )
-}
-
 function SettingsView({
   broker,
   accounts,
@@ -3886,10 +4275,12 @@ export default function App() {
   const [backtests, setBacktests] = useState<BacktestDashboardResponse | null>(null)
   const [backtestCache, setBacktestCache] = useState<BacktestCacheStatus | null>(null)
   const [pythonBacktestLab, setPythonBacktestLab] = useState<PythonBacktestLabResponse | null>(null)
+  const [liveSnapshot, setLiveSnapshot] = useState<LiveStrategySnapshot | null>(null)
+  const [liveSocketState, setLiveSocketState] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting')
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(initialRoute.symbol)
   const [detailCandidate, setDetailCandidate] = useState<SwingCandidate | null>(null)
   const [history, setHistory] = useState<SymbolHistoryResponse | null>(null)
-  const [historyRange, setHistoryRange] = useState<HistoryRange>('1y')
+  const [historyRange, setHistoryRange] = useState<HistoryRange>('1d')
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [loadingHome, setLoadingHome] = useState(false)
@@ -3903,6 +4294,15 @@ export default function App() {
   const [refreshingFeatureCache, setRefreshingFeatureCache] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  const [liveAlertsEnabled, setLiveAlertsEnabled] = useState(() => {
+    try {
+      return localStorage.getItem(LIVE_ALERTS_STORAGE_KEY) === 'true'
+    } catch {
+      return false
+    }
+  })
+  const notifiedLiveTriggers = useRef(new Set<string>())
+  const liveTriggerState = useRef(new Map<string, { lastPrice: number; triggerPrice: number | null }>())
   const autoClosingSymbols = useRef(new Set<string>())
   const autoLoadedHome = useRef(false)
   const autoLoadedScanner = useRef(false)
@@ -3928,6 +4328,87 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist))
   }, [watchlist])
+
+  useEffect(() => {
+    localStorage.setItem(LIVE_ALERTS_STORAGE_KEY, liveAlertsEnabled ? 'true' : 'false')
+  }, [liveAlertsEnabled])
+
+  useEffect(() => {
+    if (!liveSnapshot) return
+
+    const nextKeys = new Set<string>()
+    liveSnapshot.rows
+      .filter((row) => row.source === 'dhan-live')
+      .forEach((row) => {
+        const key = `${row.strategy_id}:${row.symbol}`
+        const trigger = row.trigger_price && row.trigger_price > 0 ? row.trigger_price : null
+        const previous = liveTriggerState.current.get(key)
+        const crossedTrigger = !!previous && !!trigger && previous.lastPrice < trigger && row.last_price >= trigger
+        nextKeys.add(key)
+
+        if (
+          liveAlertsEnabled
+          && crossedTrigger
+          && trigger !== null
+          && row.signal_status === 'ENTRY_NOW'
+          && 'Notification' in window
+          && Notification.permission === 'granted'
+        ) {
+          const notificationKey = `${key}:${trigger}`
+          if (!notifiedLiveTriggers.current.has(notificationKey)) {
+            notifiedLiveTriggers.current.add(notificationKey)
+            const source = row.trigger_source ? ` (${row.trigger_source})` : ''
+            new Notification(`${row.symbol} live trigger hit`, {
+              body: `${row.strategy_label}: crossed ${currency(trigger)}${source}. Stop ${currency(row.stop_loss)}, target ${currency(row.target_price)}.`,
+              tag: notificationKey,
+            })
+          }
+        }
+
+        liveTriggerState.current.set(key, { lastPrice: row.last_price, triggerPrice: trigger })
+      })
+
+    Array.from(liveTriggerState.current.keys()).forEach((key) => {
+      if (!nextKeys.has(key)) liveTriggerState.current.delete(key)
+    })
+  }, [liveAlertsEnabled, liveSnapshot])
+
+  useEffect(() => {
+    let reconnectTimer: number | null = null
+    let stopped = false
+    let socket: WebSocket | null = null
+
+    const connect = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+      socket = new WebSocket(`${protocol}://${window.location.host}/ws/live-strategies`)
+      setLiveSocketState('connecting')
+      socket.onopen = () => setLiveSocketState('open')
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as LiveStrategySnapshot
+          if (payload.event === 'live-strategy-snapshot') {
+            setLiveSnapshot(payload)
+            setSelectedSymbol((current) => current ?? payload.rows[0]?.symbol ?? null)
+          }
+        } catch {
+          // Ignore malformed feed messages; the next server snapshot will replace it.
+        }
+      }
+      socket.onerror = () => setLiveSocketState('error')
+      socket.onclose = () => {
+        if (stopped) return
+        setLiveSocketState((current) => current === 'error' ? 'error' : 'closed')
+        reconnectTimer = window.setTimeout(connect, 5000)
+      }
+    }
+
+    connect()
+    return () => {
+      stopped = true
+      if (reconnectTimer) window.clearTimeout(reconnectTimer)
+      socket?.close()
+    }
+  }, [])
 
   const loadHomeDashboard = async () => {
     setLoadingHome(true)
@@ -4017,6 +4498,26 @@ export default function App() {
       setError(errorMessage(err))
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  const enableLiveTriggerAlerts = async () => {
+    if (!('Notification' in window)) {
+      setError('This browser does not support desktop notifications.')
+      return
+    }
+    if (Notification.permission === 'granted') {
+      setLiveAlertsEnabled(true)
+      return
+    }
+    if (Notification.permission === 'denied') {
+      setError('Browser notifications are blocked. Enable them for localhost in Chrome site settings.')
+      return
+    }
+    const permission = await Notification.requestPermission()
+    setLiveAlertsEnabled(permission === 'granted')
+    if (permission !== 'granted') {
+      setError('Live trigger alerts need notification permission.')
     }
   }
 
@@ -4121,7 +4622,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (view !== 'backtests' || backtests || loadingBacktestDashboard) return
+    if ((view !== 'backtests' && view !== 'scanner') || backtests || loadingBacktestDashboard) return
     void loadBacktestDashboard()
   }, [view, backtests, loadingBacktestDashboard])
 
@@ -4139,7 +4640,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (view !== 'backtests' || pythonBacktestLab || loadingPythonBacktestLab || runningPythonBacktestLab) return
+    if ((view !== 'backtests' && view !== 'scanner') || pythonBacktestLab || loadingPythonBacktestLab || runningPythonBacktestLab) return
     void loadPythonBacktestLab(true)
   }, [view, pythonBacktestLab, loadingPythonBacktestLab, runningPythonBacktestLab])
 
@@ -4280,12 +4781,20 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!scanner || paperTrades.length === 0) return
-    const candidatesBySymbol = new Map(scanner.candidates.map((candidate) => [candidate.symbol, candidate]))
+    if ((!scanner && !liveSnapshot) || paperTrades.length === 0) return
+    const liveCandidatesBySymbol = new Map(
+      (liveSnapshot?.rows ?? [])
+        .filter((row) => row.source === 'dhan-live')
+        .map((row) => {
+          const candidate = createCandidateFromLiveRow(row)
+          return [candidate.symbol, candidate] as const
+        }),
+    )
+    const candidatesBySymbol = new Map((scanner?.candidates ?? []).map((candidate) => [candidate.symbol, candidate]))
     paperTrades
       .filter((trade) => (isTradeStopped(trade) || isTradeTargetHit(trade) || isTradeExpired(trade)) && !autoClosingSymbols.current.has(trade.symbol))
       .forEach((trade) => {
-        const candidate = candidatesBySymbol.get(trade.symbol)
+        const candidate = liveCandidatesBySymbol.get(trade.symbol) ?? candidatesBySymbol.get(trade.symbol)
         const stopped = isTradeStopped(trade)
         const targetHit = isTradeTargetHit(trade)
         void closePaperPlan(
@@ -4294,20 +4803,22 @@ export default function App() {
           stopped ? 'stop-loss' : targetHit ? 'target-hit' : `auto-closed after ${trade.max_sessions} trading sessions`,
         )
       })
-  }, [scanner, paperTrades])
+  }, [liveSnapshot, scanner, paperTrades])
 
-  const broker = home?.broker ?? scanner?.broker ?? null
-  const updatedAt = home?.updated_at ?? scanner?.updated_at ?? null
+  const liveCandidates = useMemo(
+    () => (liveSnapshot?.rows ?? [])
+      .filter((row) => row.source === 'dhan-live')
+      .map(createCandidateFromLiveRow),
+    [liveSnapshot],
+  )
+  const selectedLiveCandidate = liveCandidates.find((candidate) => candidate.symbol === selectedSymbol) ?? null
+  const broker = liveSnapshot?.broker ?? home?.broker ?? scanner?.broker ?? null
+  const updatedAt = liveSnapshot?.updated_at ?? home?.updated_at ?? scanner?.updated_at ?? null
   const selectedHistoricalRow =
     historicalScreener?.rows.find((row) => row.symbol === selectedSymbol) ?? null
-  const selectedBambooSignal =
-    bambooLatest?.all_signals.find((signal) => signal.symbol === selectedSymbol) ??
-    bambooLatest?.top_signals.find((signal) => signal.symbol === selectedSymbol) ??
-    null
   const selectedActionCandidate =
-    detailCandidate ??
-    (selectedHistoricalRow ? createCandidateFromHistoricalRow(selectedHistoricalRow) : null) ??
-    (selectedBambooSignal ? createCandidateFromBambooSignal(selectedBambooSignal) : null) ??
+    selectedLiveCandidate ??
+    (detailCandidate?.source === 'dhan-live' ? detailCandidate : null) ??
     (paperTrades.find((trade) => trade.symbol === selectedSymbol)
       ? createCandidateFromPaperTrade(paperTrades.find((trade) => trade.symbol === selectedSymbol) as PaperTrade)
       : null)
@@ -4445,6 +4956,8 @@ export default function App() {
             {view === 'home' && (
               <HomeView
                 home={home}
+                liveSnapshot={liveSnapshot}
+                liveSocketState={liveSocketState}
                 loading={loadingHome}
                 loadError={error}
                 watchlistCount={watchlist.length}
@@ -4462,11 +4975,15 @@ export default function App() {
                 historicalScreener={historicalScreener}
                 freshSignals={freshSignals}
                 bambooLatest={bambooLatest}
+                liveSnapshot={liveSnapshot}
+                liveSocketState={liveSocketState}
+                liveAlertsEnabled={liveAlertsEnabled}
                 selectedSymbol={selectedSymbol}
                 onSelect={openStock}
                 onStageFresh={stageFreshNow}
                 onRefreshCache={refreshFeatureCacheNow}
                 onReload={loadScannerData}
+                onEnableLiveAlerts={enableLiveTriggerAlerts}
                 loading={loadingScanner}
                 loadError={error}
                 stagingFresh={stagingFresh}

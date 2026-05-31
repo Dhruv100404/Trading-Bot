@@ -5,10 +5,13 @@ use axum::{
     response::Response,
     Json,
 };
+use chrono::{Datelike, NaiveDate};
 use clickhouse::Row;
+use csv::StringRecord;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::ErrorKind,
     path::PathBuf,
@@ -120,6 +123,16 @@ pub struct BacktestMonthlyReturn {
 }
 
 #[derive(Row, Deserialize, Serialize, Clone)]
+pub struct BacktestEquityPoint {
+    strategy_id: String,
+    trade_date: String,
+    daily_pnl: f64,
+    cumulative_pnl: f64,
+    drawdown_rs: f64,
+    cumulative_return_pct: f64,
+}
+
+#[derive(Row, Deserialize, Serialize, Clone)]
 pub struct BacktestSymbolResult {
     strategy_id: String,
     symbol: String,
@@ -210,6 +223,7 @@ pub struct BacktestDashboardResponse {
     summaries: Vec<BacktestRunSummary>,
     yearly_returns: Vec<BacktestYearlyReturn>,
     monthly_returns: Vec<BacktestMonthlyReturn>,
+    equity_curve: Vec<BacktestEquityPoint>,
     diagnostics: Vec<BacktestStrategyDiagnostic>,
     winners: Vec<BacktestSymbolResult>,
     losers: Vec<BacktestSymbolResult>,
@@ -291,6 +305,36 @@ struct BacktestStrategySpec {
     max_positions_per_day: u16,
     capital_per_trade: f64,
     entry_condition_sql: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct FileStrategySource {
+    strategy_id: &'static str,
+    strategy_name: &'static str,
+    setup_family: &'static str,
+    method_family: &'static str,
+    relative_path: &'static str,
+}
+
+#[derive(Clone)]
+struct FileBacktestTrade {
+    strategy_id: String,
+    strategy_name: String,
+    setup_family: String,
+    method_family: String,
+    symbol: String,
+    signal_date: NaiveDate,
+    entry_date: NaiveDate,
+    exit_date: NaiveDate,
+    entry_price: f64,
+    exit_price: f64,
+    quantity: u32,
+    capital_used: f64,
+    pnl: f64,
+    return_pct: f64,
+    exit_reason: String,
+    hold_sessions: u16,
+    score: u8,
 }
 
 pub async fn dashboard(State(state): State<AppState>) -> Json<BacktestDashboardResponse> {
@@ -375,7 +419,7 @@ pub async fn python_latest() -> Result<Json<PythonBacktestLabResponse>, (StatusC
         ok: true,
         updated_at: now_ist().to_rfc3339(),
         duration_ms: None,
-        message: "Loaded latest Python/NumPy strategy lab results.".to_string(),
+        message: "Loaded current strategy lab results directly from CSV files.".to_string(),
         payload,
     }))
 }
@@ -495,10 +539,68 @@ fn run_python_optimizer() -> anyhow::Result<String> {
 }
 
 fn read_python_lab_payload() -> anyhow::Result<Value> {
-    let path = python_lab_output_dir().join("engine_payload.json");
-    let text = fs::read_to_string(&path)
-        .map_err(|err| anyhow::anyhow!("{} ({err})", path.display()))?;
-    Ok(serde_json::from_str(&text)?)
+    let out_dir = python_lab_output_dir();
+    let predictions_path = if out_dir.join("latest_signal_predictions.csv").exists() {
+        out_dir.join("latest_signal_predictions.csv")
+    } else {
+        out_dir.join("current_signal_predictions.csv")
+    };
+
+    Ok(json!({
+        "updated_at": now_ist().to_rfc3339(),
+        "output_dir": out_dir.display().to_string(),
+        "best": {
+            "ma": read_csv_records_as_values(&out_dir.join("ma_tuned_results.csv"), Some(1))?,
+            "panic": read_csv_records_as_values(&out_dir.join("panic_tuned_results.csv"), Some(1))?,
+        },
+        "period_returns": {
+            "ma_yearly": read_csv_records_as_values(&out_dir.join("ma_yearly_returns.csv"), None)?,
+            "panic_yearly": read_csv_records_as_values(&out_dir.join("panic_yearly_returns.csv"), None)?,
+            "ma_monthly": read_csv_records_as_values(&out_dir.join("ma_monthly_returns.csv"), None)?,
+            "panic_monthly": read_csv_records_as_values(&out_dir.join("panic_monthly_returns.csv"), None)?,
+        },
+        "predictions": read_csv_records_as_values(&predictions_path, None)?,
+    }))
+}
+
+fn read_csv_records_as_values(path: &PathBuf, limit: Option<usize>) -> anyhow::Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut reader = csv::Reader::from_path(path)?;
+    let headers = reader.headers()?.clone();
+    let mut out = Vec::new();
+    for record in reader.records() {
+        let record = record?;
+        out.push(csv_record_to_value(&headers, &record));
+        if limit.is_some_and(|max| out.len() >= max) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn csv_record_to_value(headers: &StringRecord, record: &StringRecord) -> Value {
+    let mut map = serde_json::Map::new();
+    for (idx, header) in headers.iter().enumerate() {
+        let value = record.get(idx).unwrap_or("").trim();
+        map.insert(header.to_string(), csv_scalar_to_value(value));
+    }
+    Value::Object(map)
+}
+
+fn csv_scalar_to_value(value: &str) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else if matches!(value, "True" | "true") {
+        Value::Bool(true)
+    } else if matches!(value, "False" | "false") {
+        Value::Bool(false)
+    } else if let Ok(parsed) = value.parse::<f64>() {
+        json!(parsed)
+    } else {
+        Value::String(value.to_string())
+    }
 }
 
 fn python_lab_output_dir() -> PathBuf {
@@ -513,15 +615,606 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+fn append_file_backtest_results(
+    summaries: &mut Vec<BacktestRunSummary>,
+    yearly_returns: &mut Vec<BacktestYearlyReturn>,
+    monthly_returns: &mut Vec<BacktestMonthlyReturn>,
+    equity_curve: &mut Vec<BacktestEquityPoint>,
+    diagnostics: &mut Vec<BacktestStrategyDiagnostic>,
+    winners: &mut Vec<BacktestSymbolResult>,
+    losers: &mut Vec<BacktestSymbolResult>,
+    day_quality: &mut Vec<BacktestDayQuality>,
+    trades: &mut Vec<BacktestTradeLogRow>,
+) -> anyhow::Result<()> {
+    let file_trades = load_file_backtest_trades()?;
+    if file_trades.is_empty() {
+        return Ok(());
+    }
+
+    let file_ids = file_trades
+        .iter()
+        .map(|trade| trade.strategy_id.clone())
+        .collect::<HashSet<_>>();
+
+    summaries.retain(|row| !file_ids.contains(&row.strategy_id));
+    yearly_returns.retain(|row| !file_ids.contains(&row.strategy_id));
+    monthly_returns.retain(|row| !file_ids.contains(&row.strategy_id));
+    equity_curve.retain(|row| !file_ids.contains(&row.strategy_id));
+    diagnostics.retain(|row| !file_ids.contains(&row.strategy_id));
+    winners.retain(|row| !file_ids.contains(&row.strategy_id));
+    losers.retain(|row| !file_ids.contains(&row.strategy_id));
+    day_quality.retain(|row| !file_ids.contains(&row.strategy_id));
+    trades.retain(|row| !file_ids.contains(&row.strategy_id));
+
+    summaries.extend(file_summaries(&file_trades));
+    summaries.sort_by(|a, b| b.total_pnl.partial_cmp(&a.total_pnl).unwrap_or(std::cmp::Ordering::Equal));
+
+    yearly_returns.extend(file_yearly_returns(&file_trades));
+    yearly_returns.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id).then(a.year.cmp(&b.year)));
+
+    monthly_returns.extend(file_monthly_returns(&file_trades));
+    monthly_returns.sort_by(|a, b| {
+        a.strategy_id
+            .cmp(&b.strategy_id)
+            .then(a.year.cmp(&b.year))
+            .then(a.month.cmp(&b.month))
+    });
+
+    equity_curve.extend(file_equity_curve(&file_trades));
+    equity_curve.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id).then(a.trade_date.cmp(&b.trade_date)));
+
+    diagnostics.extend(file_diagnostics(&file_trades));
+    diagnostics.sort_by(|a, b| {
+        strategy_status_rank_for_dashboard(&a.status)
+            .cmp(&strategy_status_rank_for_dashboard(&b.status))
+            .then_with(|| b.stability_score.partial_cmp(&a.stability_score).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.total_pnl.partial_cmp(&a.total_pnl).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    winners.extend(file_symbol_results(&file_trades, false));
+    winners.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id));
+    losers.extend(file_symbol_results(&file_trades, true));
+    losers.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id));
+
+    day_quality.extend(file_day_quality(&file_trades));
+    day_quality.sort_by(|a, b| b.max_drawdown_rs.partial_cmp(&a.max_drawdown_rs).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut file_log = file_trade_log(&file_trades);
+    trades.append(&mut file_log);
+    trades.sort_by(|a, b| {
+        b.entry_date
+            .cmp(&a.entry_date)
+            .then_with(|| b.pnl.abs().partial_cmp(&a.pnl.abs()).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    trades.truncate(160);
+
+    Ok(())
+}
+
+fn file_strategy_sources() -> Vec<FileStrategySource> {
+    vec![
+        FileStrategySource {
+            strategy_id: "tuned-ma-breakout-v1",
+            strategy_name: "MA Breakout Lab",
+            setup_family: "MA Breakout",
+            method_family: "MA Breakout",
+            relative_path: "docs/complex_strategy_tuning_lab/ma_best_trades.csv",
+        },
+        FileStrategySource {
+            strategy_id: "tuned-panic-reversal-v1",
+            strategy_name: "Panic Reversal Lab",
+            setup_family: "Panic Reversal",
+            method_family: "Panic Reversal",
+            relative_path: "docs/complex_strategy_tuning_lab/panic_best_trades.csv",
+        },
+        FileStrategySource {
+            strategy_id: "weekly-supertrend-10-3",
+            strategy_name: "Weekly Supertrend 10-3",
+            setup_family: "Weekly Supertrend",
+            method_family: "Weekly Supertrend",
+            relative_path: "docs/king_supertrend_lab/weekly_supertrend_trades.csv",
+        },
+        FileStrategySource {
+            strategy_id: "king-candle-supertrend-breakout-v1",
+            strategy_name: "King Candle Supertrend Breakout",
+            setup_family: "King Candle",
+            method_family: "King Candle",
+            relative_path: "docs/king_supertrend_lab/king_candle_trades.csv",
+        },
+        FileStrategySource {
+            strategy_id: "king-candle-quality-v1",
+            strategy_name: "King Candle Quality",
+            setup_family: "King Candle Quality",
+            method_family: "King Candle",
+            relative_path: "docs/king_supertrend_lab/king_candle_quality_trades.csv",
+        },
+    ]
+}
+
+fn load_file_backtest_trades() -> anyhow::Result<Vec<FileBacktestTrade>> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    for source in file_strategy_sources() {
+        let path = root.join(source.relative_path);
+        if !path.exists() {
+            tracing::warn!("file-backed strategy result missing: {}", path.display());
+            continue;
+        }
+        let mut reader = csv::Reader::from_path(&path)?;
+        let headers = reader.headers()?.clone();
+        for record in reader.records() {
+            let record = record?;
+            if let Some(trade) = parse_file_backtest_trade(source, &headers, &record) {
+                out.push(trade);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_file_backtest_trade(
+    source: FileStrategySource,
+    headers: &StringRecord,
+    record: &StringRecord,
+) -> Option<FileBacktestTrade> {
+    let symbol = csv_field(headers, record, "symbol")?.to_string();
+    let signal_date = parse_csv_date(csv_field(headers, record, "signal_date").or_else(|| csv_field(headers, record, "signal_week"))?)?;
+    let entry_date = parse_csv_date(csv_field(headers, record, "entry_date")?)?;
+    let exit_date = parse_csv_date(csv_field(headers, record, "exit_date")?)?;
+    let entry_price = parse_csv_f64(csv_field(headers, record, "entry")?)?;
+    if entry_price <= 0.0 {
+        return None;
+    }
+    let net_return = parse_csv_f64(csv_field(headers, record, "net_return").or_else(|| csv_field(headers, record, "gross_return"))?)?;
+    let exit_price = csv_field(headers, record, "exit")
+        .and_then(parse_csv_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(entry_price * (1.0 + net_return));
+    let quantity = (BACKTEST_CAPITAL_PER_TRADE / entry_price).floor().max(1.0) as u32;
+    let capital_used = f64::from(quantity) * entry_price;
+    let pnl = capital_used * net_return;
+    let raw_reason = csv_field(headers, record, "exit_reason").unwrap_or("TIME");
+    let hit_target = csv_field(headers, record, "hit_target1")
+        .map(parse_csv_bool)
+        .unwrap_or(false)
+        || csv_field(headers, record, "hit_target2")
+            .map(parse_csv_bool)
+            .unwrap_or(false);
+    let hold_sessions = csv_field(headers, record, "hold_days")
+        .or_else(|| csv_field(headers, record, "hold_weeks"))
+        .and_then(parse_csv_f64)
+        .map(|value| value.round().clamp(1.0, f64::from(u16::MAX)) as u16)
+        .unwrap_or(1);
+    let score = csv_field(headers, record, "rank_score")
+        .and_then(parse_csv_f64)
+        .map(|value| (value * 5.0).round().clamp(1.0, 100.0) as u8)
+        .unwrap_or(50);
+
+    Some(FileBacktestTrade {
+        strategy_id: source.strategy_id.to_string(),
+        strategy_name: source.strategy_name.to_string(),
+        setup_family: source.setup_family.to_string(),
+        method_family: source.method_family.to_string(),
+        symbol,
+        signal_date,
+        entry_date,
+        exit_date,
+        entry_price: round2(entry_price),
+        exit_price: round2(exit_price),
+        quantity,
+        capital_used,
+        pnl,
+        return_pct: net_return * 100.0,
+        exit_reason: normalize_file_exit_reason(raw_reason, hit_target),
+        hold_sessions,
+        score,
+    })
+}
+
+fn csv_field<'a>(headers: &StringRecord, record: &'a StringRecord, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .position(|header| header == name)
+        .and_then(|idx| record.get(idx))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_csv_date(value: &str) -> Option<NaiveDate> {
+    let date = value.get(0..10).unwrap_or(value);
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+fn parse_csv_f64(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn parse_csv_bool(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y")
+}
+
+fn normalize_file_exit_reason(raw: &str, hit_target: bool) -> String {
+    let reason = raw.to_ascii_lowercase();
+    if hit_target || reason.contains("target") || reason.contains("tp") {
+        "TP".to_string()
+    } else if reason.contains("stop") || reason.contains("sl") {
+        "SL".to_string()
+    } else if reason.contains("rsi") {
+        "RSI40".to_string()
+    } else {
+        "TIME".to_string()
+    }
+}
+
+fn file_summaries(trades: &[FileBacktestTrade]) -> Vec<BacktestRunSummary> {
+    grouped_file_trades(trades)
+        .into_values()
+        .map(|rows| {
+            let first = rows[0];
+            let total_trades = rows.len() as u32;
+            let total_pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
+            let total_capital: f64 = rows.iter().map(|trade| trade.capital_used).sum();
+            BacktestRunSummary {
+                strategy_id: first.strategy_id.clone(),
+                strategy_name: first.strategy_name.clone(),
+                total_trades,
+                win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
+                avg_return_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
+                total_pnl: round2(total_pnl),
+                deployed_return_pct: round3(100.0 * total_pnl / total_capital.max(1.0)),
+                avg_hold_sessions: round2(rows.iter().map(|trade| f64::from(trade.hold_sessions)).sum::<f64>() / rows.len() as f64),
+                tp_exits: rows.iter().filter(|trade| trade.exit_reason == "TP").count() as u64,
+                sl_exits: rows.iter().filter(|trade| trade.exit_reason == "SL").count() as u64,
+                time_exits: rows.iter().filter(|trade| trade.exit_reason == "TIME").count() as u64,
+                rsi_exits: rows.iter().filter(|trade| trade.exit_reason == "RSI40").count() as u64,
+                from_date: rows.iter().map(|trade| trade.entry_date).min().unwrap_or(first.entry_date).to_string(),
+                to_date: rows.iter().map(|trade| trade.exit_date).max().unwrap_or(first.exit_date).to_string(),
+            }
+        })
+        .collect()
+}
+
+fn file_yearly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestYearlyReturn> {
+    let mut grouped: BTreeMap<(String, u16), Vec<&FileBacktestTrade>> = BTreeMap::new();
+    for trade in trades {
+        grouped
+            .entry((trade.strategy_id.clone(), trade.entry_date.year() as u16))
+            .or_default()
+            .push(trade);
+    }
+    grouped
+        .into_iter()
+        .map(|((strategy_id, year), rows)| {
+            let pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
+            let capital: f64 = rows.iter().map(|trade| trade.capital_used).sum();
+            BacktestYearlyReturn {
+                strategy_id,
+                year,
+                trades: rows.len() as u32,
+                win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
+                avg_return_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
+                pnl: round2(pnl),
+                return_pct: round3(100.0 * pnl / capital.max(1.0)),
+            }
+        })
+        .collect()
+}
+
+fn file_monthly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestMonthlyReturn> {
+    let mut grouped: BTreeMap<(String, u16, u8), Vec<&FileBacktestTrade>> = BTreeMap::new();
+    for trade in trades {
+        grouped
+            .entry((trade.strategy_id.clone(), trade.entry_date.year() as u16, trade.entry_date.month() as u8))
+            .or_default()
+            .push(trade);
+    }
+    grouped
+        .into_iter()
+        .map(|((strategy_id, year, month), rows)| {
+            let pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
+            let capital: f64 = rows.iter().map(|trade| trade.capital_used).sum();
+            let date = NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), 1)
+                .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            BacktestMonthlyReturn {
+                strategy_id,
+                year,
+                month,
+                month_label: date.format("%b").to_string(),
+                trades: rows.len() as u32,
+                win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
+                pnl: round2(pnl),
+                return_pct: round3(100.0 * pnl / capital.max(1.0)),
+            }
+        })
+        .collect()
+}
+
+fn file_equity_curve(trades: &[FileBacktestTrade]) -> Vec<BacktestEquityPoint> {
+    let mut daily: BTreeMap<(String, NaiveDate), f64> = BTreeMap::new();
+    for trade in trades {
+        *daily.entry((trade.strategy_id.clone(), trade.entry_date)).or_default() += trade.pnl;
+    }
+
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
+    let mut out = Vec::new();
+    let mut current_strategy = String::new();
+    let mut cumulative = 0.0;
+    let mut peak = 0.0;
+
+    for ((strategy_id, trade_date), daily_pnl) in daily {
+        if strategy_id != current_strategy {
+            current_strategy = strategy_id.clone();
+            cumulative = 0.0;
+            peak = 0.0;
+        }
+        cumulative += daily_pnl;
+        if cumulative > peak {
+            peak = cumulative;
+        }
+        out.push(BacktestEquityPoint {
+            strategy_id,
+            trade_date: trade_date.to_string(),
+            daily_pnl: round2(daily_pnl),
+            cumulative_pnl: round2(cumulative),
+            drawdown_rs: round2(cumulative - peak),
+            cumulative_return_pct: round3(100.0 * cumulative / active_capital.max(1.0)),
+        });
+    }
+
+    out
+}
+
+fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnostic> {
+    let monthly = file_monthly_returns(trades);
+    let monthly_by_strategy = monthly.iter().fold(HashMap::<String, Vec<f64>>::new(), |mut map, row| {
+        map.entry(row.strategy_id.clone()).or_default().push(row.pnl);
+        map
+    });
+    let dd_by_strategy = file_day_quality(trades)
+        .into_iter()
+        .map(|row| (row.strategy_id.clone(), row.max_drawdown_rs))
+        .collect::<HashMap<_, _>>();
+
+    grouped_file_trades(trades)
+        .into_values()
+        .map(|rows| {
+            let first = rows[0];
+            let total_pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
+            let wins: Vec<f64> = rows.iter().filter(|trade| trade.pnl > 0.0).map(|trade| trade.pnl).collect();
+            let losses: Vec<f64> = rows.iter().filter(|trade| trade.pnl < 0.0).map(|trade| trade.pnl).collect();
+            let gross_profit: f64 = wins.iter().sum();
+            let gross_loss = losses.iter().sum::<f64>().abs();
+            let months = monthly_by_strategy.get(&first.strategy_id).cloned().unwrap_or_default();
+            let positive_months_pct = if months.is_empty() {
+                0.0
+            } else {
+                100.0 * months.iter().filter(|pnl| **pnl > 0.0).count() as f64 / months.len() as f64
+            };
+            let worst_month = months.iter().copied().reduce(f64::min).unwrap_or(0.0);
+            let best_month = months.iter().copied().reduce(f64::max).unwrap_or(0.0);
+            let max_drawdown_rs = *dd_by_strategy.get(&first.strategy_id).unwrap_or(&0.0);
+            let profit_factor = if gross_loss == 0.0 {
+                if gross_profit > 0.0 { 99.0 } else { 0.0 }
+            } else {
+                gross_profit / gross_loss
+            };
+            let win_rate = 100.0 * wins.len() as f64 / rows.len() as f64;
+            let raw_stability = (positive_months_pct * 0.42
+                + win_rate * 0.28
+                + profit_factor.min(2.25) * 8.0
+                + if total_pnl > 0.0 { 8.0 } else { -18.0 }
+                - (max_drawdown_rs.abs() / total_pnl.abs().max(1.0) * 12.0).min(22.0))
+                .clamp(0.0, 100.0);
+            let status = if total_pnl <= 0.0 {
+                "Rejected"
+            } else if raw_stability >= 56.0 && positive_months_pct >= 55.0 {
+                "Candidate"
+            } else if raw_stability >= 50.0 {
+                "Watch"
+            } else {
+                "Fragile"
+            };
+
+            BacktestStrategyDiagnostic {
+                strategy_id: first.strategy_id.clone(),
+                method_family: first.method_family.clone(),
+                total_trades: rows.len() as u32,
+                total_pnl: round2(total_pnl),
+                win_rate: round2(win_rate),
+                profit_factor: round2(profit_factor),
+                expectancy_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
+                positive_months_pct: round2(positive_months_pct),
+                median_monthly_pnl: round2(median(months)),
+                worst_month: round2(worst_month),
+                best_month: round2(best_month),
+                max_drawdown_rs: round2(max_drawdown_rs),
+                stability_score: round2(raw_stability),
+                status: status.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn file_symbol_results(trades: &[FileBacktestTrade], losers: bool) -> Vec<BacktestSymbolResult> {
+    let mut grouped: BTreeMap<(String, String), Vec<&FileBacktestTrade>> = BTreeMap::new();
+    for trade in trades {
+        grouped
+            .entry((trade.strategy_id.clone(), trade.symbol.clone()))
+            .or_default()
+            .push(trade);
+    }
+    let mut by_strategy: HashMap<String, Vec<BacktestSymbolResult>> = HashMap::new();
+    for ((strategy_id, symbol), rows) in grouped {
+        if rows.len() < 5 {
+            continue;
+        }
+        let pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
+        let row = BacktestSymbolResult {
+            strategy_id: strategy_id.clone(),
+            symbol,
+            trades: rows.len() as u32,
+            win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
+            pnl: round2(pnl),
+            avg_return_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
+        };
+        by_strategy.entry(strategy_id).or_default().push(row);
+    }
+
+    let mut out = Vec::new();
+    for rows in by_strategy.values_mut() {
+        if losers {
+            rows.sort_by(|a, b| {
+                a.pnl
+                    .partial_cmp(&b.pnl)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.win_rate.partial_cmp(&b.win_rate).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        } else {
+            rows.sort_by(|a, b| {
+                b.win_rate
+                    .partial_cmp(&a.win_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.avg_return_pct.partial_cmp(&a.avg_return_pct).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| b.pnl.partial_cmp(&a.pnl).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        }
+        out.extend(rows.iter().take(12).cloned());
+    }
+    out
+}
+
+fn file_day_quality(trades: &[FileBacktestTrade]) -> Vec<BacktestDayQuality> {
+    let mut daily: BTreeMap<(String, NaiveDate), f64> = BTreeMap::new();
+    for trade in trades {
+        *daily.entry((trade.strategy_id.clone(), trade.entry_date)).or_default() += trade.pnl;
+    }
+
+    let mut by_strategy: BTreeMap<String, Vec<(NaiveDate, f64)>> = BTreeMap::new();
+    for ((strategy_id, date), pnl) in daily {
+        by_strategy.entry(strategy_id).or_default().push((date, pnl));
+    }
+
+    by_strategy
+        .into_iter()
+        .map(|(strategy_id, mut rows)| {
+            rows.sort_by_key(|(date, _)| *date);
+            let mut cumulative = 0.0;
+            let mut peak = 0.0;
+            let mut max_drawdown = 0.0;
+            for (_, pnl) in &rows {
+                cumulative += pnl;
+                if cumulative > peak {
+                    peak = cumulative;
+                }
+                let dd = cumulative - peak;
+                if dd < max_drawdown {
+                    max_drawdown = dd;
+                }
+            }
+            BacktestDayQuality {
+                strategy_id,
+                trading_days: rows.len() as u64,
+                positive_days_pct: round2(100.0 * rows.iter().filter(|(_, pnl)| *pnl > 0.0).count() as f64 / rows.len() as f64),
+                worst_day: round2(rows.iter().map(|(_, pnl)| *pnl).reduce(f64::min).unwrap_or(0.0)),
+                best_day: round2(rows.iter().map(|(_, pnl)| *pnl).reduce(f64::max).unwrap_or(0.0)),
+                max_drawdown_rs: round2(max_drawdown),
+            }
+        })
+        .collect()
+}
+
+fn file_trade_log(trades: &[FileBacktestTrade]) -> Vec<BacktestTradeLogRow> {
+    let mut rows = trades
+        .iter()
+        .map(|trade| BacktestTradeLogRow {
+            strategy_id: trade.strategy_id.clone(),
+            symbol: trade.symbol.clone(),
+            signal_date: trade.signal_date.to_string(),
+            entry_date: trade.entry_date.to_string(),
+            exit_date: trade.exit_date.to_string(),
+            setup_family: trade.setup_family.clone(),
+            entry_price: trade.entry_price,
+            exit_price: trade.exit_price,
+            quantity: trade.quantity,
+            pnl: round2(trade.pnl),
+            return_pct: round3(trade.return_pct),
+            exit_reason: trade.exit_reason.clone(),
+            hold_sessions: trade.hold_sessions,
+            score: trade.score,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.entry_date
+            .cmp(&a.entry_date)
+            .then_with(|| b.pnl.abs().partial_cmp(&a.pnl.abs()).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    rows.truncate(80);
+    rows
+}
+
+fn grouped_file_trades(trades: &[FileBacktestTrade]) -> BTreeMap<String, Vec<&FileBacktestTrade>> {
+    let mut grouped: BTreeMap<String, Vec<&FileBacktestTrade>> = BTreeMap::new();
+    for trade in trades {
+        grouped.entry(trade.strategy_id.clone()).or_default().push(trade);
+    }
+    grouped
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn strategy_status_rank_for_dashboard(status: &str) -> u8 {
+    match status {
+        "Candidate" => 0,
+        "Watch" => 1,
+        "Fragile" => 2,
+        "Rejected" => 3,
+        _ => 4,
+    }
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
 async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardResponse {
-    let summaries = fetch_summaries(state, run_id).await.unwrap_or_default();
-    let yearly_returns = fetch_yearly_returns(state, run_id).await.unwrap_or_default();
-    let monthly_returns = fetch_monthly_returns(state, run_id).await.unwrap_or_default();
-    let diagnostics = fetch_strategy_diagnostics(state, run_id).await.unwrap_or_default();
-    let winners = fetch_symbol_results(state, run_id, false).await.unwrap_or_default();
-    let losers = fetch_symbol_results(state, run_id, true).await.unwrap_or_default();
-    let day_quality = fetch_day_quality(state, run_id).await.unwrap_or_default();
-    let trades = fetch_trade_log(state, run_id).await.unwrap_or_default();
+    let mut summaries = fetch_summaries(state, run_id).await.unwrap_or_default();
+    let mut yearly_returns = fetch_yearly_returns(state, run_id).await.unwrap_or_default();
+    let mut monthly_returns = fetch_monthly_returns(state, run_id).await.unwrap_or_default();
+    let mut equity_curve = fetch_equity_curve(state, run_id).await.unwrap_or_default();
+    let mut diagnostics = fetch_strategy_diagnostics(state, run_id).await.unwrap_or_default();
+    let mut winners = fetch_symbol_results(state, run_id, false).await.unwrap_or_default();
+    let mut losers = fetch_symbol_results(state, run_id, true).await.unwrap_or_default();
+    let mut day_quality = fetch_day_quality(state, run_id).await.unwrap_or_default();
+    let mut trades = fetch_trade_log(state, run_id).await.unwrap_or_default();
+
+    if let Err(err) = append_file_backtest_results(
+        &mut summaries,
+        &mut yearly_returns,
+        &mut monthly_returns,
+        &mut equity_curve,
+        &mut diagnostics,
+        &mut winners,
+        &mut losers,
+        &mut day_quality,
+        &mut trades,
+    ) {
+        tracing::warn!("file-backed backtest result load failed: {}", err);
+    }
 
     BacktestDashboardResponse {
         run_id: run_id.to_string(),
@@ -529,6 +1222,7 @@ async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardRes
         summaries,
         yearly_returns,
         monthly_returns,
+        equity_curve,
         diagnostics,
         winners,
         losers,
@@ -949,6 +1643,7 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
                     lagInFrame(day_high, 1, day_high) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS prev_high, \
                     lagInFrame(day_low, 1, day_low) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS prev_low, \
                     lagInFrame(sma20, 1, sma20) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS prev_sma20, \
+                    lagInFrame(day_close, 3, day_close) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS close_3d, \
                     lagInFrame(day_close, 20, day_close) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS close_20d, \
                     lagInFrame(day_close, 60, day_close) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS close_60d \
                 FROM features \
@@ -956,6 +1651,7 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
             scored_base AS ( \
                 SELECT *, \
                     min(day_low) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS prior_low20, \
+                    max(day_high) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS prior_high20, \
                     max(day_high) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 55 PRECEDING AND 1 PRECEDING) AS prior_high55, \
                     avg(greatest(day_high - day_low, abs(day_high - prev_close), abs(day_low - prev_close))) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14, \
                     avg((day_high - day_low) / nullIf(day_close, 0.01)) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_range_pct20, \
@@ -965,6 +1661,7 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
                     avg(if((day_high - prev_high) > (prev_low - day_low) AND (day_high - prev_high) > 0, day_high - prev_high, 0)) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS plus_dm14, \
                     avg(if((prev_low - day_low) > (day_high - prev_high) AND (prev_low - day_low) > 0, prev_low - day_low, 0)) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS minus_dm14, \
                     min((day_high - day_low) / nullIf(day_close, 0.01)) OVER (PARTITION BY symbol ORDER BY rn ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS min_range_pct7, \
+                    day_close / nullIf(close_3d, 0.01) - 1 AS ret3, \
                     day_close / nullIf(close_20d, 0.01) - 1 AS ret20, \
                     day_close / nullIf(close_60d, 0.01) - 1 AS ret60 \
                 FROM enriched \
@@ -975,6 +1672,8 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
                     (day_close - sma20) / nullIf(std20, 0) AS zscore20, \
                     (day_close - sma20) / nullIf(atr14, 0) AS dist_sma20_atr, \
                     (day_close - day_low) / nullIf(day_high - day_low, 0.01) AS close_location, \
+                    (day_high - day_low) / nullIf(atr14, 0) AS range_atr, \
+                    (day_close - day_low) / nullIf(day_low, 0.01) AS recovery_from_low_pct, \
                     100 * plus_dm14 / nullIf(atr14, 0) AS plus_di14, \
                     100 * minus_dm14 / nullIf(atr14, 0) AS minus_di14, \
                     atr14 / nullIf(day_close, 0.01) AS atr_pct \
@@ -987,9 +1686,15 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
                     day_close <= high_20d AND breakout_pct <= 1.0 AND volume_ratio >= 1.2 AS regime_breakout_core \
                 FROM scored_indicators \
             ), \
+            scored_cross AS ( \
+                SELECT *, \
+                    toFloat64(rank() OVER (PARTITION BY trade_date ORDER BY ret60)) / greatest(toFloat64(count() OVER (PARTITION BY trade_date)), 1.0) AS rs60_rank, \
+                    avg(if(day_close > sma200, 1.0, 0.0)) OVER (PARTITION BY trade_date) AS market_breadth200 \
+                FROM scored \
+            ), \
             signals AS ( \
                 SELECT s.symbol, s.trade_date AS signal_date, s.rn AS signal_rn, \
-                    s.day_open, s.day_high, s.day_low, s.day_close, s.day_volume, s.sma20, s.sma50, s.sma200, s.avg_volume20, s.high_20d, s.high_52w, s.low_52w, s.rsi10, s.rsi14, s.breakout_pct, s.distance_to_52w_high_pct, s.range_position_pct, s.volume_ratio, s.atr14, s.atr_pct, s.avg_range_pct20, s.min_range_pct7, s.ret20, s.ret60, s.zscore20, s.dist_sma20_atr, s.close_location, s.adx14, s.trend_regime, s.regime_breakout_core, s.prior_high55, s.trend_up, s.pullback_zone, s.rsi10_pullback, \
+                    s.day_open, s.day_high, s.day_low, s.day_close, s.day_volume, s.sma20, s.sma50, s.sma200, s.avg_volume20, s.high_20d, s.high_52w, s.low_52w, s.rsi10, s.rsi14, s.breakout_pct, s.distance_to_52w_high_pct, s.range_position_pct, s.volume_ratio, s.atr14, s.atr_pct, s.avg_range_pct20, s.min_range_pct7, s.ret3, s.ret20, s.ret60, s.zscore20, s.dist_sma20_atr, s.close_location, s.range_atr, s.recovery_from_low_pct, s.adx14, s.trend_regime, s.regime_breakout_core, s.prior_high20, s.prior_high55, s.rs60_rank, s.market_breadth200, s.trend_up, s.pullback_zone, s.rsi10_pullback, \
                     s.day_close > s.sma200 AND s.sma20 > s.sma50 AND (s.sma20 - s.day_close) > 2.2 * s.atr14 AND s.rsi10 < 35 AS atr_stretch_liquid_only, \
                     s.day_close > s.sma200 AND not(s.trend_regime) AND s.adx14 < 30 AND s.zscore20 < -2.5 AND s.rsi14 < 30 AND s.dist_sma20_atr < -1.5 AND s.close_location >= 0.35 AS regime_mean_reversion, \
                     s.trend_regime AND s.regime_breakout_core AND s.ret60 >= 0.10 AND s.close_location >= 0.85 AND s.volume_ratio >= 1.4 AS regime_trend_breakout, \
@@ -1004,9 +1709,11 @@ async fn execute_backtest_run(state: &AppState, run_id: &str) -> anyhow::Result<
                     s.trend_up AND s.breakout_pct <= 1.5 AND s.volume_ratio >= 1.1 AND ((s.day_high - s.day_low) / nullIf(s.day_close, 0.01)) <= s.avg_range_pct20 * 0.75 AS compression_breakout, \
                     s.day_close > s.sma50 AND s.sma50 > s.sma200 AND s.ret60 > 0.08 AND s.pullback_zone AND s.volume_ratio >= 0.7 AND s.volume_ratio <= 1.5 AND s.range_position_pct >= 55 AS strong_stock_pullback, \
                     s.day_low < s.prior_low20 AND s.day_close > s.prior_low20 AND s.day_close > s.sma20 AND s.prev_close <= s.prev_sma20 AND s.volume_ratio >= 0.9 AND ((s.day_close - s.day_low) / nullIf(s.day_high - s.day_low, 0.01)) >= 0.70 AS trend_reversal_breakout, \
-                    multiIf(regime_mean_reversion, 'Regime Mean Reversion', regime_trend_breakout, 'Regime Trend Breakout', regime_breakout_volume, 'Regime Breakout Volume', regime_multifactor_score >= 9 AND regime_breakout_core, 'Regime Multi-Factor Score', rsi10_pullback, 'RSI10 Pullback Reversion', atr_stretch_liquid_only, 'ATR Stretch Liquid Only', trend_reversal_breakout, 'Trend Reversal Breakout', compression_breakout, 'Compression Breakout', strong_stock_pullback, 'Strong Stock Pullback', trend_up AND breakout_pct <= 1.5 AND volume_ratio >= 1.1, 'Breakout Setup', trend_up AND pullback_zone, 'Pullback To 20 DMA', day_close > sma50 AND distance_to_52w_high_pct <= 8.0, 'Near 52W High', 'Trend Filter') AS setup_family, \
+                    s.trend_up AND s.market_breadth200 >= 0.38 AND s.rs60_rank >= 0.58 AND s.volume_ratio >= 1.3 AND s.close_location >= 0.58 AND s.atr14 > 0 AND s.day_high >= s.prior_high20 * 1.001 AND s.day_close >= s.prior_high20 * 1.001 * 0.985 AS tuned_ma_breakout, \
+                    s.ret3 <= -0.08 AND s.range_atr >= 1.35 AND s.close_location >= 0.64 AND s.recovery_from_low_pct >= 0.012 AND s.atr14 > 0 AS tuned_panic_reversal, \
+                    multiIf(tuned_panic_reversal, 'Panic Reversal', tuned_ma_breakout, 'MA Breakout', regime_mean_reversion, 'Regime Mean Reversion', regime_trend_breakout, 'Regime Trend Breakout', regime_breakout_volume, 'Regime Breakout Volume', regime_multifactor_score >= 9 AND regime_breakout_core, 'Regime Multi-Factor Score', rsi10_pullback, 'RSI10 Pullback Reversion', atr_stretch_liquid_only, 'ATR Stretch Liquid Only', trend_reversal_breakout, 'Trend Reversal Breakout', compression_breakout, 'Compression Breakout', strong_stock_pullback, 'Strong Stock Pullback', trend_up AND breakout_pct <= 1.5 AND volume_ratio >= 1.1, 'Breakout Setup', trend_up AND pullback_zone, 'Pullback To 20 DMA', day_close > sma50 AND distance_to_52w_high_pct <= 8.0, 'Near 52W High', 'Trend Filter') AS setup_family, \
                     toUInt8(greatest(50, least(96, 50 + if(trend_up, 18, 0) + if(breakout_pct <= 1.5, 14, if(breakout_pct <= 4.0, 8, 0)) + if(distance_to_52w_high_pct <= 8.0, 10, 0) + if(volume_ratio >= 1.2, 10, if(volume_ratio >= 1.0, 5, 0)) + if(pullback_zone, 8, 0) + if(rsi10_pullback, 16, 0) + if(atr_stretch_liquid_only, 24, 0) + if(regime_mean_reversion, 28, 0) + if(regime_trend_breakout, 18, 0) + if(regime_breakout_volume, 18, 0) + if(regime_multifactor_score >= 9, 16, 0) + if(compression_breakout, 18, 0) + if(strong_stock_pullback, 16, 0) + if(trend_reversal_breakout, 24, 0) + if(range_position_pct >= 70.0, 6, 0)))) AS score \
-                FROM scored s \
+                FROM scored_cross s \
             ), \
             entries_raw AS ({entries_cte}), \
             strategy_ranked_entries AS ( \
@@ -1160,6 +1867,45 @@ async fn fetch_monthly_returns(state: &AppState, run_id: &str) -> anyhow::Result
         run_id
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestMonthlyReturn>().await?)
+}
+
+async fn fetch_equity_curve(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestEquityPoint>> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
+    let query = format!(
+        "WITH daily AS ( \
+            SELECT strategy_id, entry_date AS d, round(sum(pnl), 2) AS daily_pnl \
+            FROM trading.backtest_trades \
+            WHERE run_id = '{}' \
+            GROUP BY strategy_id, d \
+        ), equity AS ( \
+            SELECT \
+                strategy_id, \
+                d, \
+                daily_pnl, \
+                sum(daily_pnl) OVER (PARTITION BY strategy_id ORDER BY d) AS cumulative_pnl \
+            FROM daily \
+        ), dd AS ( \
+            SELECT \
+                strategy_id, \
+                d, \
+                daily_pnl, \
+                cumulative_pnl, \
+                max(cumulative_pnl) OVER (PARTITION BY strategy_id ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS peak \
+            FROM equity \
+        ) \
+        SELECT \
+            strategy_id, \
+            toString(d) AS trade_date, \
+            round(daily_pnl, 2) AS daily_pnl, \
+            round(cumulative_pnl, 2) AS cumulative_pnl, \
+            round(cumulative_pnl - peak, 2) AS drawdown_rs, \
+            round(100 * cumulative_pnl / greatest({}, 1), 3) AS cumulative_return_pct \
+        FROM dd \
+        ORDER BY strategy_id, d",
+        escape_sql(run_id),
+        active_capital
+    );
+    Ok(state.ch.query(&query).fetch_all::<BacktestEquityPoint>().await?)
 }
 
 async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestStrategyDiagnostic>> {

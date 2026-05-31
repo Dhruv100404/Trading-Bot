@@ -2,20 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use clickhouse::Row;
+use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::RwLockReadGuard;
+use tokio::time::{self, Duration, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message as DhanWsMessage};
 
-use crate::api::{paper, AppState};
+use crate::api::{paper, AppState, LiveTriggerAlertMarker};
 use crate::dhan::client::DhanClient;
-use crate::dhan::market_data::{fetch_quotes, QuoteItem};
+use crate::dhan::market_data::{fetch_intraday_candles, fetch_quotes, IntradayResponse, QuoteItem};
 use crate::types::{compute_bucket, is_nse_holiday, now_ist, prev_trading_day};
 
 #[derive(Row, Deserialize, Clone)]
@@ -84,6 +88,7 @@ pub struct LiveSignal {
     score: u8,
     as_of: String,
     trigger_price: Option<f32>,
+    trigger_source: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -186,6 +191,7 @@ pub struct SymbolHistoryResponse {
     updated_at: String,
     symbol: String,
     range: String,
+    source: String,
     candles: Vec<HistoricalCandle>,
     summary: Option<HistoricalSummary>,
     message: Option<String>,
@@ -324,6 +330,7 @@ struct HistoricalScreenerFeatureRow {
     symbol: Option<String>,
     trade_date: Option<String>,
     day_open: Option<f64>,
+    prev_close: Option<f64>,
     day_close: Option<f64>,
     day_high: Option<f64>,
     day_low: Option<f64>,
@@ -344,7 +351,11 @@ struct HistoricalScreenerFeatureRow {
     prior_high20: Option<f64>,
     prior_high55: Option<f64>,
     prior_high252: Option<f64>,
+    prior_close3: Option<f64>,
     prior_low20: Option<f64>,
+    ret3: Option<f64>,
+    range_atr: Option<f64>,
+    recovery_from_low_pct: Option<f64>,
     rs60_rank: Option<f64>,
     rs120_rank: Option<f64>,
     market_breadth200: Option<f64>,
@@ -385,7 +396,11 @@ CREATE TABLE IF NOT EXISTS trading.daily_screener_features (
     prior_high20   Float64,
     prior_high55   Float64,
     prior_high252  Float64,
+    prior_close3   Float64,
     prior_low20    Float64,
+    ret3           Float64,
+    range_atr      Float64,
+    recovery_from_low_pct Float64,
     rs60_rank      Float64,
     rs120_rank     Float64,
     market_breadth200 Float64,
@@ -403,7 +418,11 @@ const SCREENER_FEATURE_CACHE_ALTERS: &[&str] = &[
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high20 Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high55 Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_high252 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_close3 Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS prior_low20 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS ret3 Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS range_atr Float64 DEFAULT 0",
+    "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS recovery_from_low_pct Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS rs60_rank Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS rs120_rank Float64 DEFAULT 0",
     "ALTER TABLE trading.daily_screener_features ADD COLUMN IF NOT EXISTS market_breadth200 Float64 DEFAULT 0",
@@ -478,6 +497,64 @@ pub struct FreshSignalsResponse {
     message: Option<String>,
 }
 
+#[derive(Serialize, Clone)]
+pub struct LiveStrategyRow {
+    security_id: String,
+    symbol: String,
+    company_name: String,
+    strategy_id: String,
+    strategy_label: String,
+    strategy_status: String,
+    setup_family: String,
+    signal_status: String,
+    signal_label: String,
+    reason: String,
+    score: u8,
+    last_price: f32,
+    day_change_pct: f32,
+    open_gap_pct: f32,
+    volume: u64,
+    trigger_price: Option<f32>,
+    trigger_source: Option<String>,
+    stop_loss: f32,
+    target_price: f32,
+    risk_reward: f32,
+    source: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct LiveStrategySnapshot {
+    event: String,
+    updated_at: String,
+    mode: String,
+    feed_status: String,
+    broker: BrokerStatus,
+    market_regime: MarketRegime,
+    total_watching: usize,
+    triggered: usize,
+    rows: Vec<LiveStrategyRow>,
+    message: Option<String>,
+}
+
+#[derive(Clone)]
+struct WeeklyLabCandidate {
+    symbol: String,
+    strategy_id: String,
+    strategy_label: String,
+    setup_family: String,
+    strategy_status: String,
+    signal_date: String,
+    trigger_price: f32,
+    close: f32,
+    supertrend: f32,
+    rank_score: f32,
+    relvol: f32,
+    rs13w_rank: f32,
+    body_ratio: f32,
+    range_atr: f32,
+}
+
 #[derive(Serialize)]
 pub struct FeatureCacheRefreshResponse {
     updated_at: String,
@@ -492,6 +569,7 @@ struct FeatureCacheStatsRow {
     #[serde(deserialize_with = "deserialize_clickhouse_u64")]
     cached_rows: u64,
     avg_atr14: f64,
+    avg_ret3_abs: f64,
 }
 
 #[derive(Deserialize)]
@@ -559,12 +637,644 @@ pub async fn broker_status(State(state): State<AppState>) -> Json<BrokerStatus> 
     Json(resolve_broker_status(&state).await)
 }
 
+pub async fn live_strategy_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| stream_live_strategies(socket, state))
+}
+
+async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
+    let mut broker = resolve_broker_status(&state).await;
+    let Some(credentials) = resolve_dhan_credentials(&state).await else {
+        let snapshot = empty_live_snapshot(
+            broker,
+            "missing-credentials",
+            "No Dhan credentials are configured, so live strategy streaming cannot start.",
+        );
+        let _ = send_live_snapshot(&mut socket, &snapshot).await;
+        return;
+    };
+
+    if broker.state != "ready" {
+        let msg = broker.message.clone();
+        let snapshot = empty_live_snapshot(broker, "broker-not-ready", &msg);
+        let _ = send_live_snapshot(&mut socket, &snapshot).await;
+        return;
+    }
+
+    let watch_rows = load_watch_rows(&state, 1000, None).await;
+    if watch_rows.is_empty() {
+        let snapshot = empty_live_snapshot(
+            broker,
+            "empty-universe",
+            "No enabled watchlist instruments were found for live strategy streaming.",
+        );
+        let _ = send_live_snapshot(&mut socket, &snapshot).await;
+        return;
+    }
+
+    let volume_map = load_volume_groups_map();
+    let weekly_lab_candidates = load_weekly_lab_candidates();
+    let symbols = watch_rows.iter().map(|row| row.symbol.clone()).collect::<Vec<_>>();
+    let baselines = load_live_signal_baselines(&state, &symbols).await.unwrap_or_default();
+    let strategy_statuses = load_latest_strategy_statuses(&state).await.unwrap_or_default();
+    let mut quote_map = initial_live_quotes(&state, &credentials, &watch_rows).await.unwrap_or_default();
+    let snapshot = build_live_strategy_snapshot(
+        broker.clone(),
+        "dhan-websocket",
+        "connecting",
+        &watch_rows,
+        &volume_map,
+        &quote_map,
+        &baselines,
+        &strategy_statuses,
+        &weekly_lab_candidates,
+        Some("Connecting to Dhan live market feed...".to_string()),
+    );
+    if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
+        return;
+    }
+
+    let url = format!(
+        "wss://api-feed.dhan.co?version=2&token={}&clientId={}&authType=2",
+        credentials.access_token,
+        credentials.client_id,
+    );
+    let Ok((mut dhan_ws, _)) = connect_async(&url).await else {
+        stream_rest_strategy_snapshots(
+            socket,
+            state,
+            credentials,
+            broker,
+            watch_rows,
+            volume_map,
+            quote_map,
+            baselines,
+            strategy_statuses,
+            weekly_lab_candidates,
+            "websocket-connect-failed",
+            "Dhan websocket connection failed; keeping the live panel refreshed from REST quote snapshots.",
+        ).await;
+        return;
+    };
+
+    for chunk in watch_rows.chunks(100) {
+        let message = serde_json::json!({
+            "RequestCode": 17,
+            "InstrumentCount": chunk.len(),
+            "InstrumentList": chunk.iter().map(|row| serde_json::json!({
+                "ExchangeSegment": "NSE_EQ",
+                "SecurityId": row.security_id,
+            })).collect::<Vec<_>>(),
+        });
+        if dhan_ws.send(DhanWsMessage::Text(message.to_string())).await.is_err() {
+            let snapshot = build_live_strategy_snapshot(
+                broker,
+                "dhan-websocket",
+                "subscribe-failed",
+                &watch_rows,
+                &volume_map,
+                &quote_map,
+                &baselines,
+                &strategy_statuses,
+                &weekly_lab_candidates,
+                Some("Connected to Dhan websocket, but instrument subscription failed.".to_string()),
+            );
+            let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
+            return;
+        }
+    }
+
+    let mut heartbeat = time::interval(Duration::from_secs(5));
+    let mut last_sent = Instant::now() - Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let snapshot = build_live_strategy_snapshot(
+                    broker.clone(),
+                    "dhan-websocket",
+                    "streaming",
+                    &watch_rows,
+                    &volume_map,
+                    &quote_map,
+                    &baselines,
+                    &strategy_statuses,
+                    &weekly_lab_candidates,
+                    None,
+                );
+                if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
+                    break;
+                }
+            }
+            browser_msg = socket.recv() => {
+                match browser_msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            dhan_msg = dhan_ws.next() => {
+                match dhan_msg {
+                    Some(Ok(DhanWsMessage::Binary(bytes))) => {
+                        for tick in parse_dhan_quote_packets(&bytes) {
+                            let security_id = tick.security_id.clone();
+                            quote_map.entry(security_id).and_modify(|quote| {
+                                if tick.last_price > 0.0 { quote.last_price = tick.last_price; }
+                                if tick.open > 0.0 { quote.ohlc.open = tick.open; }
+                                if tick.high > 0.0 { quote.ohlc.high = tick.high; }
+                                if tick.low > 0.0 { quote.ohlc.low = tick.low; }
+                                if tick.prev_close > 0.0 { quote.ohlc.close = tick.prev_close; }
+                                if tick.volume > 0 { quote.volume = tick.volume; }
+                            }).or_insert_with(|| tick.into_quote_item());
+                        }
+                        if last_sent.elapsed() >= Duration::from_millis(900) {
+                            last_sent = Instant::now();
+                            let snapshot = build_live_strategy_snapshot(
+                                broker.clone(),
+                                "dhan-websocket",
+                                "streaming",
+                                &watch_rows,
+                                &volume_map,
+                                &quote_map,
+                                &baselines,
+                                &strategy_statuses,
+                                &weekly_lab_candidates,
+                                None,
+                            );
+                            if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(DhanWsMessage::Ping(payload))) => {
+                        let _ = dhan_ws.send(DhanWsMessage::Pong(payload)).await;
+                    }
+                    Some(Ok(DhanWsMessage::Close(_))) | None => {
+                        broker.live_quotes = false;
+                        let snapshot = build_live_strategy_snapshot(
+                            broker,
+                            "dhan-websocket",
+                            "disconnected",
+                            &watch_rows,
+                            &volume_map,
+                            &quote_map,
+                            &baselines,
+                            &strategy_statuses,
+                            &weekly_lab_candidates,
+                            Some("Dhan websocket disconnected. Reopen Strategies to reconnect.".to_string()),
+                        );
+                        let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        broker.live_quotes = false;
+                        let snapshot = build_live_strategy_snapshot(
+                            broker,
+                            "dhan-websocket",
+                            "feed-error",
+                            &watch_rows,
+                            &volume_map,
+                            &quote_map,
+                            &baselines,
+                            &strategy_statuses,
+                            &weekly_lab_candidates,
+                            Some(format!("Dhan websocket error: {err}")),
+                        );
+                        let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn send_live_snapshot(socket: &mut WebSocket, snapshot: &LiveStrategySnapshot) -> Result<(), axum::Error> {
+    let payload = serde_json::to_string(snapshot).unwrap_or_else(|_| "{\"event\":\"error\"}".to_string());
+    socket.send(Message::Text(payload)).await
+}
+
+async fn publish_live_snapshot(socket: &mut WebSocket, state: &AppState, snapshot: &LiveStrategySnapshot) -> bool {
+    maybe_send_telegram_trigger_alerts(state, snapshot).await;
+    send_live_snapshot(socket, snapshot).await.is_ok()
+}
+
+async fn maybe_send_telegram_trigger_alerts(state: &AppState, snapshot: &LiveStrategySnapshot) {
+    let token = state.config.telegram_bot_token.trim();
+    let chat_id = state.config.telegram_chat_id.trim();
+    if token.is_empty() || chat_id.is_empty() {
+        return;
+    }
+
+    let mut messages = Vec::new();
+    {
+        let mut alert_state = state.telegram_alert_state.lock().await;
+        for row in snapshot.rows.iter().filter(|row| row.source == "dhan-live") {
+            let key = format!("{}:{}", row.strategy_id, row.symbol);
+            let trigger = match row.trigger_price {
+                Some(value) if value > 0.0 => value,
+                _ => {
+                    alert_state.insert(key, LiveTriggerAlertMarker {
+                        last_price: row.last_price,
+                        notified_trigger: None,
+                    });
+                    continue;
+                }
+            };
+
+            let marker = alert_state.entry(key).or_insert(LiveTriggerAlertMarker {
+                last_price: row.last_price,
+                notified_trigger: None,
+            });
+            let crossed_trigger = marker.last_price > 0.0
+                && marker.last_price < trigger
+                && row.last_price >= trigger;
+            let already_notified = marker
+                .notified_trigger
+                .map(|notified| (notified - trigger).abs() < 0.005)
+                .unwrap_or(false);
+
+            if crossed_trigger && row.signal_status == "ENTRY_NOW" && !already_notified {
+                marker.notified_trigger = Some(trigger);
+                messages.push(format_telegram_trigger_message(row, trigger));
+            }
+            marker.last_price = row.last_price;
+        }
+    }
+
+    for message in messages {
+        if let Err(err) = send_telegram_message(token, chat_id, &message).await {
+            tracing::warn!("telegram trigger alert failed: {err}");
+        }
+    }
+}
+
+fn format_telegram_trigger_message(row: &LiveStrategyRow, trigger: f32) -> String {
+    let source = row
+        .trigger_source
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("strategy trigger");
+    format!(
+        "Swing Atlas trigger hit\n{} - {}\nLTP Rs {:.2} crossed trigger Rs {:.2} ({})\nStop Rs {:.2} | Target Rs {:.2} | Score {} | Volume {}",
+        row.symbol,
+        row.strategy_label,
+        row.last_price,
+        trigger,
+        source,
+        row.stop_loss,
+        row.target_price,
+        row.score,
+        row.volume
+    )
+}
+
+async fn send_telegram_message(token: &str, chat_id: &str, text: &str) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("telegram sendMessage returned {}", response.status());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_rest_strategy_snapshots(
+    mut socket: WebSocket,
+    state: AppState,
+    credentials: ResolvedDhanCredentials,
+    broker: BrokerStatus,
+    watch_rows: Vec<WatchRow>,
+    volume_map: HashMap<String, String>,
+    mut quote_map: HashMap<String, QuoteItem>,
+    baselines: HashMap<String, HistoricalScreenerFeatureRow>,
+    strategy_statuses: HashMap<String, String>,
+    weekly_lab_candidates: HashMap<String, WeeklyLabCandidate>,
+    feed_status: &str,
+    message: &str,
+) {
+    let mut interval = time::interval(Duration::from_secs(10));
+    let mut first = true;
+    loop {
+        if !first {
+            if let Ok(quotes) = initial_live_quotes(&state, &credentials, &watch_rows).await {
+                quote_map = quotes;
+            }
+        }
+        let snapshot = build_live_strategy_snapshot(
+            broker.clone(),
+            "rest-snapshot",
+            feed_status,
+            &watch_rows,
+            &volume_map,
+            &quote_map,
+            &baselines,
+            &strategy_statuses,
+            &weekly_lab_candidates,
+            Some(message.to_string()),
+        );
+        first = false;
+        if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
+            break;
+        }
+        tokio::select! {
+            _ = interval.tick() => {}
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn empty_live_snapshot(broker: BrokerStatus, status: &str, message: &str) -> LiveStrategySnapshot {
+    LiveStrategySnapshot {
+        event: "live-strategy-snapshot".to_string(),
+        updated_at: now_ist().to_rfc3339(),
+        mode: "dhan-websocket".to_string(),
+        feed_status: status.to_string(),
+        broker,
+        market_regime: MarketRegime {
+            label: "Live Feed Unavailable".to_string(),
+            tone: "neutral".to_string(),
+            summary: message.to_string(),
+            advances: 0,
+            declines: 0,
+            breadth_ratio: 0.0,
+        },
+        total_watching: 0,
+        triggered: 0,
+        rows: Vec::new(),
+        message: Some(message.to_string()),
+    }
+}
+
+async fn initial_live_quotes(
+    state: &AppState,
+    credentials: &ResolvedDhanCredentials,
+    watch_rows: &[WatchRow],
+) -> anyhow::Result<HashMap<String, QuoteItem>> {
+    let mut config = state.config.clone();
+    config.dhan_access_token = credentials.access_token.clone();
+    config.dhan_client_id = credentials.client_id.clone();
+    let security_ids = watch_rows
+        .iter()
+        .map(|row| row.security_id.clone())
+        .collect::<Vec<_>>();
+    get_live_quotes(state, &config, &security_ids).await
+}
+
+fn build_live_strategy_snapshot(
+    broker: BrokerStatus,
+    mode: &str,
+    feed_status: &str,
+    watch_rows: &[WatchRow],
+    volume_map: &HashMap<String, String>,
+    quote_map: &HashMap<String, QuoteItem>,
+    baselines: &HashMap<String, HistoricalScreenerFeatureRow>,
+    strategy_statuses: &HashMap<String, String>,
+    weekly_lab_candidates: &HashMap<String, WeeklyLabCandidate>,
+    message: Option<String>,
+) -> LiveStrategySnapshot {
+    let regular_session = is_regular_session_now();
+    let seeds = watch_rows
+        .iter()
+        .filter_map(|row| quote_map.get(&row.security_id).map(|quote| seed_from_quote(row, quote, volume_map)))
+        .collect::<Vec<_>>();
+    let market_regime = compute_market_regime(&seeds, true);
+    let now = now_ist().to_rfc3339();
+    let mut rows = watch_rows
+        .iter()
+        .filter_map(|watch| {
+            let quote = quote_map.get(&watch.security_id)?;
+            let seed = seed_from_quote(watch, quote, volume_map);
+            let candidate = build_live_candidate(
+                seed,
+                &market_regime,
+                baselines.get(&watch.symbol),
+                strategy_statuses,
+                weekly_lab_candidates.get(&watch.symbol),
+                regular_session,
+            );
+            if candidate.live_signal.strategy_id == "unscored" || candidate.live_signal.strategy_id == "unlinked-screener" {
+                return None;
+            }
+            Some(LiveStrategyRow {
+                security_id: watch.security_id.clone(),
+                symbol: candidate.symbol,
+                company_name: candidate.company_name,
+                strategy_id: candidate.live_signal.strategy_id,
+                strategy_label: candidate.live_signal.strategy_label,
+                strategy_status: candidate.live_signal.strategy_status,
+                setup_family: candidate.setup_family,
+                signal_status: candidate.live_signal.status,
+                signal_label: candidate.live_signal.label,
+                reason: candidate.live_signal.reason,
+                score: candidate.score,
+                last_price: candidate.last_price,
+                day_change_pct: candidate.day_change_pct,
+                open_gap_pct: candidate.open_gap_pct,
+                volume: quote.volume,
+                trigger_price: candidate.live_signal.trigger_price,
+                trigger_source: candidate.live_signal.trigger_source.clone(),
+                stop_loss: candidate.stop_loss,
+                target_price: candidate.target_price,
+                risk_reward: candidate.risk_reward,
+                source: candidate.source,
+                updated_at: now.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|a, b| {
+        live_signal_rank(&a.signal_status)
+            .cmp(&live_signal_rank(&b.signal_status))
+            .then_with(|| strategy_status_rank(&a.strategy_status).cmp(&strategy_status_rank(&b.strategy_status)))
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+    rows.truncate(80);
+    let triggered = rows.iter().filter(|row| row.signal_status == "ENTRY_NOW").count();
+
+    LiveStrategySnapshot {
+        event: "live-strategy-snapshot".to_string(),
+        updated_at: now,
+        mode: mode.to_string(),
+        feed_status: feed_status.to_string(),
+        broker,
+        market_regime,
+        total_watching: rows.len(),
+        triggered,
+        rows,
+        message,
+    }
+}
+
+#[derive(Default)]
+struct DhanQuoteTick {
+    security_id: String,
+    last_price: f32,
+    open: f32,
+    high: f32,
+    low: f32,
+    prev_close: f32,
+    volume: u64,
+}
+
+impl DhanQuoteTick {
+    fn into_quote_item(self) -> QuoteItem {
+        QuoteItem {
+            last_price: self.last_price,
+            ohlc: crate::dhan::market_data::QuoteOhlc {
+                open: self.open,
+                high: self.high,
+                low: self.low,
+                close: self.prev_close,
+            },
+            volume: self.volume,
+            ..Default::default()
+        }
+    }
+}
+
+fn parse_dhan_quote_packets(bytes: &[u8]) -> Vec<DhanQuoteTick> {
+    let mut ticks = Vec::new();
+    let mut offset = 0usize;
+    while offset + 8 <= bytes.len() {
+        let code = bytes[offset];
+        let packet_len = i16::from_le_bytes([bytes[offset + 1], bytes[offset + 2]]).max(0) as usize;
+        let packet_len = if packet_len >= 8 && offset + packet_len <= bytes.len() {
+            packet_len
+        } else {
+            bytes.len() - offset
+        };
+        let packet = &bytes[offset..offset + packet_len];
+        let security_id = i32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]).to_string();
+        match code {
+            4 if packet.len() >= 50 => {
+                ticks.push(DhanQuoteTick {
+                    security_id,
+                    last_price: read_f32_le(packet, 8),
+                    volume: read_i32_le(packet, 22).max(0) as u64,
+                    open: read_f32_le(packet, 34),
+                    prev_close: read_f32_le(packet, 38),
+                    high: read_f32_le(packet, 42),
+                    low: read_f32_le(packet, 46),
+                });
+            }
+            2 if packet.len() >= 16 => {
+                ticks.push(DhanQuoteTick {
+                    security_id,
+                    last_price: read_f32_le(packet, 8),
+                    ..Default::default()
+                });
+            }
+            6 if packet.len() >= 16 => {
+                ticks.push(DhanQuoteTick {
+                    security_id,
+                    prev_close: read_f32_le(packet, 8),
+                    ..Default::default()
+                });
+            }
+            8 if packet.len() >= 62 => {
+                ticks.push(DhanQuoteTick {
+                    security_id,
+                    last_price: read_f32_le(packet, 8),
+                    volume: read_i32_le(packet, 22).max(0) as u64,
+                    open: read_f32_le(packet, 46),
+                    prev_close: read_f32_le(packet, 50),
+                    high: read_f32_le(packet, 54),
+                    low: read_f32_le(packet, 58),
+                });
+            }
+            _ => {}
+        }
+        if packet_len == 0 {
+            break;
+        }
+        offset += packet_len;
+    }
+    ticks
+}
+
+fn read_f32_le(packet: &[u8], offset: usize) -> f32 {
+    if packet.len() < offset + 4 {
+        return 0.0;
+    }
+    f32::from_le_bytes([packet[offset], packet[offset + 1], packet[offset + 2], packet[offset + 3]])
+}
+
+fn read_i32_le(packet: &[u8], offset: usize) -> i32 {
+    if packet.len() < offset + 4 {
+        return 0;
+    }
+    i32::from_le_bytes([packet[offset], packet[offset + 1], packet[offset + 2], packet[offset + 3]])
+}
+
 pub async fn history(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<SymbolHistoryResponse> {
     let range = normalize_history_range(query.range.as_deref());
+    if range == "1d" {
+        return match load_dhan_intraday_history(&state, &symbol).await {
+            Ok(candles) if !candles.is_empty() => {
+                let summary = compute_historical_summary(&candles);
+                Json(SymbolHistoryResponse {
+                    updated_at: crate::types::now_ist().to_rfc3339(),
+                    symbol,
+                    range,
+                    source: "dhan-intraday".to_string(),
+                    candles,
+                    summary,
+                    message: None,
+                })
+            }
+            Ok(_) => Json(SymbolHistoryResponse {
+                updated_at: crate::types::now_ist().to_rfc3339(),
+                symbol,
+                range,
+                source: "dhan-intraday".to_string(),
+                candles: Vec::new(),
+                summary: None,
+                message: Some("Dhan intraday chart returned no candles for the selected trading day.".to_string()),
+            }),
+            Err(err) => Json(SymbolHistoryResponse {
+                updated_at: crate::types::now_ist().to_rfc3339(),
+                symbol,
+                range,
+                source: "dhan-intraday".to_string(),
+                candles: Vec::new(),
+                summary: None,
+                message: Some(format!("Dhan intraday chart failed: {}", err)),
+            }),
+        };
+    }
+
     match load_historical_candles(&state, &symbol, &range).await {
         Ok(candles) => {
             let summary = compute_historical_summary(&candles);
@@ -577,6 +1287,7 @@ pub async fn history(
                 updated_at: crate::types::now_ist().to_rfc3339(),
                 symbol,
                 range,
+                source: "parquet-history".to_string(),
                 candles,
                 summary,
                 message,
@@ -586,6 +1297,7 @@ pub async fn history(
             updated_at: crate::types::now_ist().to_rfc3339(),
             symbol,
             range,
+            source: "parquet-history".to_string(),
             candles: Vec::new(),
             summary: None,
             message: Some(format!("Historical parquet query failed: {}", err)),
@@ -845,10 +1557,10 @@ async fn build_dashboard_bundle(
 
     let mut broker = resolve_broker_status(state).await;
     let volume_map = load_volume_groups_map();
+    let weekly_lab_candidates = load_weekly_lab_candidates();
 
-    let trading_day = is_nse_trading_day_now();
     let regular_session = is_regular_session_now();
-    let live_quote_map = if broker.state == "ready" && trading_day {
+    let live_quote_map = if broker.state == "ready" {
         let credentials = resolve_dhan_credentials(state).await;
         if let Some(credentials) = credentials {
             let mut config = state.config.clone();
@@ -861,7 +1573,7 @@ async fn build_dashboard_bundle(
                     broker.message = if regular_session {
                         "Live Dhan quotes are available for the regular NSE session.".to_string()
                     } else {
-                        "Dhan quotes are available after market close; using the latest quoted prices.".to_string()
+                        "Dhan quotes are available outside regular NSE hours; using the latest broker-sourced prices.".to_string()
                     };
                     Some(quotes)
                 }
@@ -876,24 +1588,10 @@ async fn build_dashboard_bundle(
             None
         }
     } else {
-        if broker.state == "ready" && !trading_day {
-            broker.live_quotes = false;
-            broker.message = "NSE is on a weekend or listed holiday; using parquet-backed last close for scanner prices.".to_string();
-        }
         None
     };
 
     let symbols = watch_rows.iter().map(|row| row.symbol.clone()).collect::<Vec<_>>();
-    let historical_fallbacks = load_historical_fallbacks(
-        state,
-        &symbols,
-    )
-    .await
-    .map_err(|err| {
-        tracing::warn!("historical parquet fallback failed: {}", err);
-        err
-    })
-    .unwrap_or_default();
     let strategy_statuses = load_latest_strategy_statuses(state)
         .await
         .map_err(|err| {
@@ -908,13 +1606,14 @@ async fn build_dashboard_bundle(
             err
         })
         .unwrap_or_default();
-    let seeds = build_candidate_seeds(&watch_rows, &volume_map, live_quote_map.as_ref(), &historical_fallbacks);
+    let seeds = build_candidate_seeds(&watch_rows, &volume_map, live_quote_map.as_ref());
     let market_regime = compute_market_regime(&seeds, broker.live_quotes);
     let mut candidates: Vec<SwingCandidate> = seeds
         .into_iter()
         .map(|seed| {
             let baseline = live_baselines.get(&seed.symbol);
-            build_live_candidate(seed, &market_regime, baseline, &strategy_statuses, regular_session)
+            let weekly_lab = weekly_lab_candidates.get(&seed.symbol);
+            build_live_candidate(seed, &market_regime, baseline, &strategy_statuses, weekly_lab, regular_session)
         })
         .collect();
 
@@ -1146,7 +1845,7 @@ async fn load_watch_rows(
     limit: usize,
     symbol_filter: Option<&str>,
 ) -> Vec<WatchRow> {
-    let limit = limit.clamp(1, 128);
+    let limit = limit.clamp(1, 1200);
 
     let primary = if let Some(symbol) = symbol_filter {
         let query_enabled = format!(
@@ -1200,20 +1899,15 @@ fn build_candidate_seeds(
     rows: &[WatchRow],
     volume_map: &HashMap<String, String>,
     live_quote_map: Option<&HashMap<String, QuoteItem>>,
-    historical_map: &HashMap<String, HistoricalFallbackRow>,
 ) -> Vec<CandidateSeed> {
     rows.iter()
-        .enumerate()
-        .map(|(idx, row)| {
+        .filter_map(|row| {
             if let Some(quotes) = live_quote_map {
                 if let Some(quote) = quotes.get(&row.security_id) {
-                    return seed_from_quote(row, quote, volume_map);
+                    return Some(seed_from_quote(row, quote, volume_map));
                 }
             }
-            if let Some(history) = historical_map.get(&row.symbol) {
-                return seed_from_history(row, history, volume_map);
-            }
-            fallback_seed(row, volume_map, idx)
+            None
         })
         .collect()
 }
@@ -1441,47 +2135,6 @@ fn seed_from_quote(
     }
 }
 
-fn fallback_seed(
-    row: &WatchRow,
-    volume_map: &HashMap<String, String>,
-    idx: usize,
-) -> CandidateSeed {
-    let seed = row
-        .symbol
-        .bytes()
-        .fold(0u32, |acc, item| acc.wrapping_mul(33).wrapping_add(item as u32))
-        .wrapping_add(idx as u32)
-        .wrapping_add(row.min_volume);
-    let base_price = 120.0 + (seed % 1800) as f32;
-    let trend = ((seed % 420) as f32 / 100.0) - 1.0;
-    let gap = (((seed / 11) % 220) as f32 / 100.0) - 0.9;
-    let recovery = 0.8 + (((seed / 7) % 180) as f32 / 100.0);
-    let distance_to_high = 0.3 + (((seed / 13) % 120) as f32 / 100.0);
-    let range = 1.1 + (((seed / 17) % 180) as f32 / 100.0);
-
-    CandidateSeed {
-        symbol: row.symbol.clone(),
-        company_name: row.company_name.clone(),
-        tiers: row.tiers.clone(),
-        liquidity_bucket: volume_map
-            .get(&row.symbol)
-            .cloned()
-            .unwrap_or_else(|| liquidity_from_tiers(row)),
-        open_price: round2(base_price * (1.0 + gap / 100.0)),
-        high_price: round2(base_price * (1.0 + distance_to_high / 100.0)),
-        low_price: round2(base_price * (1.0 - recovery / 100.0)),
-        last_price: round2(base_price),
-        prev_close: round2(base_price / (1.0 + trend / 100.0)),
-        day_volume: 0.0,
-        day_change_pct: round2(trend),
-        open_gap_pct: round2(gap),
-        recovery_pct: round2(recovery),
-        distance_to_high_pct: round2(distance_to_high),
-        intraday_range_pct: round2(range),
-        source: "watchlist-fallback".to_string(),
-    }
-}
-
 fn compute_market_regime(seeds: &[CandidateSeed], live_quotes: bool) -> MarketRegime {
     let advances = seeds.iter().filter(|seed| seed.day_change_pct > 0.25).count();
     let declines = seeds.iter().filter(|seed| seed.day_change_pct < -0.25).count();
@@ -1523,11 +2176,14 @@ fn build_live_candidate(
     regime: &MarketRegime,
     baseline: Option<&HistoricalScreenerFeatureRow>,
     strategy_statuses: &HashMap<String, String>,
+    weekly_lab: Option<&WeeklyLabCandidate>,
     entry_window_open: bool,
 ) -> SwingCandidate {
     let fallback_family = classify_setup_family(&seed);
     let fallback_score = fallback_candidate_score(&seed, &fallback_family, regime);
-    let live_signal = evaluate_live_signal(&seed, baseline, strategy_statuses, entry_window_open);
+    let daily_signal = evaluate_live_signal(&seed, baseline, strategy_statuses, entry_window_open);
+    let weekly_signal = weekly_lab.map(|row| evaluate_weekly_lab_signal(&seed, row, entry_window_open));
+    let live_signal = choose_live_signal(daily_signal, weekly_signal);
 
     let family = if live_signal.setup_family == "Unscored" {
         fallback_family.clone()
@@ -1553,14 +2209,22 @@ fn build_live_candidate(
                 expected_hold_for_family(&fallback_family),
             )
         });
-    let stop_loss = round2(seed.last_price * (1.0 - stop_buffer / 100.0));
-    let target_price = round2(seed.last_price * (1.0 + target_buffer / 100.0));
-    let risk_reward = round2((target_price - seed.last_price) / (seed.last_price - stop_loss).max(0.01));
-    let entry_zone = format!(
-        "Rs {:.2} - Rs {:.2}",
-        seed.last_price * 0.995,
-        seed.last_price * 1.008
-    );
+    let planned_entry = live_signal
+        .trigger_price
+        .filter(|price| *price > 0.0)
+        .unwrap_or(seed.last_price);
+    let stop_loss = round2(planned_entry * (1.0 - stop_buffer / 100.0));
+    let target_price = round2(planned_entry * (1.0 + target_buffer / 100.0));
+    let risk_reward = round2((target_price - planned_entry) / (planned_entry - stop_loss).max(0.01));
+    let entry_zone = if live_signal.trigger_price.is_some() {
+        format!("Trigger Rs {:.2}", planned_entry)
+    } else {
+        format!(
+            "Rs {:.2} - Rs {:.2}",
+            seed.last_price * 0.995,
+            seed.last_price * 1.008
+        )
+    };
     let expected_hold = max_hold_sessions.to_string();
 
     let mut reasons = vec![
@@ -1670,6 +2334,108 @@ fn fallback_candidate_score(seed: &CandidateSeed, family: &str, regime: &MarketR
         .clamp(58.0, 96.0) as u8
 }
 
+fn choose_live_signal(daily: LiveSignal, weekly: Option<LiveSignal>) -> LiveSignal {
+    let Some(weekly) = weekly else {
+        return daily;
+    };
+    if weekly.strategy_id == "king-candle-quality-v1" {
+        return weekly;
+    }
+    if matches!(daily.status.as_str(), "ENTRY_NOW" | "WATCH") {
+        daily
+    } else {
+        weekly
+    }
+}
+
+fn evaluate_weekly_lab_signal(
+    seed: &CandidateSeed,
+    row: &WeeklyLabCandidate,
+    entry_window_open: bool,
+) -> LiveSignal {
+    let trigger = row.trigger_price.max(0.01);
+    let live_price = seed.last_price.max(0.01);
+    let trigger_source = if row.strategy_id == "king-candle-quality-v1" {
+        "King candle high + 0.1%".to_string()
+    } else {
+        "Weekly close baseline".to_string()
+    };
+    let score = (
+        68.0
+        + row.rs13w_rank.clamp(0.0, 1.0) * 14.0
+        + row.relvol.clamp(0.0, 6.0) * 1.6
+        + row.body_ratio.clamp(0.0, 1.0) * 5.0
+        + row.range_atr.clamp(0.0, 4.0) * 2.0
+        + (row.rank_score / 3.0).clamp(0.0, 6.0)
+    ).round().clamp(60.0, 96.0) as u8;
+
+    let lost_supertrend = row.supertrend > 0.0 && live_price < row.supertrend;
+    let trigger_hit = live_price >= trigger;
+    let (status, label, reason) = if lost_supertrend {
+        (
+            "INVALIDATED",
+            "Invalidated",
+            format!(
+                "{} is below weekly Supertrend support: live {:.2}, Supertrend {:.2}.",
+                row.strategy_label, live_price, row.supertrend
+            ),
+        )
+    } else if row.strategy_id == "king-candle-quality-v1" && trigger_hit && entry_window_open {
+        (
+            "ENTRY_NOW",
+            "Enter Now",
+            format!(
+                "King Candle Quality trigger is live: LTP {:.2} is above trigger {:.2}; relvol {:.2}x and RS13 rank {:.0}%.",
+                live_price,
+                trigger,
+                row.relvol,
+                row.rs13w_rank * 100.0
+            ),
+        )
+    } else if row.strategy_id == "king-candle-quality-v1" && trigger_hit {
+        (
+            "WAIT_FOR_TRIGGER",
+            "Signal Ready",
+            format!(
+                "King Candle Quality trigger {:.2} is cleared, but regular-session entry is closed right now.",
+                trigger
+            ),
+        )
+    } else if row.strategy_id == "king-candle-quality-v1" {
+        (
+            "WAIT_FOR_TRIGGER",
+            "Wait Above King High",
+            format!(
+                "King Candle Quality is armed from {}; needs live price above {:.2}. Current LTP {:.2}.",
+                row.signal_date, trigger, live_price
+            ),
+        )
+    } else {
+        (
+            "WATCH",
+            "Weekly Trend Watch",
+            format!(
+                "Weekly Supertrend 10-3 is positive from {}; LTP {:.2}, weekly close baseline {:.2}, Supertrend {:.2}.",
+                row.signal_date, live_price, row.close, row.supertrend
+            ),
+        )
+    };
+
+    LiveSignal {
+        status: status.to_string(),
+        label: label.to_string(),
+        reason,
+        strategy_id: row.strategy_id.clone(),
+        strategy_label: row.strategy_label.clone(),
+        strategy_status: row.strategy_status.clone(),
+        setup_family: row.setup_family.clone(),
+        score,
+        as_of: format!("dhan-live / weekly {}", row.signal_date),
+        trigger_price: Some(trigger),
+        trigger_source: Some(trigger_source),
+    }
+}
+
 fn evaluate_live_signal(
     seed: &CandidateSeed,
     baseline: Option<&HistoricalScreenerFeatureRow>,
@@ -1688,6 +2454,7 @@ fn evaluate_live_signal(
             score: 0,
             as_of: seed.source.clone(),
             trigger_price: None,
+            trigger_source: None,
         };
     };
 
@@ -1702,7 +2469,8 @@ fn evaluate_live_signal(
     let rsi10 = row.rsi10.unwrap_or(50.0);
     let avg_volume20 = row.avg_volume20.unwrap_or(0.0).max(1.0);
     let high_20d = row.high_20d.unwrap_or(high).max(high);
-    let high_52w = row.high_52w.unwrap_or(high).max(high);
+    let historical_high_52w = row.high_52w.unwrap_or(high).max(0.01);
+    let high_52w = historical_high_52w.max(high);
     let low_52w = row.low_52w.unwrap_or(low).min(low);
     let day_volume = if seed.day_volume > 0.0 {
         seed.day_volume
@@ -1719,10 +2487,36 @@ fn evaluate_live_signal(
     let range_span = (high_52w - low_52w).max(0.01);
     let range_position_pct = ((close - low_52w) / range_span) * 100.0;
     let volume_ratio = day_volume / avg_volume20;
+    let atr14 = row.atr14.unwrap_or_else(|| (high - low).abs()).max(close * 0.01);
+    let prior_high20 = row.prior_high20.filter(|value| *value > 0.0).unwrap_or(high_20d);
+    let prior_close3 = row.prior_close3.filter(|value| *value > 0.0).unwrap_or(close);
+    let close_location = if high > low { ((close - low) / (high - low)).clamp(0.0, 1.0) } else { 0.5 };
+    let range_atr = if atr14 > 0.0 { (high - low).max(0.0) / atr14 } else { 0.0 };
+    let recovery_from_low_pct = if low > 0.0 { (close - low).max(0.0) / low } else { 0.0 };
+    let ret3 = if prior_close3 > 0.0 { close / prior_close3 - 1.0 } else { 0.0 };
+    let rs60_rank = row.rs60_rank.unwrap_or(0.5).clamp(0.0, 1.0);
+    let market_breadth200 = row.market_breadth200.unwrap_or(0.5).clamp(0.0, 1.0);
     let trend_up = close > sma20 && sma20 > sma50;
     let pullback_zone = close >= sma20 * 0.98 && close <= sma20 * 1.03;
     let rsi10_pullback = close > sma200 && rsi10 < 30.0;
-    let setup_family = if rsi10_pullback {
+    let tuned_ma_breakout = trend_up
+        && market_breadth200 >= 0.38
+        && rs60_rank >= 0.58
+        && volume_ratio >= 1.3
+        && close_location >= 0.58
+        && atr14 > 0.0
+        && high >= prior_high20 * 1.001
+        && close >= prior_high20 * 1.001 * 0.985;
+    let tuned_panic_reversal = ret3 <= -0.08
+        && range_atr >= 1.35
+        && close_location >= 0.64
+        && recovery_from_low_pct >= 0.012
+        && atr14 > 0.0;
+    let setup_family = if tuned_panic_reversal {
+        "Panic Reversal"
+    } else if tuned_ma_breakout {
+        "MA Breakout"
+    } else if rsi10_pullback {
         "RSI10 Pullback Reversion"
     } else if trend_up && breakout_pct <= 1.5 && volume_ratio >= 1.1 {
         "Breakout Setup"
@@ -1754,17 +2548,39 @@ fn evaluate_live_signal(
         sma20,
         sma200,
         rsi10,
+        tuned_ma_breakout,
+        tuned_panic_reversal,
     );
     let strategy_status = strategy_statuses
         .get(strategy_id)
         .cloned()
         .unwrap_or_else(|| default_strategy_status(strategy_id).to_string());
-    let trigger_price = match setup_family {
-        "Breakout Setup" => Some(round2(high_20d as f32)),
-        "Pullback To 20 DMA" => Some(round2(sma20 as f32)),
-        "Near 52W High" => Some(round2(high_52w as f32)),
-        _ => None,
+    let (trigger_price, trigger_source) = match setup_family {
+        "MA Breakout" => (
+            Some(round2((prior_high20 * 1.001) as f32)),
+            Some("Prior 20D high + 0.1%".to_string()),
+        ),
+        "Panic Reversal" => (
+            Some(round2((low + 0.25 * (high - low)) as f32)),
+            Some("25% recovery from intraday low".to_string()),
+        ),
+        "Breakout Setup" => (
+            Some(round2((prior_high20 * 1.001) as f32)),
+            Some("Prior 20D high + 0.1%".to_string()),
+        ),
+        "Pullback To 20 DMA" => (
+            Some(round2(sma20 as f32)),
+            Some("Live-adjusted SMA20 reclaim".to_string()),
+        ),
+        "Near 52W High" => (
+            Some(round2((historical_high_52w * 1.001) as f32)),
+            Some("52W high + 0.1%".to_string()),
+        ),
+        _ => (None, None),
     };
+    let trigger_hit = trigger_price
+        .map(|trigger| close >= trigger as f64)
+        .unwrap_or(false);
 
     let lost_structure = close < sma50 * 0.985 || range_position_pct < 40.0;
     let (status, label, reason) = if lost_structure {
@@ -1785,13 +2601,36 @@ fn evaluate_live_signal(
                 score, setup_family, volume_ratio
             ),
         )
+    } else if strategy_status == "Candidate" && !trigger_hit {
+        (
+            "WAIT_FOR_TRIGGER",
+            "Wait For Trigger",
+            match trigger_price {
+                Some(trigger) => format!(
+                    "{} is approved, but live LTP {:.2} has not crossed trigger {:.2} ({}) yet.",
+                    strategy_label,
+                    close,
+                    trigger,
+                    trigger_source.as_deref().unwrap_or("strategy trigger")
+                ),
+                None => format!(
+                    "{} is approved, but no live trigger could be derived for setup {}.",
+                    strategy_label, setup_family
+                ),
+            },
+        )
     } else if strategy_status == "Candidate" && entry_window_open {
         (
             "ENTRY_NOW",
             "Enter Now",
             format!(
-                "{} is active now with score {}, distance to 52W high {:.2}%, and volume ratio {:.2}.",
-                strategy_label, score, distance_to_52w_high_pct, volume_ratio
+                "{} trigger is live: LTP {:.2} is above trigger {:.2}; score {}, distance to 52W high {:.2}%, volume ratio {:.2}.",
+                strategy_label,
+                close,
+                trigger_price.unwrap_or(close as f32),
+                score,
+                distance_to_52w_high_pct,
+                volume_ratio
             ),
         )
     } else if strategy_status == "Candidate" {
@@ -1834,6 +2673,7 @@ fn evaluate_live_signal(
         score,
         as_of: format!("{} / baseline {}", seed.source, row.trade_date.clone().unwrap_or_default()),
         trigger_price,
+        trigger_source,
     }
 }
 
@@ -1849,6 +2689,7 @@ fn default_live_signal() -> LiveSignal {
         score: 0,
         as_of: "unknown".to_string(),
         trigger_price: None,
+        trigger_source: None,
     }
 }
 
@@ -1896,6 +2737,8 @@ fn live_strategy_score(
 
 fn strategy_exit_plan(strategy_id: &str) -> Option<(f32, f32, &'static str)> {
     match strategy_id {
+        "king-candle-quality-v1" => Some((40.0, 8.0, "20-30 weeks / weekly ST trail")),
+        "weekly-supertrend-10-3" => Some((40.0, 10.0, "20-30 weeks / weekly ST trail")),
         "swing-breakout-v1" => Some((8.0, 4.0, "10 sessions")),
         "breakout-volume-v2" => Some((10.0, 4.0, "12 sessions")),
         "pullback-20dma-v1" => Some((6.0, 3.0, "10 sessions")),
@@ -2137,6 +2980,78 @@ fn load_volume_groups_map() -> HashMap<String, String> {
     HashMap::new()
 }
 
+fn load_weekly_lab_candidates() -> HashMap<String, WeeklyLabCandidate> {
+    let mut out = HashMap::new();
+    load_weekly_lab_file(
+        "docs/king_supertrend_lab/weekly_supertrend_103_latest_candidates.csv",
+        "weekly-supertrend-10-3",
+        "Weekly Supertrend 10-3",
+        "Weekly Supertrend",
+        "Watch",
+        false,
+        &mut out,
+    );
+    load_weekly_lab_file(
+        "docs/king_supertrend_lab/king_candle_quality_breakout_latest_candidates.csv",
+        "king-candle-quality-v1",
+        "King Candle Quality",
+        "King Candle Quality",
+        "Candidate",
+        true,
+        &mut out,
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_weekly_lab_file(
+    path: &str,
+    strategy_id: &str,
+    strategy_label: &str,
+    setup_family: &str,
+    strategy_status: &str,
+    breakout_trigger: bool,
+    out: &mut HashMap<String, WeeklyLabCandidate>,
+) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines().skip(1) {
+        let cols = line.split(',').map(str::trim).collect::<Vec<_>>();
+        if cols.len() < 12 || cols[0].is_empty() {
+            continue;
+        }
+        let symbol = cols[0].to_string();
+        let close = parse_csv_f32(cols[3]);
+        let high = parse_csv_f32(cols[4]);
+        let trigger_price = if breakout_trigger {
+            round2(high * 1.001)
+        } else {
+            round2(close)
+        };
+        out.insert(symbol.clone(), WeeklyLabCandidate {
+            symbol,
+            strategy_id: strategy_id.to_string(),
+            strategy_label: strategy_label.to_string(),
+            setup_family: setup_family.to_string(),
+            strategy_status: strategy_status.to_string(),
+            signal_date: cols[2].to_string(),
+            trigger_price,
+            close,
+            supertrend: parse_csv_f32(cols[5]),
+            rank_score: parse_csv_f32(cols[6]),
+            relvol: parse_csv_f32(cols[7]),
+            rs13w_rank: parse_csv_f32(cols[8]),
+            body_ratio: parse_csv_f32(cols[9]),
+            range_atr: parse_csv_f32(cols[11]),
+        });
+    }
+}
+
+fn parse_csv_f32(raw: &str) -> f32 {
+    raw.parse::<f32>().unwrap_or(0.0)
+}
+
 fn liquidity_from_tiers(row: &WatchRow) -> String {
     if row.tiers.iter().any(|tier| tier == "Tier1" || tier == "F&O") || row.enabled == 1 {
         "LARGE".to_string()
@@ -2176,7 +3091,8 @@ fn expected_hold_for_family(family: &str) -> &'static str {
 }
 
 fn normalize_history_range(raw: Option<&str>) -> String {
-    match raw.unwrap_or("1y").to_ascii_lowercase().as_str() {
+    match raw.unwrap_or("1d").to_ascii_lowercase().as_str() {
+        "1d" | "live" | "intraday" => "1d".to_string(),
         "3m" => "3m".to_string(),
         "6m" => "6m".to_string(),
         "1y" => "1y".to_string(),
@@ -2337,7 +3253,8 @@ async fn latest_feature_cache_stats(state: &AppState) -> anyhow::Result<Option<F
         SELECT \
             toString(trade_date) AS data_date, \
             toUInt64(count()) AS cached_rows, \
-            toFloat64(avg(atr14)) AS avg_atr14 \
+            toFloat64(avg(atr14)) AS avg_atr14, \
+            toFloat64(avg(abs(ret3))) AS avg_ret3_abs \
         FROM trading.daily_screener_features FINAL \
         WHERE trade_date = (SELECT data_date FROM target) \
         GROUP BY trade_date"
@@ -2356,7 +3273,8 @@ async fn refresh_screener_feature_cache(state: &AppState) -> anyhow::Result<()> 
         (trade_date, symbol, day_open, day_high, day_low, day_close, prev_close, day_volume, \
          sma20, sma50, sma200, avg_volume20, high_20d, high_52w, low_52w, rsi10, \
          atr14, atr_pct, range_pct, close_location, gap_pct, prior_high20, prior_high55, \
-         prior_high252, prior_low20, rs60_rank, rs120_rank, market_breadth200, refreshed_at) \
+         prior_high252, prior_close3, prior_low20, ret3, range_atr, recovery_from_low_pct, \
+         rs60_rank, rs120_rank, market_breadth200, refreshed_at) \
         WITH daily AS ( \
             SELECT \
                 symbol, \
@@ -2418,6 +3336,7 @@ async fn refresh_screener_feature_cache(state: &AppState) -> anyhow::Result<()> 
                 coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING), day_high) AS prior_high20, \
                 coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 55 PRECEDING AND 1 PRECEDING), day_high) AS prior_high55, \
                 coalesce(max(day_high) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING), day_high) AS prior_high252, \
+                lagInFrame(day_close, 3, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS prior_close3, \
                 coalesce(min(day_low) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING), day_low) AS prior_low20, \
                 if(lagInFrame(day_close, 60, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 0, day_close / lagInFrame(day_close, 60, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1, 0) AS ret60, \
                 if(lagInFrame(day_close, 120, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 0, day_close / lagInFrame(day_close, 120, 0) OVER (PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1, 0) AS ret120, \
@@ -2426,6 +3345,9 @@ async fn refresh_screener_feature_cache(state: &AppState) -> anyhow::Result<()> 
             FROM priced \
         ), scored AS ( \
             SELECT *, \
+                if(prior_close3 > 0, day_close / prior_close3 - 1, 0) AS ret3, \
+                if(atr14 > 0, (day_high - day_low) / atr14, 0) AS range_atr, \
+                if(day_low > 0, (day_close - day_low) / day_low, 0) AS recovery_from_low_pct, \
                 toFloat64(rank() OVER (PARTITION BY trade_date ORDER BY ret60)) / greatest(toFloat64(count() OVER (PARTITION BY trade_date)), 1.0) AS rs60_rank, \
                 toFloat64(rank() OVER (PARTITION BY trade_date ORDER BY ret120)) / greatest(toFloat64(count() OVER (PARTITION BY trade_date)), 1.0) AS rs120_rank, \
                 avg(if(day_close > sma200, 1.0, 0.0)) OVER (PARTITION BY trade_date) AS market_breadth200 \
@@ -2456,7 +3378,11 @@ async fn refresh_screener_feature_cache(state: &AppState) -> anyhow::Result<()> 
             toFloat64(prior_high20), \
             toFloat64(prior_high55), \
             toFloat64(prior_high252), \
+            toFloat64(prior_close3), \
             toFloat64(prior_low20), \
+            toFloat64(ret3), \
+            toFloat64(range_atr), \
+            toFloat64(recovery_from_low_pct), \
             toFloat64(rs60_rank), \
             toFloat64(rs120_rank), \
             toFloat64(market_breadth200), \
@@ -2529,6 +3455,7 @@ async fn load_cached_live_signal_baselines(
             f.symbol, \
             toString(f.trade_date) AS trade_date, \
             toFloat64(f.day_open) AS day_open, \
+            toFloat64(f.prev_close) AS prev_close, \
             toFloat64(f.day_close) AS day_close, \
             toFloat64(f.day_high) AS day_high, \
             toFloat64(f.day_low) AS day_low, \
@@ -2540,7 +3467,15 @@ async fn load_cached_live_signal_baselines(
             toFloat64(f.high_20d) AS high_20d, \
             toFloat64(f.high_52w) AS high_52w, \
             toFloat64(f.low_52w) AS low_52w, \
-            toFloat64(f.rsi10) AS rsi10 \
+            toFloat64(f.rsi10) AS rsi10, \
+            toFloat64(f.atr14) AS atr14, \
+            toFloat64(f.prior_high20) AS prior_high20, \
+            toFloat64(f.prior_close3) AS prior_close3, \
+            toFloat64(f.ret3) AS ret3, \
+            toFloat64(f.range_atr) AS range_atr, \
+            toFloat64(f.recovery_from_low_pct) AS recovery_from_low_pct, \
+            toFloat64(f.rs60_rank) AS rs60_rank, \
+            toFloat64(f.market_breadth200) AS market_breadth200 \
         FROM trading.daily_screener_features AS f FINAL \
         WHERE f.trade_date = (SELECT data_date FROM target) \
           AND f.symbol IN ({symbol_list})"
@@ -2598,6 +3533,112 @@ async fn load_historical_candles(
             })
         })
         .collect())
+}
+
+async fn load_dhan_intraday_history(
+    state: &AppState,
+    symbol: &str,
+) -> anyhow::Result<Vec<HistoricalCandle>> {
+    let credentials = resolve_dhan_credentials(state)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Dhan credentials are not configured"))?;
+    let watch = load_watch_rows(state, 1, Some(symbol))
+        .await
+        .into_iter()
+        .find(|row| row.symbol.eq_ignore_ascii_case(symbol))
+        .ok_or_else(|| anyhow::anyhow!("{} is not present in the Dhan watchlist/security master", symbol))?;
+
+    let mut config = state.config.clone();
+    config.dhan_access_token = credentials.access_token;
+    config.dhan_client_id = credentials.client_id;
+    let client = DhanClient::new(&config);
+    let target_day = intraday_chart_day();
+    let from_time = format!("{} 09:15:00", target_day.format("%Y-%m-%d"));
+    let to_time = format!("{} 15:30:00", target_day.format("%Y-%m-%d"));
+    let response = fetch_intraday_candles(&client, &watch.security_id, &from_time, &to_time).await?;
+    let mut candles = intraday_response_to_candles(response);
+
+    if target_day == now_ist().date_naive() {
+        if let Ok(quotes) = get_live_quotes(state, &config, &[watch.security_id]).await {
+            if let Some(quote) = quotes.values().next() {
+                append_live_quote_candle(&mut candles, quote);
+            }
+        }
+    }
+
+    Ok(candles)
+}
+
+fn intraday_chart_day() -> chrono::NaiveDate {
+    let now = now_ist();
+    let today = now.date_naive();
+    let session_has_started = compute_bucket(&now) > 0
+        || now.hour() > 15
+        || (now.hour() == 15 && now.minute() >= 30);
+
+    if !is_nse_holiday(today) && session_has_started {
+        today
+    } else {
+        prev_trading_day(today)
+    }
+}
+
+fn intraday_response_to_candles(response: IntradayResponse) -> Vec<HistoricalCandle> {
+    let len = response
+        .timestamp
+        .len()
+        .min(response.open.len())
+        .min(response.high.len())
+        .min(response.low.len())
+        .min(response.close.len())
+        .min(response.volume.len());
+
+    let mut candles = Vec::with_capacity(len);
+    for idx in 0..len {
+        let Some(ts) = Utc.timestamp_opt(response.timestamp[idx].round() as i64, 0).single() else {
+            continue;
+        };
+        candles.push(HistoricalCandle {
+            date: ts.with_timezone(&chrono_tz::Asia::Kolkata).to_rfc3339(),
+            open: round2_f64(response.open[idx]),
+            high: round2_f64(response.high[idx]),
+            low: round2_f64(response.low[idx]),
+            close: round2_f64(response.close[idx]),
+            volume: response.volume[idx].max(0.0).round() as u64,
+        });
+    }
+    candles
+}
+
+fn append_live_quote_candle(candles: &mut Vec<HistoricalCandle>, quote: &QuoteItem) {
+    let last_price = quote.last_price;
+    if last_price <= 0.0 {
+        return;
+    }
+    let live_price = round2_f64(last_price as f64);
+    let live_high = round2_f64(quote.high().max(last_price) as f64);
+    let live_low = round2_f64(if quote.low() > 0.0 { quote.low().min(last_price) } else { last_price } as f64);
+    let live_open = round2_f64(if quote.open() > 0.0 { quote.open() } else { last_price } as f64);
+    let live_volume = quote.volume;
+
+    if let Some(last) = candles.last_mut() {
+        last.close = live_price;
+        last.high = last.high.max(live_high);
+        last.low = if last.low > 0.0 { last.low.min(live_low) } else { live_low };
+        if live_volume > 0 {
+            last.volume = live_volume;
+        }
+        return;
+    }
+
+    candles.push(HistoricalCandle {
+        date: now_ist().to_rfc3339(),
+        open: live_open,
+        high: live_high,
+        low: live_low,
+        close: live_price,
+        volume: live_volume,
+    });
 }
 
 fn compute_historical_summary(candles: &[HistoricalCandle]) -> Option<HistoricalSummary> {
@@ -2696,7 +3737,7 @@ async fn load_historical_screener_rows(
     let cache_stats = latest_feature_cache_stats(state).await?;
     let cache_usable = cache_stats
         .as_ref()
-        .is_some_and(|row| row.cached_rows > 0 && row.avg_atr14 > 0.0);
+        .is_some_and(|row| row.cached_rows > 0 && row.avg_atr14 > 0.0 && row.avg_ret3_abs > 0.0);
     if !cache_usable {
         refresh_screener_feature_cache(state).await?;
     }
@@ -2812,7 +3853,11 @@ async fn load_cached_historical_screener_rows(
             toFloat64(f.prior_high20) AS prior_high20, \
             toFloat64(f.prior_high55) AS prior_high55, \
             toFloat64(f.prior_high252) AS prior_high252, \
+            toFloat64(f.prior_close3) AS prior_close3, \
             toFloat64(f.prior_low20) AS prior_low20, \
+            toFloat64(f.ret3) AS ret3, \
+            toFloat64(f.range_atr) AS range_atr, \
+            toFloat64(f.recovery_from_low_pct) AS recovery_from_low_pct, \
             toFloat64(f.rs60_rank) AS rs60_rank, \
             toFloat64(f.rs120_rank) AS rs120_rank, \
             toFloat64(f.market_breadth200) AS market_breadth200 \
@@ -2872,10 +3917,21 @@ fn map_historical_screener_row(
     let prior_high20 = row.prior_high20.filter(|value| *value > 0.0).unwrap_or(high_20d);
     let prior_high55 = row.prior_high55.filter(|value| *value > 0.0).unwrap_or(prior_high20);
     let prior_high252 = row.prior_high252.filter(|value| *value > 0.0).unwrap_or(high_52w);
+    let prior_close3 = row.prior_close3.filter(|value| *value > 0.0).unwrap_or(day_close);
     let prior_low20 = row.prior_low20.filter(|value| *value > 0.0).unwrap_or(day_low);
     let rs60_rank = row.rs60_rank.unwrap_or(0.5).clamp(0.0, 1.0);
     let rs120_rank = row.rs120_rank.unwrap_or(0.5).clamp(0.0, 1.0);
     let market_breadth200 = row.market_breadth200.unwrap_or(0.5).clamp(0.0, 1.0);
+    let ret3 = row
+        .ret3
+        .unwrap_or_else(|| if prior_close3 > 0.0 { day_close / prior_close3 - 1.0 } else { 0.0 });
+    let range_atr = row
+        .range_atr
+        .filter(|value| *value > 0.0)
+        .unwrap_or_else(|| if atr14 > 0.0 { (day_high - day_low).max(0.0) / atr14 } else { 0.0 });
+    let recovery_from_low_pct = row
+        .recovery_from_low_pct
+        .unwrap_or_else(|| if day_low > 0.0 { (day_close - day_low).max(0.0) / day_low } else { 0.0 });
     let breakout_pct = ((prior_high20 - day_close) / prior_high20) * 100.0;
     let distance_to_52w_high_pct = ((high_52w - day_close) / high_52w) * 100.0;
     let range_span = (high_52w - low_52w).max(0.01);
@@ -2894,12 +3950,29 @@ fn map_historical_screener_row(
         && day_close > prior_low20
         && close_location >= 0.65
         && volume_ratio >= 0.8;
+    let tuned_ma_breakout = trend_up
+        && market_breadth200 >= 0.38
+        && rs60_rank >= 0.58
+        && volume_ratio >= 1.3
+        && close_location >= 0.58
+        && atr14 > 0.0
+        && day_high >= prior_high20 * 1.001
+        && day_close >= prior_high20 * 1.001 * 0.985;
+    let tuned_panic_reversal = ret3 <= -0.08
+        && range_atr >= 1.35
+        && close_location >= 0.64
+        && recovery_from_low_pct >= 0.012
+        && atr14 > 0.0;
     let relative_strength_leader = rs60_rank >= 0.75
         && rs120_rank >= 0.65
         && day_close > sma50
         && (distance_to_52w_high_pct <= 10.0 || day_close > prior_high55 || day_close > prior_high252);
 
-    let setup_family = if rsi10_pullback {
+    let setup_family = if tuned_panic_reversal {
+        "Panic Reversal"
+    } else if tuned_ma_breakout {
+        "MA Breakout"
+    } else if rsi10_pullback {
         "RSI10 Pullback Reversion"
     } else if failed_breakdown_reclaim {
         "Failed Breakdown Reclaim"
@@ -2953,6 +4026,12 @@ fn map_historical_screener_row(
     if failed_breakdown_reclaim {
         score += 14.0;
     }
+    if tuned_ma_breakout {
+        score += 20.0;
+    }
+    if tuned_panic_reversal {
+        score += 24.0;
+    }
     if compression_breakout {
         score += 12.0;
     }
@@ -2984,6 +4063,8 @@ fn map_historical_screener_row(
         sma20,
         sma200,
         rsi10,
+        tuned_ma_breakout,
+        tuned_panic_reversal,
     );
     let strategy_status = strategy_statuses
         .get(strategy_id)
@@ -2996,6 +4077,7 @@ fn map_historical_screener_row(
         sma20,
         atr14,
         prior_high20,
+        prior_close3,
         prior_low20,
     );
 
@@ -3037,10 +4119,13 @@ fn historical_trade_plan(
     sma20: f64,
     atr14: f64,
     prior_high20: f64,
+    prior_close3: f64,
     prior_low20: f64,
 ) -> (String, f64, f64, f64) {
     let atr = atr14.max(close * 0.015).max(0.01);
     let raw_stop = match setup_family {
+        "MA Breakout" => low.min(close - atr),
+        "Panic Reversal" => low,
         "Breakout Continuation" | "Compression Breakout" => (prior_high20 - 0.35 * atr).min(close - 1.2 * atr),
         "Pullback To 20 DMA" => (sma20 - 0.8 * atr).min(low - 0.25 * atr),
         "Failed Breakdown Reclaim" => prior_low20.min(low) - 0.25 * atr,
@@ -3051,13 +4136,21 @@ fn historical_trade_plan(
     let stop_loss = round2_f64(raw_stop.max(close * 0.88).min(close - 0.01));
     let risk = (close - stop_loss).max(0.01);
     let reward_multiple = match setup_family {
+        "MA Breakout" => 2.5,
+        "Panic Reversal" => 2.0,
         "RSI10 Pullback Reversion" => 1.4,
         "Pullback To 20 DMA" | "Failed Breakdown Reclaim" => 1.8,
         _ => 2.0,
     };
-    let target_price = round2_f64(close + risk * reward_multiple);
+    let target_price = if setup_family == "Panic Reversal" && prior_close3 > close {
+        round2_f64(prior_close3)
+    } else {
+        round2_f64(close + risk * reward_multiple)
+    };
     let risk_reward = round2_f64((target_price - close) / risk);
     let planned_entry = match setup_family {
+        "MA Breakout" => format!("Breakout trigger above Rs {:.2}; confirm the 20D level holds", prior_high20),
+        "Panic Reversal" => format!("Panic reclaim hold above Rs {:.2}; target pre-panic close Rs {:.2}", low, prior_close3.max(close)),
         "Breakout Continuation" | "Compression Breakout" => {
             format!("Next session strength above Rs {:.2}", prior_high20.max(close))
         }
@@ -3082,7 +4175,15 @@ fn strategy_match_for_screener(
     sma20: f64,
     sma200: f64,
     rsi10: f64,
+    tuned_ma_breakout: bool,
+    tuned_panic_reversal: bool,
 ) -> (&'static str, &'static str) {
+    if tuned_panic_reversal {
+        return ("tuned-panic-reversal-v1", "Panic Reversal Lab");
+    }
+    if tuned_ma_breakout {
+        return ("tuned-ma-breakout-v1", "MA Breakout Lab");
+    }
     if day_close > sma200 && rsi10 < 30.0 {
         return ("rsi10-pullback-reversion-v1", "RSI10 Pullback");
     }
@@ -3130,6 +4231,10 @@ fn strategy_match_for_screener(
 
 fn default_strategy_status(strategy_id: &str) -> &'static str {
     match strategy_id {
+        "king-candle-quality-v1" => "Candidate",
+        "weekly-supertrend-10-3" => "Watch",
+        "tuned-ma-breakout-v1" => "Candidate",
+        "tuned-panic-reversal-v1" => "Watch",
         "momentum-core-v1" => "Candidate",
         "rsi10-pullback-reversion-v1" => "Candidate",
         "failed-breakdown-reclaim-v1" => "Candidate",
@@ -3156,6 +4261,8 @@ fn strategy_status_rank(status: &str) -> u8 {
 fn matches_setup_filter(row: &HistoricalScreenerRow, setup_filter: &str) -> bool {
     match setup_filter {
         "all" => true,
+        "ma" | "ma-breakout" => row.setup_family == "MA Breakout",
+        "panic" | "panic-reversal" => row.setup_family == "Panic Reversal",
         "breakout" => matches!(row.setup_family.as_str(), "Breakout Setup" | "Breakout Continuation" | "Compression Breakout"),
         "pullback" => row.setup_family == "Pullback To 20 DMA",
         "compression" => row.setup_family == "Compression Breakout",
@@ -3220,6 +4327,16 @@ fn build_signal_ledger_row(
     };
     let entry_price = row.close.max(0.01);
     let quantity = quantity_for_capital(entry_price, PAPER_CAPITAL_PER_SIGNAL);
+    let stop_loss = if row.stop_loss > 0.0 && row.stop_loss < entry_price {
+        row.stop_loss
+    } else {
+        round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0))
+    };
+    let target_price = if row.target_price > entry_price {
+        row.target_price
+    } else {
+        round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0))
+    };
     Ok(SignalLedgerInsertRow {
         signal_key: signal_key_for(row),
         symbol: row.symbol.clone(),
@@ -3230,8 +4347,8 @@ fn build_signal_ledger_row(
         signal_date: row.as_of.clone(),
         entry_price,
         quantity,
-        stop_loss: round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0)),
-        target_price: round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0)),
+        stop_loss,
+        target_price,
         score: row.score,
         source: "historical-screener".to_string(),
         status: "active".to_string(),
@@ -3275,8 +4392,16 @@ async fn stage_signal_to_paper(
     };
     let entry_price = row.close.max(0.01);
     let quantity = quantity_for_capital(entry_price, PAPER_CAPITAL_PER_SIGNAL);
-    let stop_loss = round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0));
-    let target_price = round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0));
+    let stop_loss = if row.stop_loss > 0.0 && row.stop_loss < entry_price {
+        row.stop_loss
+    } else {
+        round2_f64(entry_price * (1.0 - rule.stop_loss_pct / 100.0))
+    };
+    let target_price = if row.target_price > entry_price {
+        row.target_price
+    } else {
+        round2_f64(entry_price * (1.0 + rule.take_profit_pct / 100.0))
+    };
     let trade = paper::PaperTradeRow {
         symbol: row.symbol.clone(),
         company_name: row.symbol.clone(),
@@ -3330,6 +4455,16 @@ struct PaperRule {
 
 fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
     let rule = match strategy_id {
+        "tuned-ma-breakout-v1" => PaperRule {
+            stop_loss_pct: 6.0,
+            take_profit_pct: 12.0,
+            source: "tuned MA breakout lab model",
+        },
+        "tuned-panic-reversal-v1" => PaperRule {
+            stop_loss_pct: 4.0,
+            take_profit_pct: 10.0,
+            source: "tuned panic reversal lab model",
+        },
         "near-52w-high-v1"
         | "near-52w-high-runner-v2"
         | "near-52w-high-volume-v3"
@@ -3420,11 +4555,6 @@ fn read_bamboo_signal_csv(path: &str) -> anyhow::Result<Vec<BambooLatestSignal>>
 
 fn parse_csv_f64(raw: &str) -> f64 {
     raw.parse::<f64>().unwrap_or(0.0)
-}
-
-fn is_nse_trading_day_now() -> bool {
-    let now = now_ist();
-    !is_nse_holiday(now.date_naive())
 }
 
 fn is_regular_session_now() -> bool {

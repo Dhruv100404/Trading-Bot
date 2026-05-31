@@ -30,6 +30,45 @@ export interface LiveSignal {
   score: number
   as_of: string
   trigger_price: number | null
+  trigger_source: string | null
+}
+
+export interface LiveStrategyRow {
+  security_id: string
+  symbol: string
+  company_name: string
+  strategy_id: string
+  strategy_label: string
+  strategy_status: string
+  setup_family: string
+  signal_status: string
+  signal_label: string
+  reason: string
+  score: number
+  last_price: number
+  day_change_pct: number
+  open_gap_pct: number
+  volume: number
+  trigger_price: number | null
+  trigger_source: string | null
+  stop_loss: number
+  target_price: number
+  risk_reward: number
+  source: string
+  updated_at: string
+}
+
+export interface LiveStrategySnapshot {
+  event: string
+  updated_at: string
+  mode: string
+  feed_status: string
+  broker: BrokerStatus
+  market_regime: MarketRegime
+  total_watching: number
+  triggered: number
+  rows: LiveStrategyRow[]
+  message: string | null
 }
 
 export interface SwingCandidate {
@@ -112,6 +151,7 @@ export interface SymbolHistoryResponse {
   updated_at: string
   symbol: string
   range: string
+  source: string
   candles: HistoricalCandle[]
   summary: HistoricalSummary | null
   message: string | null
@@ -142,6 +182,8 @@ export interface HistoricalScreenerRow {
   rs120_rank: number
   market_breadth200: number
   planned_entry: string
+  trigger_price: number | null
+  trigger_source?: string | null
   stop_loss: number
   target_price: number
   risk_reward: number
@@ -318,6 +360,15 @@ export interface BacktestMonthlyReturn {
   return_pct: number
 }
 
+export interface BacktestEquityPoint {
+  strategy_id: string
+  trade_date: string
+  daily_pnl: number
+  cumulative_pnl: number
+  drawdown_rs: number
+  cumulative_return_pct: number
+}
+
 export interface BacktestSymbolResult {
   strategy_id: string
   symbol: string
@@ -402,6 +453,7 @@ export interface BacktestDashboardResponse {
   summaries: BacktestRunSummary[]
   yearly_returns: BacktestYearlyReturn[]
   monthly_returns: BacktestMonthlyReturn[]
+  equity_curve: BacktestEquityPoint[]
   diagnostics: BacktestStrategyDiagnostic[]
   winners: BacktestSymbolResult[]
   losers: BacktestSymbolResult[]

@@ -13,6 +13,8 @@ pub struct Config {
     pub debug: bool,
     pub ws_subscribe_fno_oi: bool,
     pub gemini_api_key: String,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
 }
 
 impl Config {
@@ -34,6 +36,8 @@ impl Config {
             debug: env::var("DEBUG").unwrap_or_default() == "true",
             ws_subscribe_fno_oi: env::var("WS_SUBSCRIBE_FNO_OI").unwrap_or_default() == "true",
             gemini_api_key: env::var("GEMINI_API_KEY").unwrap_or_default(),
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            telegram_chat_id: env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
         })
     }
 }

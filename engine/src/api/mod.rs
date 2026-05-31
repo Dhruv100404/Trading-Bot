@@ -18,6 +18,12 @@ pub struct CachedQuotes {
     pub by_security_id: HashMap<String, QuoteItem>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiveTriggerAlertMarker {
+    pub last_price: f32,
+    pub notified_trigger: Option<f32>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub ch: ChClient,
@@ -26,6 +32,7 @@ pub struct AppState {
     pub config: Config,
     pub quote_cache: Arc<RwLock<Option<CachedQuotes>>>,
     pub quote_fetch_lock: Arc<Mutex<()>>,
+    pub telegram_alert_state: Arc<Mutex<HashMap<String, LiveTriggerAlertMarker>>>,
 }
 
 pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
@@ -36,6 +43,7 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         config: app_config,
         quote_cache: Arc::new(RwLock::new(None)),
         quote_fetch_lock: Arc::new(Mutex::new(())),
+        telegram_alert_state: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new()
@@ -53,6 +61,7 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         .route("/api/swing/scanner",            get(swing::scanner))
         .route("/api/swing/feature-cache/refresh", post(swing::refresh_feature_cache))
         .route("/api/swing/fresh-signals",      post(swing::fresh_signals))
+        .route("/ws/live-strategies",           get(swing::live_strategy_ws))
         .route("/api/swing/bamboo/latest",      get(swing::bamboo_latest))
         .route("/api/swing/historical-screener", get(swing::historical_screener))
         .route("/api/swing/history/:symbol",    get(swing::history))

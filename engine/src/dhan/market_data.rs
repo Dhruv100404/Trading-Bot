@@ -152,7 +152,7 @@ pub struct IntradayResponse {
     #[serde(rename = "close", default)]
     pub close: Vec<f64>,
     #[serde(rename = "timestamp", default)]
-    pub timestamp: Vec<i64>,
+    pub timestamp: Vec<f64>,
     #[serde(rename = "volume", default)]
     pub volume: Vec<f64>,
 }
@@ -162,8 +162,8 @@ pub struct IntradayResponse {
 pub async fn fetch_intraday_candles(
     client: &DhanClient,
     security_id: &str,
-    from_date: &str, // "YYYY-MM-DD"
-    to_date: &str,   // "YYYY-MM-DD"
+    from_date: &str, // "YYYY-MM-DD HH:MM:SS"
+    to_date: &str,   // "YYYY-MM-DD HH:MM:SS"
 ) -> Result<IntradayResponse> {
     #[derive(Serialize)]
     struct Req<'a> {
@@ -172,7 +172,8 @@ pub async fn fetch_intraday_candles(
         #[serde(rename = "exchangeSegment")]
         exchange_segment: &'a str,
         instrument: &'a str,
-        expiry_code: i32,
+        interval: &'a str,
+        oi: bool,
         #[serde(rename = "fromDate")]
         from_date: &'a str,
         #[serde(rename = "toDate")]
@@ -183,7 +184,8 @@ pub async fn fetch_intraday_candles(
         security_id,
         exchange_segment: "NSE_EQ",
         instrument: "EQUITY",
-        expiry_code: 0,
+        interval: "1",
+        oi: false,
         from_date,
         to_date,
     };
@@ -195,27 +197,31 @@ pub async fn fetch_intraday_candles(
             tokio::time::sleep(backoff).await;
         }
 
-        let resp = match client.post("v2/charts/intraday").json(&req_body).send().await {
+        let resp = match client.post("/charts/intraday").json(&req_body).send().await {
             Ok(r) => r,
             Err(e) => { last_err = format!("request error: {}", e); continue; }
         };
 
         let http_status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let preview: String = text.chars().take(300).collect();
 
         if http_status == 429 || http_status == 400 {
-            let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("[INTRADAY] HTTP {} (attempt {}): {}", http_status, attempt + 1, &body[..body.len().min(200)]);
-            last_err = format!("HTTP {}", http_status);
+            tracing::warn!("[INTRADAY] HTTP {} (attempt {}): {}", http_status, attempt + 1, preview);
+            last_err = format!("HTTP {}: {}", http_status, preview);
             continue;
         }
         if http_status >= 500 {
-            last_err = format!("server error {}", http_status);
+            last_err = format!("server error {}: {}", http_status, preview);
             continue;
         }
 
-        let data: IntradayResponse = match resp.json().await {
+        let data: IntradayResponse = match serde_json::from_str(&text) {
             Ok(d) => d,
-            Err(e) => { last_err = format!("json error: {}", e); continue; }
+            Err(e) => {
+                last_err = format!("json error: {} | body: {}", e, preview);
+                continue;
+            }
         };
 
         return Ok(data);
