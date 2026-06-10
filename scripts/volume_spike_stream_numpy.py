@@ -402,20 +402,7 @@ def run(args: argparse.Namespace) -> None:
 
     symbols = load_symbols(args)
     specs = lab.pattern_grid_specs(args) if args.search_grid else []
-    baseline_spec: dict[str, float | int | str] = {
-        "name": "baseline_rv8_v203_cum8_acc3_drop3_gap0.5_m-0.5_0_h30",
-        "bar_rvol_min": float(lab.BAR_RVOL_MIN),
-        "vol20_rvol_min": float(lab.VOL20_RVOL_MIN),
-        "cum_rvol_min": float(lab.CUM_RVOL_MIN),
-        "volume_accel_max": float(lab.VOLUME_ACCEL_MAX),
-        "drop_from_high_min": float(lab.DROP_FROM_HIGH_MIN),
-        "gap_up_min": float(lab.GAP_UP_MIN),
-        "mom15_min": float(lab.MOM15_MIN),
-        "mom15_max": float(lab.MOM15_MAX),
-        "hold_minutes": int(args.hold_minutes),
-        "stop_pct": float(args.stop_pct),
-        "target_pct": float(args.target_pct),
-    }
+    baseline_spec = whole.baseline_spec_from_args(args)
     broad_specs = [*(specs or [baseline_spec]), baseline_spec]
     holds = sorted({int(spec["hold_minutes"]) for spec in broad_specs})
 
@@ -485,6 +472,23 @@ def run(args: argparse.Namespace) -> None:
     summary.to_csv(out_dir / "summary.csv", index=False)
     whole.save_chart_set(out_dir, baseline_daily, "")
     baseline_diag = lab.write_diagnostics("", baseline_tradebook, baseline_daily, out_dir)
+    live_section = ""
+    if args.live_signals:
+        lab.HOLD_MINUTES = int(baseline_spec["hold_minutes"])
+        lab.STOP_PCT = np.float32(args.stop_pct)
+        lab.TARGET_PCT = np.float32(args.target_pct)
+        live_date = str(args.live_date) if args.live_date else (str(dates_np[trade_day_mask].max()) if trade_day_mask.any() else "")
+        live_signals = lab.live_signal_sheet(baseline_tradebook, live_date, str(args.preset))
+        live_signals.to_csv(out_dir / "live_signals.csv", index=False)
+        live_section = f"""
+## Live Signals
+
+- Signal date: `{live_date}`
+- Rows: {live_signals.shape[0]:,}
+- File: `live_signals.csv`
+
+{lab.markdown_table(live_signals, max_rows=50)}
+"""
 
     pattern_results = pd.DataFrame()
     best_tradebook = pd.DataFrame()
@@ -561,6 +565,7 @@ def run(args: argparse.Namespace) -> None:
     report = f"""# Whole-Data One-Pass NumPy Volume-Spike Backtest
 
 - Source parquet glob: `{parquet_dir / args.parquet_glob}`
+- Strategy preset: `{args.preset}`
 - Trade dates: `{args.trade_start_date}` to `{args.trade_end_date}`
 - Universe: `{"all volume_groups symbols" if args.all_symbols else "volume_groups MEGA/LARGE"}`
 - Monthly files used: {len(files):,}
@@ -580,6 +585,8 @@ def run(args: argparse.Namespace) -> None:
 
 {baseline_diag}
 
+{live_section}
+
 {pattern_section}
 
 ## Files
@@ -589,6 +596,7 @@ def run(args: argparse.Namespace) -> None:
 - `summary.csv`
 - `daily_summary.csv`
 - `tradebook.csv`
+- `live_signals.csv` when `--live-signals` is used.
 - `pattern_grid.csv`
 - `best_pattern_tradebook.csv`
 - `best_pattern_daily_summary.csv`
@@ -606,10 +614,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-start-date", default=DEFAULT_START_DATE)
     parser.add_argument("--trade-end-date", default=DEFAULT_END_DATE)
     parser.add_argument("--all-symbols", action="store_true")
+    parser.add_argument(
+        "--preset",
+        choices=["baseline", "candidate60"],
+        default="baseline",
+        help="Baseline rule preset to evaluate from the streamed candidate table.",
+    )
     parser.add_argument("--hold-minutes", type=int, default=int(lab.HOLD_MINUTES))
     parser.add_argument("--stop-pct", type=float, default=float(lab.STOP_PCT))
     parser.add_argument("--target-pct", type=float, default=float(lab.TARGET_PCT))
     parser.add_argument("--round-trip-cost-pct", type=float, default=float(lab.ROUND_TRIP_COST_PCT))
+    parser.add_argument("--live-signals", action="store_true", help="Write latest-session signal sheet for the configured baseline/preset rule.")
+    parser.add_argument("--live-date", default=None, help="Signal date to export. Defaults to latest available trade date in the run.")
     parser.add_argument("--search-grid", action="store_true")
     parser.add_argument("--search-holds", default=lab.SEARCH_HOLDS)
     parser.add_argument("--search-bar-rvol", default=lab.SEARCH_BAR_RVOL)
