@@ -78,8 +78,10 @@ def metric_block(trades: pd.DataFrame, label: str) -> dict:
             "label": label,
             "trades": 0,
             "expectancy_pct": 0.0,
+            "median_return_pct": 0.0,
             "win_rate": 0.0,
             "profit_factor": 0.0,
+            "sharpe_ratio": 0.0,
             "max_drawdown_pct": 0.0,
             "tail_5pct": 0.0,
             "avg_hold": 0.0,
@@ -91,6 +93,11 @@ def metric_block(trades: pd.DataFrame, label: str) -> dict:
     pf = gross_profit / gross_loss if gross_loss > 0 else 99.0
     equity = (1 + r / 10).cumprod()
     dd = equity / equity.cummax() - 1
+    avg_hold = float(trades["hold_days"].mean())
+    std = float(r.std(ddof=0))
+    sharpe = 0.0
+    if std > 0 and avg_hold > 0:
+        sharpe = float(r.mean() / std * math.sqrt(252 / avg_hold))
     return {
         "label": label,
         "trades": int(len(trades)),
@@ -98,9 +105,10 @@ def metric_block(trades: pd.DataFrame, label: str) -> dict:
         "median_return_pct": round(pct(r.median()), 3),
         "win_rate": round(pct(wins.mean()), 2),
         "profit_factor": round(float(pf), 3),
+        "sharpe_ratio": round(sharpe, 3),
         "max_drawdown_pct": round(pct(dd.min()), 2),
         "tail_5pct": round(pct(r.quantile(0.05)), 3),
-        "avg_hold": round(float(trades["hold_days"].mean()), 2),
+        "avg_hold": round(avg_hold, 2),
     }
 
 
@@ -112,24 +120,24 @@ def split_cutoffs(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, pd.Time
 
 
 def score_from_splits(full: dict, train: dict, validation: dict, oos: dict) -> float:
-    sample_bonus = min(full["trades"], 400) / 8
+    sample_bonus = min(full["trades"], 600) / 10
     val_exp = validation["expectancy_pct"]
     oos_exp = oos["expectancy_pct"]
-    train_pf = min(float(train["profit_factor"]), 8.0)
-    validation_pf = min(float(validation["profit_factor"]), 8.0)
-    oos_pf = min(float(oos["profit_factor"]), 8.0)
-    oos_sample_penalty = max(0, 30 - int(oos["trades"])) * 1.2
+    train_sharpe = max(min(float(train["sharpe_ratio"]), 8.0), -4.0)
+    validation_sharpe = max(min(float(validation["sharpe_ratio"]), 8.0), -4.0)
+    oos_sharpe = max(min(float(oos["sharpe_ratio"]), 8.0), -4.0)
+    oos_sample_penalty = max(0, 40 - int(oos["trades"])) * 1.4
     return (
-        validation_pf * 18
-        + oos_pf * 12
-        + train_pf * 6
-        + val_exp * 9
-        + min(oos_exp, 4.0) * 8
-        + full["expectancy_pct"] * 4
+        validation_sharpe * 20
+        + oos_sharpe * 18
+        + train_sharpe * 5
+        + val_exp * 8
+        + min(oos_exp, 5.0) * 9
+        + full["expectancy_pct"] * 3
         + sample_bonus
         - abs(min(validation["max_drawdown_pct"], 0)) * 0.8
-        - abs(min(oos["max_drawdown_pct"], 0)) * 0.35
-        + max(full["tail_5pct"], -12) * 0.4
+        - abs(min(oos["max_drawdown_pct"], 0)) * 0.6
+        + max(full["tail_5pct"], -12) * 0.5
         - oos_sample_penalty
     )
 
@@ -263,8 +271,11 @@ def backtest_ma_breakout(df: pd.DataFrame, tune: MATune, by_symbol: dict[str, Sy
 
     for signal in candidates.itertuples(index=False):
         store = by_symbol[signal.symbol]
-        entry_idx = int(signal.sym_pos)
-        entry = float(signal.entry_trigger)
+        signal_idx = int(signal.sym_pos)
+        entry_idx = signal_idx + 1
+        if entry_idx >= len(store.close):
+            continue
+        entry = float(store.open[entry_idx])
         if entry <= 0 or not math.isfinite(entry):
             continue
         prev_atr = float(signal.prev_atr14)
@@ -284,11 +295,7 @@ def backtest_ma_breakout(df: pd.DataFrame, tune: MATune, by_symbol: dict[str, Sy
         trail_values = store.sma10 if tune.trail_ma == 10 else store.sma20
         dates = store.trade_date
 
-        if float(signal.close) <= stop:
-            weighted_return = float(signal.close) / entry - 1
-            remaining = 0.0
-            exit_reason = "entry_day_failed"
-        for j in range(entry_idx + 1, min(entry_idx + tune.max_hold, len(closes))):
+        for j in range(entry_idx, min(entry_idx + tune.max_hold, len(closes))):
             if remaining <= 0:
                 break
             hold = j - entry_idx + 1
@@ -326,7 +333,7 @@ def backtest_ma_breakout(df: pd.DataFrame, tune: MATune, by_symbol: dict[str, Sy
             "strategy": "tuned_ma_breakout",
             "symbol": signal.symbol,
             "signal_date": signal.trade_date,
-            "entry_date": signal.trade_date,
+            "entry_date": dates[entry_idx],
             "exit_date": exit_date,
             "entry": entry,
             "stop": stop,
@@ -360,17 +367,17 @@ def panic_rank(c: pd.DataFrame) -> pd.DataFrame:
 
 
 def panic_entry_price(low: float, high: float, close: float, tune: PanicTune, next_open: float | None) -> tuple[float | None, int, str]:
+    if next_open is None or not math.isfinite(next_open):
+        return None, 1, "missing_next_open"
     if tune.entry_model == "next_open":
-        if next_open is None or not math.isfinite(next_open):
-            return None, 1, "next_open"
         return float(next_open), 1, "next_open"
     if tune.entry_model == "close":
-        return close, 0, "signal_close"
+        return float(next_open), 1, "close_confirmed_next_open"
     reclaim_fraction = 0.25 if tune.entry_model == "reclaim25" else 0.40
     entry = low + reclaim_fraction * (high - low)
     if close < entry:
-        return None, 0, "unconfirmed_reclaim"
-    return float(entry), 0, tune.entry_model
+        return None, 1, "unconfirmed_reclaim"
+    return float(next_open), 1, f"{tune.entry_model}_next_open"
 
 
 def panic_target(sma20: float, pre_panic_close3: float, signal_low: float, tune: PanicTune, entry: float) -> float | None:
@@ -437,7 +444,7 @@ def backtest_panic(df: pd.DataFrame, tune: PanicTune, by_symbol: dict[str, Symbo
             continue
         pre_panic_close3 = float(signal.pre_panic_close3)
 
-        for j in range(entry_idx + 1, min(entry_idx + tune.max_hold, len(closes))):
+        for j in range(entry_idx, min(entry_idx + tune.max_hold, len(closes))):
             if remaining <= 0:
                 break
             hold = j - entry_idx + 1
@@ -614,18 +621,18 @@ def save_charts(out_dir: Path, ma_results: pd.DataFrame, panic_results: pd.DataF
         plt.figure(figsize=(12, 7))
         plt.barh(top["name"], top["score"], color="#1b998b")
         plt.title(f"Top tuned {name} parameter sets")
-        plt.xlabel("Walk-forward score")
+        plt.xlabel("Sharpe-first walk-forward score")
         plt.tight_layout()
         plt.savefig(chart_dir / f"{name}_top_parameter_scores.png", dpi=160)
         plt.close()
 
         plt.figure(figsize=(9, 6))
-        plt.scatter(results["validation_expectancy_pct"], results["oos_expectancy_pct"], s=22, alpha=0.45, color="#33658a")
+        plt.scatter(results["validation_sharpe_ratio"], results["oos_sharpe_ratio"], s=22, alpha=0.45, color="#33658a")
         plt.axhline(0, color="#333333", linewidth=1)
         plt.axvline(0, color="#333333", linewidth=1)
-        plt.title(f"{name.upper()} validation vs out-of-sample expectancy")
-        plt.xlabel("Validation expectancy %")
-        plt.ylabel("OOS expectancy %")
+        plt.title(f"{name.upper()} validation vs out-of-sample Sharpe")
+        plt.xlabel("Validation Sharpe")
+        plt.ylabel("OOS Sharpe")
         plt.tight_layout()
         plt.savefig(chart_dir / f"{name}_validation_vs_oos.png", dpi=160)
         plt.close()
@@ -789,7 +796,7 @@ def latest_ma_predictions(df: pd.DataFrame, tune: MATune, recent_dates: int = 20
         return pd.DataFrame()
     dates = sorted(candidates["trade_date"].dropna().unique())[-recent_dates:]
     candidates = candidates[candidates["trade_date"].isin(dates)].copy()
-    candidates["entry"] = trigger.loc[candidates.index]
+    candidates["entry"] = candidates["next_open"].where(candidates["next_open"].notna(), candidates["close"])
     candidates["breakout_pct"] = candidates["close"] / candidates[high_col] - 1
     candidates["risk_per_share"] = (candidates["entry"] - np.minimum(candidates["low"], candidates["entry"] - tune.stop_atr_mult * candidates["atr14"])).clip(lower=0.01)
     candidates["stop"] = candidates["entry"] - candidates["risk_per_share"]
@@ -808,7 +815,7 @@ def latest_ma_predictions(df: pd.DataFrame, tune: MATune, recent_dates: int = 20
         "target": ranked["target"].round(2),
         "score": ranked["rank_score"].round(3),
         "close": ranked["close"].round(2),
-        "reason": "20/55D breakout trigger, MA trend alignment, relative strength, volume expansion",
+        "reason": "EOD breakout confirmation; planned fill is next session open when available",
     })
 
 
@@ -834,7 +841,8 @@ def latest_panic_predictions(df: pd.DataFrame, tune: PanicTune, recent_dates: in
     targets = []
     stops = []
     for row in candidates.itertuples(index=False):
-        entry, _, _ = panic_entry_price(float(row.low), float(row.high), float(row.close), tune, None)
+        next_open = float(row.next_open) if pd.notna(row.next_open) else None
+        entry, _, _ = panic_entry_price(float(row.low), float(row.high), float(row.close), tune, next_open)
         entry = entry if entry and math.isfinite(entry) else float(row.close)
         target = panic_target(float(row.sma20), float(row.pre_panic_close3), float(row.low), tune, entry)
         if target is None:
@@ -858,7 +866,7 @@ def latest_panic_predictions(df: pd.DataFrame, tune: PanicTune, recent_dates: in
         "target": candidates["target"].round(2),
         "score": candidates["rank_score"].round(3),
         "close": candidates["close"].round(2),
-        "reason": "capitulation selloff, reclaim/off-low confirmation, volatility expansion",
+        "reason": "EOD panic confirmation; planned fill is next session open when available",
     })
 
 
@@ -945,6 +953,35 @@ def write_report(
 ) -> None:
     best_ma = ma_results.iloc[0].to_dict()
     best_panic = panic_results.iloc[0].to_dict()
+    comparison = pd.DataFrame([
+        {
+            "strategy": "MA Breakout",
+            "best_model": best_ma.get("name"),
+            "score": best_ma.get("score"),
+            "full_trades": best_ma.get("full_trades"),
+            "full_expectancy_pct": best_ma.get("full_expectancy_pct"),
+            "full_sharpe_ratio": best_ma.get("full_sharpe_ratio"),
+            "full_max_drawdown_pct": best_ma.get("full_max_drawdown_pct"),
+            "oos_trades": best_ma.get("oos_trades"),
+            "oos_expectancy_pct": best_ma.get("oos_expectancy_pct"),
+            "oos_sharpe_ratio": best_ma.get("oos_sharpe_ratio"),
+            "oos_max_drawdown_pct": best_ma.get("oos_max_drawdown_pct"),
+        },
+        {
+            "strategy": "Panic Reversal",
+            "best_model": best_panic.get("name"),
+            "score": best_panic.get("score"),
+            "full_trades": best_panic.get("full_trades"),
+            "full_expectancy_pct": best_panic.get("full_expectancy_pct"),
+            "full_sharpe_ratio": best_panic.get("full_sharpe_ratio"),
+            "full_max_drawdown_pct": best_panic.get("full_max_drawdown_pct"),
+            "oos_trades": best_panic.get("oos_trades"),
+            "oos_expectancy_pct": best_panic.get("oos_expectancy_pct"),
+            "oos_sharpe_ratio": best_panic.get("oos_sharpe_ratio"),
+            "oos_max_drawdown_pct": best_panic.get("oos_max_drawdown_pct"),
+        },
+    ])
+    preferred = "Panic Reversal" if float(best_panic.get("score", 0)) >= float(best_ma.get("score", 0)) else "MA Breakout"
     report = out_dir / "final_report.md"
     lines = [
         "# Complex Strategy Tuning Lab",
@@ -954,18 +991,25 @@ def write_report(
         "- Qullamaggie/Lance moving-average trend breakout.",
         "- Lance panic/capitulation reversal.",
         "",
-        "The first pass used daily next-open approximations. This pass tunes the actual Python strategy logic: entry model, filters, partial exits, breakeven behavior, and trail style.",
+        "This pass uses no-lookahead daily execution: signals are formed only after the full daily candle is known, and historical fills happen at the next trading session open.",
         "",
         "Speed note: the hot simulation loop uses precomputed NumPy arrays per symbol. Pandas is only used for feature engineering, ranking, and reporting.",
-        "Scoring note: profit factor is capped inside the optimizer score and small out-of-sample windows are penalized so tiny no-loss samples do not dominate the leaderboard.",
+        "Scoring note: the leaderboard is Sharpe-first. Profit factor is still exported for compatibility, but it is not used in the optimizer score.",
+        "Sharpe note: because this is a trade-log backtest, Sharpe is approximated from per-trade returns and annualized by average holding period. It is best used for comparing these parameter sets, not as a brokerage-grade portfolio Sharpe.",
         "",
         "## Why real-life winners can fail naive backtests",
         "",
-        "1. Real entries are intraday; next-open backtests often buy too late.",
+        "1. Real entries are intraday, but daily-candle backtests must use next-session fills unless an intraday replay proves the event order.",
         "2. Discretionary traders wait for confirmation: failed low, reclaim, ORH break, higher low, or volume confirmation.",
         "3. The best trades are rare and clustered in specific regimes.",
         "4. The local data is NSE stock history, not Nikkei futures, Nasdaq futures, Apple, Nvidia, or yen carry panic data.",
         "5. Daily OHLC cannot prove exact event order inside the candle.",
+        "",
+        "## Sharpe-first conclusion",
+        "",
+        comparison.to_markdown(index=False),
+        "",
+        f"Decision: prefer `{preferred}` as the active small-swing research candidate. Keep the other model as secondary confirmation unless its future out-of-sample Sharpe and drawdown improve.",
         "",
         "## Best tuned MA breakout",
         "",
@@ -1005,7 +1049,7 @@ def write_report(
         "",
         "## Production read",
         "",
-        "The tuned backtests should be treated as a research engine, not a magic JSON config. The useful output is the parameter behavior: which filters survive validation, which exits carry the edge, and where out-of-sample breaks.",
+        "The tuned backtests should be treated as a research engine, not a magic JSON config. The useful output is the parameter behavior after enforcing next-session fills: which filters survive validation, which exits carry the edge, and where out-of-sample breaks.",
         "",
         "For production, the next upgrade is an intraday event simulator that reads minute buckets only for selected candidate days and verifies sequence: low made first, reclaim triggered, higher low held, then entry fired.",
     ]

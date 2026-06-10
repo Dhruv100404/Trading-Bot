@@ -254,7 +254,14 @@ def cap_candidates(candidates: pd.DataFrame, max_new_per_week: int) -> pd.DataFr
     )
 
 
-def exit_trade(rows: pd.DataFrame, entry_idx: int, entry: float, max_hold_weeks: int) -> dict[str, object]:
+def exit_trade(
+    rows: pd.DataFrame,
+    entry_idx: int,
+    entry: float,
+    max_hold_weeks: int,
+    *,
+    allow_entry_week_targets: bool = True,
+) -> dict[str, object]:
     target1 = entry * 1.40
     target2 = target1 * 1.40
     remaining = 1.0
@@ -270,11 +277,12 @@ def exit_trade(rows: pd.DataFrame, entry_idx: int, entry: float, max_hold_weeks:
         row = rows.iloc[j]
         high = float(row["high"])
 
-        if not hit_t1 and high >= target1:
+        can_take_target = allow_entry_week_targets or j > entry_idx
+        if can_take_target and not hit_t1 and high >= target1:
             weighted_return += 0.40 * (target1 / entry - 1)
             remaining -= 0.40
             hit_t1 = True
-        if not hit_t2 and high >= target2:
+        if can_take_target and not hit_t2 and high >= target2:
             weighted_return += 0.40 * (target2 / entry - 1)
             remaining -= 0.40
             hit_t2 = True
@@ -341,7 +349,7 @@ def backtest_candidates(features: pd.DataFrame, candidates: pd.DataFrame, config
             trigger_price = float(signal.high) * 1.001
             found = None
             for j in range(signal_idx + 1, min(len(rows), signal_idx + config.trigger_window_weeks + 1)):
-                if int(rows.iloc[j]["st_dir"]) != 1:
+                if j > signal_idx + 1 and int(rows.iloc[j - 1]["st_dir"]) != 1:
                     break
                 if float(rows.iloc[j]["high"]) >= trigger_price:
                     found = j
@@ -358,7 +366,13 @@ def backtest_candidates(features: pd.DataFrame, candidates: pd.DataFrame, config
         if entry_idx >= len(rows) or entry <= 0 or not math.isfinite(entry):
             continue
 
-        result = exit_trade(rows, entry_idx, entry, config.max_hold_weeks)
+        result = exit_trade(
+            rows,
+            entry_idx,
+            entry,
+            config.max_hold_weeks,
+            allow_entry_week_targets=mode != "king",
+        )
         blocked_until[symbol] = int(result["exit_idx"]) + 1
         entry_row = rows.iloc[entry_idx]
         trades.append(
@@ -520,6 +534,7 @@ def write_report(
         "- Weekly bullish candle: green body, large body/range, close near high, open near low.",
         "- Requires range expansion, volume expansion, relative strength, Supertrend positive, and a 20-week high breakout.",
         "- Entry is a stop-style trigger above the King candle high within the next 4 weeks.",
+        "- The trigger window only uses Supertrend states from completed weeks; targets are not credited inside the same weekly candle that triggered the entry.",
         "- Uses the same 40/40/20 profit booking and weekly Supertrend trailing exit.",
         "",
         "### King Candle Quality Breakout",

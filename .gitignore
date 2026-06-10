@@ -35,3 +35,4 @@ docs/quant_research_outputs/
 *.csv
 
 parquets/
+docs/

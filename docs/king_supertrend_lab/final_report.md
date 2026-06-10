@@ -27,6 +27,7 @@ This is a first explicit backtest of the pasted Vijay Khant style rules on local
 - Weekly bullish candle: green body, large body/range, close near high, open near low.
 - Requires range expansion, volume expansion, relative strength, Supertrend positive, and a 20-week high breakout.
 - Entry is a stop-style trigger above the King candle high within the next 4 weeks.
+- The trigger window only uses Supertrend states from completed weeks; targets are not credited inside the same weekly candle that triggered the entry.
 - Uses the same 40/40/20 profit booking and weekly Supertrend trailing exit.
 
 ### King Candle Quality Breakout
@@ -40,8 +41,8 @@ This is a first explicit backtest of the pasted Vijay Khant style rules on local
 | Strategy | Trades | Win % | Avg % | Median % | PF | Max DD pct-pts | Avg hold wks | T1 hit | T2 hit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Weekly Supertrend 10-3 | 1,470 | 47.01 | 11.472 | -2.549 | 2.136 | -3122.640 | 38.60 | 39.52 | 19.25 |
-| King Candle Supertrend Breakout | 1,050 | 49.24 | 13.197 | -1.281 | 2.267 | -2483.900 | 39.57 | 42.38 | 21.71 |
-| King Candle Quality Breakout | 392 | 51.28 | 12.476 | 1.896 | 2.084 | -734.816 | 36.73 | 42.86 | 22.19 |
+| King Candle Supertrend Breakout | 1,051 | 49.19 | 13.106 | -1.400 | 2.250 | -2483.900 | 39.53 | 42.34 | 21.69 |
+| King Candle Quality Breakout | 393 | 51.15 | 12.236 | 1.749 | 2.047 | -734.816 | 36.65 | 42.75 | 22.14 |
 
 ## Weekly Supertrend 10-3 yearly
 
@@ -58,7 +59,7 @@ This is a first explicit backtest of the pasted Vijay Khant style rules on local
 
 |   year |   trades |   win_rate |   avg_return_pct |   return_proxy_pct |
 |-------:|---------:|-----------:|-----------------:|-------------------:|
-|   2021 |      124 |      33.06 |            6.599 |            818.256 |
+|   2021 |      125 |      32.8  |            5.888 |            735.978 |
 |   2022 |      191 |      45.03 |           17.448 |           3332.57  |
 |   2023 |      273 |      79.49 |           40.223 |          10980.8   |
 |   2024 |      228 |      33.77 |           -3.962 |           -903.381 |
@@ -69,7 +70,7 @@ This is a first explicit backtest of the pasted Vijay Khant style rules on local
 
 |   year |   trades |   win_rate |   avg_return_pct |   return_proxy_pct |
 |-------:|---------:|-----------:|-----------------:|-------------------:|
-|   2021 |       20 |      25    |           -1.418 |            -28.356 |
+|   2021 |       21 |      23.81 |           -5.246 |           -110.171 |
 |   2022 |       74 |      43.24 |           10.379 |            768.049 |
 |   2023 |       98 |      77.55 |           42.415 |           4156.69  |
 |   2024 |       98 |      38.78 |           -2.094 |           -205.178 |
