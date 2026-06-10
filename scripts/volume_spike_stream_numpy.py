@@ -420,6 +420,14 @@ def run(args: argparse.Namespace) -> None:
         key = monthly_file_key(path) or path.stem
         candidate_path = chunks_dir / f"candidates_{key}.parquet"
         dates_path = chunks_dir / f"dates_{key}.csv"
+        if args.resume_candidates and candidate_path.exists() and dates_path.exists():
+            log(f"{key}: resuming candidates")
+            dates = pd.read_csv(dates_path)["date"].to_numpy(dtype="datetime64[D]")
+            if dates.size:
+                trading_dates.append(dates)
+            if candidate_path.exists():
+                candidate_files.append(candidate_path)
+            continue
         log(f"{key}: reading file {idx}/{len(files)}")
         candidates, dates, prev_close_state, processed_days = extract_month_candidates(
             path,
