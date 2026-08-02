@@ -70,3 +70,39 @@ Run Backtest
 ```
 
 The UI should also show the last cached timestamp so it is clear whether the user is seeing fresh data or stored data.
+
+## Daily Data Operations
+
+The cache is intentionally not rebuilt merely by opening the workspace. Run the
+following host-side command after the NSE close on each trading day instead:
+
+```powershell
+.\scripts\refresh_daily_screener.ps1
+```
+
+It performs the required sequence safely:
+
+1. `download_parquet.py` audits the current and previous monthly OHLCV files
+   and fetches only missing trading days from Dhan. It does not use `--force`.
+2. `POST /api/swing/feature-cache/refresh` rebuilds
+   `trading.daily_screener_features` from the monthly parquet files.
+3. The command fails if the API returns no usable data date or zero cached
+   symbols, or if the returned date is more than five calendar days old. It
+   otherwise prints the exact cache date and row count. Use
+   `-MaximumDataAgeDays 0` for a strict post-close freshness check.
+
+When raw parquet files have already been updated by another process, rebuild
+only the scanner cache:
+
+```powershell
+.\scripts\refresh_daily_screener.ps1 -SkipDownload
+```
+
+Use `-AllMonths` only to repair historical gaps; daily operations should retain
+the default two-month audit window. `-WhatIf` previews the operations without
+changing parquet data or the feature cache.
+
+The endpoint reads root monthly files named `parquets/candles_YYYYMM.parquet`.
+The downloader's `--day` mode writes separate files below `parquets/daily/` for
+research and does **not** feed the scanner cache until those rows are merged
+into the monthly files. For the live scanner, use the default monthly mode.

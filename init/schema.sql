@@ -154,6 +154,108 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY ts
 TTL ts + INTERVAL 90 DAY;
 
+CREATE TABLE IF NOT EXISTS trading.news_articles (
+    article_id        String,
+    source            LowCardinality(String),
+    source_kind       LowCardinality(String),
+    category          LowCardinality(String),
+    title             String,
+    url               String,
+    summary           String,
+    published_at      Nullable(DateTime('Asia/Kolkata')),
+    fetched_at        DateTime('Asia/Kolkata'),
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+PARTITION BY toYYYYMM(fetched_at)
+ORDER BY (source, article_id)
+TTL fetched_at + INTERVAL 45 DAY;
+
+CREATE TABLE IF NOT EXISTS trading.news_mentions (
+    article_id        String,
+    symbol            String,
+    security_id       String,
+    company_name      String,
+    match_confidence  Float32,
+    matched_text      String,
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+ORDER BY (article_id, symbol)
+TTL inserted_at + INTERVAL 45 DAY;
+
+CREATE TABLE IF NOT EXISTS trading.news_scores (
+    article_id        String,
+    symbol            String,
+    sentiment         Float32,
+    impact_score      Float32,
+    direction         LowCardinality(String),
+    horizon           LowCardinality(String),
+    confidence        Float32,
+    reason            String,
+    model             LowCardinality(String),
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+ORDER BY (article_id, symbol)
+TTL inserted_at + INTERVAL 45 DAY;
+
+CREATE TABLE IF NOT EXISTS trading.nse_large_deals (
+    deal_id           String,
+    deal_type         LowCardinality(String),
+    deal_date         Date,
+    deal_date_raw     String,
+    symbol            String,
+    security_name     String,
+    client_name       String,
+    side              LowCardinality(String),
+    quantity          Float64,
+    price             Float64,
+    value_lakh        Float64,
+    source_url        String,
+    fetched_at        DateTime('Asia/Kolkata'),
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+PARTITION BY toYYYYMM(deal_date)
+ORDER BY (deal_date, deal_type, symbol, client_name, side, deal_id)
+TTL fetched_at + INTERVAL 180 DAY;
+
+CREATE TABLE IF NOT EXISTS trading.market_activity_snapshots (
+    row_id            String,
+    snapshot_at       DateTime('Asia/Kolkata'),
+    trading_date      Date,
+    source            LowCardinality(String),
+    metric_type       LowCardinality(String),
+    exchange          LowCardinality(String),
+    index_name        LowCardinality(String),
+    rank              UInt32,
+    symbol            String,
+    stock_name        String,
+    moneycontrol_id   String,
+    slug              String,
+    price             Float64,
+    change_abs        Float64,
+    change_pct        Float64,
+    day_high          Float64,
+    day_low           Float64,
+    open              Float64,
+    prev_close        Float64,
+    volume            UInt64,
+    avg_volume        UInt64,
+    volume_multiplier Float64,
+    volume_change_pct Float64,
+    value_cr          Float64,
+    vwap              Float64,
+    direction         LowCardinality(String),
+    mcap_cr           Float64,
+    month_return_pct  Float64,
+    month3_return_pct Float64,
+    share_url         String,
+    source_url        String,
+    fetched_at        DateTime('Asia/Kolkata'),
+    inserted_at       DateTime DEFAULT now()
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(trading_date)
+ORDER BY (trading_date, metric_type, exchange, index_name, snapshot_at, rank, symbol)
+TTL snapshot_at + INTERVAL 180 DAY;
+
 CREATE TABLE IF NOT EXISTS trading.gap15_config (
     total_capital      UInt32,
     leverage           UInt32,
@@ -186,10 +288,7 @@ CREATE TABLE IF NOT EXISTS trading.tier_state (
 ) ENGINE = ReplacingMergeTree(inserted_at)
 ORDER BY tier_name;
 
-INSERT INTO trading.tier_state (tier_name, enabled) VALUES
-    ('F&O', 0), ('Nifty50', 0), ('Nifty500', 0),
-    ('AllNSE', 0), ('NSEActive', 0),
-    ('Tier1', 0), ('Tier2', 0), ('Margin4x', 0), ('Liquid5L', 0);
+INSERT INTO trading.tier_state (tier_name, enabled) VALUES ('F&O', 0), ('Nifty50', 0), ('Nifty500', 0), ('AllNSE', 0), ('NSEActive', 0), ('Tier1', 0), ('Tier2', 0), ('Margin4x', 0), ('Liquid5L', 0);
 
 CREATE TABLE IF NOT EXISTS trading.volume_group_state (
     group_name   String,

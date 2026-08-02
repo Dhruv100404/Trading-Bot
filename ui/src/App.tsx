@@ -14,22 +14,32 @@ import {
   CircleAlert,
   Compass,
   Database,
+  ExternalLink,
+  Filter,
   Landmark,
   LayoutDashboard,
   ListTodo,
+  Newspaper,
   Radar,
   RefreshCw,
+  Search,
   Sparkles,
   Target,
   TrendingUp,
   WalletCards,
+  Zap,
 } from 'lucide-react'
 import {
   getBrokerAccounts,
   getBacktestDashboard,
   getBacktestDatewise,
   getBambooLatest,
+  getCorporateEvents,
   getHistoricalScreener,
+  getMarketActivity,
+  getNews,
+  getNewsPredictionHistory,
+  getNseLargeDeals,
   closePaperTrade,
   deletePaperTrade,
   getPaperBudget,
@@ -42,6 +52,8 @@ import {
   pythonBacktestChartUrl,
   refreshBacktestCache,
   refreshFeatureCache,
+  refreshMarketActivity,
+  refreshNews,
   runBacktest,
   runPythonBacktestLab,
   savePaperTrade,
@@ -50,10 +62,18 @@ import {
   type BrokerStatus,
   type BacktestDashboardResponse,
   type BacktestCacheStatus,
+  type BacktestCashEquityPoint,
+  type BacktestCashProfile,
   type BacktestDatewiseResponse,
   type BacktestDayQuality,
   type BacktestEquityPoint,
   type BacktestRunSummary,
+  type BacktestPrediction,
+  type CorporateEvent,
+  type ConfluenceFinding,
+  type ConfluenceNewsArticle,
+  type ConfluenceNewsSummary,
+  type ConfluenceScoreBreakdown,
   type BacktestStrategyDiagnostic,
   type PythonBacktestLabResponse,
   type PythonBacktestMetricRow,
@@ -66,8 +86,14 @@ import {
   type LiveStrategySnapshot,
   type LiveStrategyRow,
   type LiveSignal,
+  type MarketActivityItem,
+  type MarketActivityRefreshResult,
+  type NewsItem,
+  type NewsRefreshResult,
+  type NseLargeDeal,
   type PaperTrade,
   type PaperBudget,
+  type ResearchConfluence,
   type SymbolHistoryResponse,
   type SwingCandidate,
   type SwingHomeResponse,
@@ -75,7 +101,7 @@ import {
   type SetupMix,
 } from './api'
 
-type View = 'home' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'settings' | 'stock'
+type View = 'home' | 'market' | 'scanner' | 'watchlist' | 'portfolio' | 'backtests' | 'settings' | 'stock'
 type HistoryRange = '1d' | '3m' | '6m' | '1y' | '3y' | '5y'
 type PaperDeskTab = 'open' | 'closed' | 'weekly' | 'strategy' | 'intake'
 
@@ -88,6 +114,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Dashboard', icon: LayoutDashboard, blurb: 'Market, risk, and top picks' },
+  { id: 'market', label: 'Market Hub', icon: Activity, blurb: 'News, deals, and volume shockers' },
   { id: 'scanner', label: 'Scanner', icon: Radar, blurb: 'Strategy-first signal board' },
   { id: 'watchlist', label: 'Watchlist', icon: Bookmark, blurb: 'Organize stocks to monitor' },
   { id: 'backtests', label: 'Backtest', icon: BarChart3, blurb: 'Strategy returns and trades' },
@@ -98,7 +125,7 @@ const NAV_ITEMS: NavItem[] = [
 const WATCHLIST_STORAGE_KEY = 'swing-watchlist'
 const LIVE_ALERTS_STORAGE_KEY = 'swing-live-trigger-alerts'
 const PAPER_CAPITAL_PER_STOCK = 50000
-const PAPER_HOLD_SESSIONS = 5
+const PAPER_HOLD_SESSIONS = 10
 const AUTO_PAPER_MAX_SUGGESTIONS = 7
 const MIN_BACKTEST_STRATEGY_TRADES = 30
 const NSE_HOLIDAYS = new Set([
@@ -112,6 +139,180 @@ const NSE_HOLIDAYS = new Set([
 ])
 
 type Tone = 'positive' | 'warning' | 'danger' | 'neutral'
+type ScannerDisplayRow = HistoricalScreenerRow & {
+  company_name?: string
+  source?: string
+  signal_status?: LiveSignal['status']
+  confluence?: ResearchConfluence
+}
+type ResearchCommitteeState = 'ENTRY_NOW' | 'ARMED' | 'WATCH'
+
+interface ResearchCommitteePick {
+  rank: number
+  symbol: string
+  companyName: string
+  primary: ScannerDisplayRow
+  state: ResearchCommitteeState
+  researchScore: number
+  committeeScore: number
+  pillarCount: number
+  conflictCount: number
+  modelFamilies: string[]
+  news?: ConfluenceNewsSummary
+  newsTone: Tone
+  reason: string
+}
+
+interface StrategyPlaybookEntry {
+  name: string
+  disposition: string
+  tone: Tone
+  parameters: string
+}
+
+interface StrategyPlaybookPillar {
+  name: string
+  description: string
+  entries: StrategyPlaybookEntry[]
+}
+
+const RESEARCH_COMMITTEE_PICK_LIMIT = 5
+const RESEARCH_COMMITTEE_MIN_PILLARS = 3
+const RESEARCH_COMMITTEE_MIN_MODEL_FAMILIES = 2
+const RESEARCH_COMMITTEE_MAX_CONFLICTS = 1
+const RESEARCH_COMMITTEE_MIN_RISK_REWARD = 2
+
+const STRATEGY_PLAYBOOK_PILLARS: StrategyPlaybookPillar[] = [
+  {
+    name: 'Trend breakout',
+    description: 'Multiple 52W, momentum, breakout, compression, and relative-strength labels describe one correlated trend pillar.',
+    entries: [
+      {
+        name: 'Momentum Core',
+        disposition: 'Keep · primary',
+        tone: 'positive',
+        parameters: 'Within 3% of 52W high · ≥85% through range · close > SMA20 > SMA50 · score ≥92 · trigger 0.1% above 52W high.',
+      },
+      {
+        name: '52W Runner',
+        disposition: 'Rejected',
+        tone: 'danger',
+        parameters: 'Within 3% · uptrend · volume ≥0.8× · score ≥90. It is a weaker Momentum Core variant.',
+      },
+      {
+        name: '52W Volume',
+        disposition: 'Fragile',
+        tone: 'warning',
+        parameters: 'Within 6% of 52W high · volume ≥1.15× · range position ≥75% · score ≥88.',
+      },
+      {
+        name: 'Near 52W High',
+        disposition: 'Fragile',
+        tone: 'warning',
+        parameters: 'Within 8% of 52W high · close > SMA50 · score ≥80. This is the basic fallback trend label.',
+      },
+      {
+        name: 'Breakout Continuation',
+        disposition: 'Watch only',
+        tone: 'warning',
+        parameters: 'Clear 20D high · close location ≥60% · volume ≥1.1× · score ≥88.',
+      },
+      {
+        name: 'Compression Breakout',
+        disposition: 'Watch only',
+        tone: 'warning',
+        parameters: 'Breakout + volume ≥1.05× · ATR% <8 · candle range ≤ max(1.05× ATR%, 1.5) · score ≥88.',
+      },
+      {
+        name: 'RS Leader Continuation',
+        disposition: 'Watch only',
+        tone: 'warning',
+        parameters: 'RS60 ≥75th percentile · RS120 ≥65th · close > SMA50 · near 52W high or 55D/252D breakout · score ≥86.',
+      },
+      {
+        name: 'Swing Breakout',
+        disposition: 'Rejected',
+        tone: 'danger',
+        parameters: 'Fallback 20D breakout; trigger is prior 20D high +0.1%. It should not be counted separately from the trend pillar.',
+      },
+    ],
+  },
+  {
+    name: 'Pullback / reclaim',
+    description: 'These are counter-trend entries inside an uptrend, not a second vote for the same breakout.',
+    entries: [
+      {
+        name: 'Pullback Quality',
+        disposition: 'Rejected',
+        tone: 'danger',
+        parameters: 'Uptrend · within roughly 2–3% of SMA20 · volume ≥0.8× · close ≥SMA20 · score ≥88.',
+      },
+      {
+        name: 'Pullback 20DMA',
+        disposition: 'Rejected',
+        tone: 'danger',
+        parameters: 'Lower-quality SMA20 pullback fallback; same underlying family as Pullback Quality, never a separate confirmation.',
+      },
+    ],
+  },
+  {
+    name: 'Reversal',
+    description: 'Mean-reversion ideas remain research until they receive current validation and a clear entry trigger.',
+    entries: [
+      {
+        name: 'RSI10 Pullback Reversion',
+        disposition: 'Research only · unvalidated',
+        tone: 'neutral',
+        parameters: 'Close > SMA200 and RSI(10) <30. There is no explicit live trigger price, so it cannot become Entry Now automatically.',
+      },
+      {
+        name: 'Failed Breakdown Reclaim',
+        disposition: 'Research only · unvalidated',
+        tone: 'neutral',
+        parameters: 'Undercut prior 20D low then reclaim · close location ≥65% · volume ≥0.8× · score ≥86.',
+      },
+      {
+        name: 'Tuned Panic Reversal',
+        disposition: 'Watch / research',
+        tone: 'warning',
+        parameters: '3D return ≤−8% · range ≥1.35 ATR · close location ≥64% · recovery-low ≥1.2 · trigger after a 25% recovery.',
+      },
+    ],
+  },
+]
+
+const STRATEGY_PLAYBOOK_RESEARCH_FEEDS: StrategyPlaybookEntry[] = [
+  {
+    name: 'Weekly Supertrend 10,3',
+    disposition: 'Fresh-weekly confirmation only',
+    tone: 'warning',
+    parameters: 'Weekly Supertrend ATR(10)×3 + ₹50 minimum + 20W liquidity + breadth ≥35% + RS13W ≥50th percentile. Stale weekly rows are quarantined.',
+  },
+  {
+    name: 'King Candle Quality',
+    disposition: 'Fresh-weekly confirmation only',
+    tone: 'warning',
+    parameters: 'Weekly Supertrend positive · body/range ≥85% · close location ≥78% · range ≥1.15 ATR · rel. volume ≥1.2× · RS13W ≥85% · 20W breakout. Loose variant is backtest-only.',
+  },
+  {
+    name: 'King Candle Supertrend (loose)',
+    disposition: 'Backtest research only',
+    tone: 'neutral',
+    parameters: 'Looser weekly version: body/range ≥65% and RS13W ≥55%. It is never a live Top Pick and remains correlated with King Candle Quality.',
+  },
+  {
+    name: 'Bamboo MTF Breakout (six variants)',
+    disposition: 'Research only',
+    tone: 'neutral',
+    parameters: 'Long-base/daily breakout family: SMA50/SMA200 trend · ₹50 minimum · 20D breakout · relative volume ≥1.1× · close location ≥65%.',
+  },
+  {
+    name: 'Unlinked Screener',
+    disposition: 'Never eligible',
+    tone: 'danger',
+    parameters: 'Catch-all raw MA/breakout row without a linked validated strategy. It stays out of Top Picks.',
+  },
+]
 
 interface BacktestPaperRule {
   stopLossPct: number
@@ -120,11 +321,6 @@ interface BacktestPaperRule {
 }
 
 const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
-  'tuned-ma-breakout-v1': {
-    stopLossPct: 6,
-    takeProfitPct: 12,
-    source: 'tuned MA breakout lab model',
-  },
   'tuned-panic-reversal-v1': {
     stopLossPct: 4,
     takeProfitPct: 10,
@@ -141,11 +337,6 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
     source: 'near-52w-high backtest family',
   },
   'near-52w-high-volume-v3': {
-    stopLossPct: 5,
-    takeProfitPct: 10,
-    source: 'near-52w-high backtest family',
-  },
-  'near-52w-high-tight-v2': {
     stopLossPct: 5,
     takeProfitPct: 10,
     source: 'near-52w-high backtest family',
@@ -174,11 +365,6 @@ const BACKTEST_PAPER_RULES: Record<string, BacktestPaperRule> = {
     stopLossPct: 4,
     takeProfitPct: 8,
     source: 'engine swing-breakout model',
-  },
-  'breakout-volume-v2': {
-    stopLossPct: 4,
-    takeProfitPct: 8,
-    source: 'swing-breakout backtest family',
   },
   'failed-breakdown-reclaim-v1': {
     stopLossPct: 4,
@@ -279,6 +465,389 @@ function compactDate(value: string | null | undefined) {
       })
 }
 
+function marketDateAgeDays(value: string | null | undefined) {
+  if (!value) return Number.POSITIVE_INFINITY
+  const normalized = value.includes('T') ? value : value.includes(' ') ? `${value.replace(' ', 'T')}+05:30` : `${value}T00:00:00+05:30`
+  const timestamp = new Date(normalized).getTime()
+  return Number.isNaN(timestamp) ? Number.POSITIVE_INFINITY : Math.floor((Date.now() - timestamp) / 86_400_000)
+}
+
+function marketTimestamp(value: string | null | undefined) {
+  if (!value) return 'Time unavailable'
+  const normalized = value.includes('T') ? value : value.includes(' ') ? `${value.replace(' ', 'T')}+05:30` : `${value}T00:00:00+05:30`
+  const date = new Date(normalized)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatSourceName(source: string) {
+  return (source || 'source')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (match) => match.toUpperCase())
+}
+
+function readableLabel(value: string | null | undefined, fallback = 'Not calculated') {
+  if (!value) return fallback
+  return value
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (match) => match.toUpperCase())
+}
+
+function asFiniteNumber(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function confluencePillarCount(confluence: ResearchConfluence | undefined) {
+  const declared = asFiniteNumber(confluence?.pillar_count)
+  if (declared !== null) return Math.max(0, Math.round(declared))
+  return confluence?.strategy_matches?.length ?? 0
+}
+
+function confluenceStrategyCount(confluence: ResearchConfluence | undefined) {
+  return confluence?.strategy_matches?.length ?? 0
+}
+
+function confluenceTradeState(confluence: ResearchConfluence | undefined) {
+  return confluence?.trade_state || confluence?.research_state || confluence?.confluence_state
+}
+
+function researchTone(confluence: ResearchConfluence | undefined, fallbackScore?: number): Tone {
+  const state = confluenceTradeState(confluence)?.toUpperCase() ?? ''
+  if (/(INVALID|NO[_ -]?TRADE|REJECT|CONFLICT|RISK)/.test(state)) return 'danger'
+  if (/(ENTRY|CONFIRM|READY|SUPPORTED|QUALIFIED)/.test(state)) return 'positive'
+  if (/(WATCH|ARM|WAIT|REVIEW)/.test(state)) return 'warning'
+  if ((fallbackScore ?? 0) >= 85) return 'positive'
+  return 'neutral'
+}
+
+function newsTone(news: ConfluenceNewsSummary | undefined): Tone {
+  if (!news) return 'neutral'
+  const direction = news.direction?.toUpperCase() ?? ''
+  const bullish = asFiniteNumber(news.bullish_articles) ?? 0
+  const bearish = asFiniteNumber(news.bearish_articles) ?? 0
+  if (direction.includes('BEAR') || bearish > bullish) return 'danger'
+  if (direction.includes('BULL') || bullish > bearish) return 'positive'
+  if (direction.includes('WATCH') || direction.includes('CAUTION')) return 'warning'
+  return 'neutral'
+}
+
+function researchCommitteeStateForRow(row: ScannerDisplayRow): ResearchCommitteeState | null {
+  const declared = (confluenceTradeState(row.confluence) ?? '').toUpperCase()
+  if (/(ENTRY[ _-]?(READY|NOW)|CONFIRMED)/.test(declared)) return 'ENTRY_NOW'
+  if (/(ARMED|WAIT[ _-]?FOR[ _-]?TRIGGER)/.test(declared)) return 'ARMED'
+  if (/WATCH/.test(declared)) return 'WATCH'
+
+  const state = `${row.signal_status ?? ''} ${row.trend_label ?? ''}`.toUpperCase()
+  if (/(ENTRY[ _-]?(READY|NOW)|ENTER NOW)/.test(state)) return 'ENTRY_NOW'
+  if (/(ARMED|WAIT[ _-]?FOR[ _-]?TRIGGER|SIGNAL READY)/.test(state)) return 'ARMED'
+  if (/WATCH/.test(state)) return 'WATCH'
+  if (row.strategy_status === 'Candidate') return 'ARMED'
+  if (row.strategy_status === 'Watch') return 'WATCH'
+  return null
+}
+
+function researchCommitteeStateRank(state: ResearchCommitteeState) {
+  if (state === 'ENTRY_NOW') return 3
+  if (state === 'ARMED') return 2
+  return 1
+}
+
+function researchCommitteeStateLabel(state: ResearchCommitteeState) {
+  if (state === 'ENTRY_NOW') return 'Entry Now'
+  if (state === 'ARMED') return 'Armed'
+  return 'Watch'
+}
+
+function researchCommitteeStateTone(state: ResearchCommitteeState): Tone {
+  if (state === 'ENTRY_NOW') return 'positive'
+  if (state === 'ARMED') return 'warning'
+  return 'neutral'
+}
+
+function researchCommitteeExcluded(row: ScannerDisplayRow) {
+  const values = [
+    row.strategy_status,
+    row.trend_label,
+    confluenceTradeState(row.confluence),
+    row.confluence?.confluence_state,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toUpperCase()
+  return /(NO[ _-]?TRADE|INVALID|REJECT|FRAGILE|WATCH|BLOCKED)/.test(values)
+}
+
+function researchCommitteeCurrent(row: ScannerDisplayRow) {
+  if (row.source !== 'dhan-live') return false
+  const ageDays = marketDateAgeDays(row.as_of)
+  if (Number.isFinite(ageDays) && ageDays > 4) return false
+  return row.strategy_status === 'Candidate'
+}
+
+function researchCommitteeApprovedTradeState(row: ScannerDisplayRow) {
+  const state = (confluenceTradeState(row.confluence) ?? '').toUpperCase()
+  return /(ENTRY[ _-]?(READY|NOW)|CONFIRMED|ARMED|WAIT[ _-]?FOR[ _-]?TRIGGER)/.test(state)
+}
+
+function researchCommitteeScore(row: ScannerDisplayRow) {
+  const score = asFiniteNumber(row.confluence?.research_score)
+    ?? asFiniteNumber(row.confluence?.score_breakdown?.total_score)
+    ?? row.score
+  return Math.max(0, Math.min(100, Math.round(score)))
+}
+
+function researchCommitteePillarCount(rows: ScannerDisplayRow[]) {
+  return rows.reduce((best, row) => {
+    const declared = asFiniteNumber(row.confluence?.supporting_pillars)
+      ?? asFiniteNumber(row.confluence?.pillar_count)
+      ?? 0
+    return Math.max(best, Math.round(declared))
+  }, 0)
+}
+
+function researchCommitteeConflictCount(rows: ScannerDisplayRow[]) {
+  return rows.reduce((best, row) => {
+    const declared = asFiniteNumber(row.confluence?.conflicting_pillars) ?? 0
+    return Math.max(best, Math.round(declared))
+  }, 0)
+}
+
+function researchCommitteeModelFamily(
+  strategyId: string | undefined,
+  strategyLabel: string | undefined,
+  setupFamily: string | undefined,
+) {
+  const source = `${strategyId ?? ''} ${strategyLabel ?? ''} ${setupFamily ?? ''}`.toLowerCase()
+  const canonicalFamily = (setupFamily ?? '').trim().toLowerCase()
+  if (!source.trim() || /(unlinked|unscored)/.test(source)) return null
+  // The API provides canonical families for genuine cross-model matches.
+  // Weekly trend remains timeframe confirmation of the same breakout pillar.
+  if (canonicalFamily === 'trend breakout' || canonicalFamily === 'weekly trend') return 'Trend breakout'
+  if (canonicalFamily === 'relative strength') return 'Trend breakout'
+  if (canonicalFamily === 'pullback') return 'Pullback / reclaim'
+  if (canonicalFamily === 'failed breakdown reclaim') return 'Oversold reversal'
+  if (canonicalFamily === 'oversold reversal') return 'Oversold reversal'
+  if (/(52w|momentum|relative[ _-]?strength|rs[ _-]?leader)/.test(source)) return 'Trend breakout'
+  if (/(breakout|compression|king[ _-]?candle|supertrend)/.test(source)) return 'Breakout / trend'
+  if (/(pullback|reversal|reclaim|panic|rsi)/.test(source)) return 'Pullback / reversal'
+  if (/trend/.test(source)) return 'Trend filter'
+  return 'Other approved model'
+}
+
+function researchCommitteeModelFamilies(rows: ScannerDisplayRow[]) {
+  const families = new Set<string>()
+  const addModel = (strategyId?: string, strategyLabel?: string, setupFamily?: string) => {
+    const family = researchCommitteeModelFamily(strategyId, strategyLabel, setupFamily)
+    if (family) families.add(family)
+  }
+
+  rows.forEach((row) => {
+    addModel(row.strategy_id, row.strategy_label, row.setup_family)
+    row.confluence?.strategy_matches?.forEach((match) => {
+      // A watch-only rule is useful dossier context, but cannot create the
+      // appearance of independent model agreement in the decision shortlist.
+      if (match.strategy_status === 'Candidate') {
+        addModel(match.strategy_id, match.strategy_label, match.setup_family)
+      }
+    })
+  })
+
+  return Array.from(families).sort()
+}
+
+function researchCommitteeNews(rows: ScannerDisplayRow[]) {
+  let selected: ConfluenceNewsSummary | undefined
+  let selectedWeight = -1
+  rows.forEach((row) => {
+    const news = row.confluence?.news
+    if (!news) return
+    const articles = asFiniteNumber(news.article_count) ?? 0
+    const impact = Math.abs(asFiniteNumber(news.max_impact) ?? 0)
+    const adjustment = Math.abs(asFiniteNumber(news.score_adjustment) ?? 0)
+    const weight = articles * 100 + impact * 10 + adjustment
+    if (weight > selectedWeight) {
+      selected = news
+      selectedWeight = weight
+    }
+  })
+  return selected
+}
+
+function researchCommitteeReason({
+  pillarCount,
+  modelFamilies,
+  news,
+  conflictCount,
+}: Pick<ResearchCommitteePick, 'pillarCount' | 'modelFamilies' | 'news' | 'conflictCount'>) {
+  const parts = [
+    `${pillarCount} independent pillar${pillarCount === 1 ? '' : 's'}`,
+    `${modelFamilies.length} model famil${modelFamilies.length === 1 ? 'y' : 'ies'}`,
+  ]
+  const tone = newsTone(news)
+  if (tone === 'positive') parts.push(`${newsSummaryLabel(news)} supports it`)
+  else if (tone === 'danger') parts.push(`${newsSummaryLabel(news)} is a caution`)
+  else if (news) parts.push('news is not decisive')
+  else parts.push('no linked catalyst')
+  if (conflictCount > 0) parts.push(`${conflictCount} risk flag${conflictCount === 1 ? '' : 's'}`)
+  return parts.join(' · ')
+}
+
+function buildResearchCommitteePicks(rows: ScannerDisplayRow[]): ResearchCommitteePick[] {
+  const eligibleRows = rows.filter((row) => (
+    Boolean(row.confluence)
+    && researchCommitteeCurrent(row)
+    && researchCommitteeApprovedTradeState(row)
+    && !researchCommitteeExcluded(row)
+    && researchCommitteeStateForRow(row) !== null
+  ))
+  const bySymbol = new Map<string, ScannerDisplayRow[]>()
+  eligibleRows.forEach((row) => {
+    const key = row.symbol.trim().toUpperCase()
+    if (!key) return
+    bySymbol.set(key, [...(bySymbol.get(key) ?? []), row])
+  })
+
+  const picks = Array.from(bySymbol.entries()).map(([symbol, symbolRows]) => {
+    const primary = [...symbolRows].sort((left, right) => {
+      const stateDelta = researchCommitteeStateRank(researchCommitteeStateForRow(right)!) - researchCommitteeStateRank(researchCommitteeStateForRow(left)!)
+      if (stateDelta !== 0) return stateDelta
+      return researchCommitteeScore(right) - researchCommitteeScore(left)
+        || right.score - left.score
+    })[0]
+    const state = researchCommitteeStateForRow(primary)!
+    const researchScore = researchCommitteeScore(primary)
+    const pillarCount = researchCommitteePillarCount(symbolRows)
+    const conflictCount = researchCommitteeConflictCount(symbolRows)
+    const modelFamilies = researchCommitteeModelFamilies(symbolRows)
+    const news = researchCommitteeNews(symbolRows)
+    const catalystAdjustment = newsTone(news) === 'positive'
+      ? 4
+      : newsTone(news) === 'danger'
+        ? -8
+        : newsTone(news) === 'warning'
+          ? -2
+          : 0
+    const riskRewardAdjustment = primary.risk_reward >= 2 ? 2 : primary.risk_reward >= 1.5 ? 1 : 0
+    const committeeScore = Math.max(0, Math.min(100, Math.round(
+      researchScore * 0.72
+      + Math.min(pillarCount, 5) * 4
+      + Math.min(modelFamilies.length, 3) * 3
+      + catalystAdjustment
+      + riskRewardAdjustment
+      - Math.min(conflictCount, 3) * 4,
+    )))
+
+    return {
+      rank: 0,
+      symbol,
+      companyName: primary.company_name || '',
+      primary,
+      state,
+      researchScore,
+      committeeScore,
+      pillarCount,
+      conflictCount,
+      modelFamilies,
+      news,
+      newsTone: newsTone(news),
+      reason: researchCommitteeReason({ pillarCount, modelFamilies, news, conflictCount }),
+    }
+  })
+
+  return picks
+    .filter((pick) => (
+      pick.pillarCount >= RESEARCH_COMMITTEE_MIN_PILLARS
+      && pick.newsTone !== 'danger'
+    ))
+    .sort((left, right) => (
+      researchCommitteeStateRank(right.state) - researchCommitteeStateRank(left.state)
+      || right.committeeScore - left.committeeScore
+      || right.researchScore - left.researchScore
+      || left.symbol.localeCompare(right.symbol)
+    ))
+    .slice(0, RESEARCH_COMMITTEE_PICK_LIMIT)
+    .map((pick, index) => ({ ...pick, rank: index + 1 }))
+}
+
+function confluenceFindingText(finding: string | ConfluenceFinding) {
+  if (typeof finding === 'string') return finding
+  const title = finding.title || finding.label || finding.pillar || finding.source || 'Research evidence'
+  const detail = finding.detail || finding.reason
+  return detail && detail !== title ? `${title}: ${detail}` : title
+}
+
+function confluenceFindingUrl(finding: string | ConfluenceFinding) {
+  return typeof finding === 'string' ? undefined : finding.source_url || finding.url
+}
+
+function confluenceNewsArticles(news: ConfluenceNewsSummary | undefined): ConfluenceNewsArticle[] {
+  if (!news) return []
+  const articles = [...(news.articles ?? []), ...(news.items ?? [])]
+  if (articles.length > 0) return articles
+  if (news.latest_url) {
+    return [{
+      title: news.latest_headline || news.latest_reason || 'Open linked news source',
+      source: news.latest_source || news.source,
+      url: news.latest_url,
+    }]
+  }
+  if (news.source_url || news.url) {
+    return [{
+      title: news.latest_reason || 'Open linked news source',
+      source: news.source,
+      source_url: news.source_url,
+      url: news.url,
+    }]
+  }
+  return []
+}
+
+function newsSummaryLabel(news: ConfluenceNewsSummary | undefined) {
+  if (!news) return 'News not linked'
+  const bullish = asFiniteNumber(news.bullish_articles) ?? 0
+  const bearish = asFiniteNumber(news.bearish_articles) ?? 0
+  const articles = asFiniteNumber(news.article_count) ?? bullish + bearish
+  if (bearish > 0 && bearish >= bullish) return `${bearish} bearish / ${articles} article${articles === 1 ? '' : 's'}`
+  if (bullish > 0) return `${bullish} bullish / ${articles} article${articles === 1 ? '' : 's'}`
+  return articles > 0 ? `${articles} recent article${articles === 1 ? '' : 's'}` : 'No recent article'
+}
+
+function formatActivityMetric(metric: string) {
+  if (metric === 'volume_shockers') return 'Volume Shocker'
+  if (metric === 'most_active') return 'Most Active'
+  return formatSourceName(metric || 'activity')
+}
+
+function formatConfidence(value: number) {
+  if (!Number.isFinite(value)) return '0%'
+  return `${Math.round(value * 100)}%`
+}
+
+function marketTimestampValue(value: string | null | undefined) {
+  if (!value) return 0
+  const normalized = value.includes('T') ? value : value.includes(' ') ? `${value.replace(' ', 'T')}+05:30` : `${value}T00:00:00+05:30`
+  const timestamp = new Date(normalized).getTime()
+  return Number.isNaN(timestamp) ? 0 : timestamp
+}
+
+type NewsDeskSort = 'latest' | 'volume' | 'deals' | 'impact'
+type NewsDeskView = 'actionable' | 'linked'
+
+interface NewsPastEvidence {
+  article_id: string
+  symbol: string
+  prediction_status?: string
+  outcome?: string
+  return_pct?: number
+  target_hit?: boolean
+  evaluated_at?: string
+}
+
 function stateTone(state: BrokerStatus['state']) {
   if (state === 'ready') return 'positive'
   if (state === 'expired' || state === 'degraded') return 'warning'
@@ -315,6 +884,8 @@ function canSendToPaper(candidate: SwingCandidate) {
     && candidate.stop_loss > 0
     && candidate.stop_loss < candidate.last_price
     && candidate.target_price > candidate.last_price
+    && candidate.live_signal.status !== 'NO_TRADE'
+    && candidate.live_signal.status !== 'INVALIDATED'
 }
 
 function signalClass(status: LiveSignal['status']) {
@@ -328,8 +899,11 @@ function parseRouteHash(): { view: View; symbol: string | null } {
     dashboard: 'home',
     backtest: 'backtests',
     'paper-desk': 'portfolio',
+    news: 'market',
+    activity: 'market',
+    'market-hub': 'market',
   }
-  const knownViews: View[] = ['home', 'scanner', 'watchlist', 'portfolio', 'backtests', 'settings', 'stock']
+  const knownViews: View[] = ['home', 'market', 'scanner', 'watchlist', 'portfolio', 'backtests', 'settings', 'stock']
   const view = aliases[viewPart] ?? (knownViews.includes(viewPart as View) ? (viewPart as View) : 'home')
   if (viewPart && !aliases[viewPart] && !knownViews.includes(viewPart as View)) {
     window.history.replaceState(null, '', '/home')
@@ -365,6 +939,7 @@ function ruleForStrategy(strategyId: string) {
 
 function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCandidate {
   const rule = ruleForStrategy(row.strategy_id)
+  const staleSignal = marketDateAgeDays(row.as_of) > 4
   const stopLossPct = rule?.stopLossPct ?? 0
   const takeProfitPct = rule?.takeProfitPct ?? 0
   const stopLoss = row.stop_loss > 0 ? row.stop_loss : rule ? Number((row.close * (1 - stopLossPct / 100)).toFixed(2)) : 0
@@ -376,7 +951,7 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
     setup_family: strategyLabel,
     bias: 'Long',
     score: row.score,
-    confidence: row.score >= 88 ? 'High Conviction' : row.score >= 78 ? 'Actionable' : 'Watchlist',
+    confidence: staleSignal ? 'Historical Only' : row.score >= 88 ? 'High Conviction' : row.score >= 78 ? 'Actionable' : 'Watchlist',
     regime_fit: Math.min(95, Math.max(55, row.score - 4)),
     risk_reward: row.risk_reward > 0 ? row.risk_reward : rule ? Number((((targetPrice - row.close) / Math.max(row.close - stopLoss, 0.01))).toFixed(2)) : 0,
     last_price: row.close,
@@ -388,7 +963,9 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
     stop_loss: stopLoss,
     target_price: targetPrice,
     expected_hold: `${PAPER_HOLD_SESSIONS} trading sessions`,
-    thesis: `${row.symbol} is staged only because the latest parquet screener row maps to the backtest-tracked ${strategyLabel} strategy status: ${row.strategy_status}.`,
+    thesis: staleSignal
+      ? `${row.symbol} matched ${strategyLabel} on ${row.as_of}, but that dataset is stale and cannot authorize a fresh entry.`
+      : `${row.symbol} is staged only because the latest parquet screener row maps to the backtest-tracked ${strategyLabel} strategy status: ${row.strategy_status}.`,
     reasons: [
       rule ? `Exit model uses ${rule.source}: ${stopLossPct}% stop, ${takeProfitPct}% target, capped at ${PAPER_HOLD_SESSIONS} trading sessions.` : 'No strategy config was found for this row, so it is review-only unless a stop is supplied.',
       `${row.symbol} is ${row.distance_to_20d_high_pct.toFixed(2)}% away from the 20-day high.`,
@@ -398,13 +975,16 @@ function createCandidateFromHistoricalRow(row: HistoricalScreenerRow): SwingCand
     ],
     risks: [
       `Stop is fixed at ${currency(stopLoss)} from the configured backtest rule.`,
+      ...(staleSignal ? [`Signal date ${row.as_of} is more than four calendar days old; refresh market data before any paper or live entry.`] : []),
       'Paper staging is evidence-gathering only; backtested behavior can fail in forward trading.',
     ],
     source: 'parquet-screener',
     live_signal: defaultLiveSignal({
-      status: row.strategy_status === 'Watch' ? 'WATCH' : row.strategy_status === 'Rejected' ? 'NO_TRADE' : 'WAIT_FOR_TRIGGER',
-      label: row.strategy_status === 'Watch' ? 'Watch Only' : row.strategy_status === 'Rejected' ? 'No Trade' : 'Needs Live Trigger',
-      reason: `Historical screener row maps to ${strategyLabel}; live Dhan confirmation is still required before entry.`,
+      status: staleSignal ? 'NO_TRADE' : row.strategy_status === 'Watch' ? 'WATCH' : row.strategy_status === 'Rejected' ? 'NO_TRADE' : 'WAIT_FOR_TRIGGER',
+      label: staleSignal ? 'Refresh Data' : row.strategy_status === 'Watch' ? 'Watch Only' : row.strategy_status === 'Rejected' ? 'No Trade' : 'Needs Live Trigger',
+      reason: staleSignal
+        ? `Latest strategy bar is ${row.as_of}; no entry is allowed until the parquet/live feature data is current.`
+        : `Historical screener row maps to ${strategyLabel}; live Dhan confirmation is still required before entry.`,
       strategy_id: row.strategy_id,
       strategy_label: strategyLabel,
       strategy_status: row.strategy_status,
@@ -542,6 +1122,7 @@ function createCandidateFromLiveRow(row: LiveStrategyRow): SwingCandidate {
         : 'Do not treat this as an entry until the live status says Enter Now.',
     ],
     source: row.source,
+    confluence: row.confluence,
     live_signal: {
       status,
       label: row.signal_label,
@@ -558,7 +1139,7 @@ function createCandidateFromLiveRow(row: LiveStrategyRow): SwingCandidate {
   }
 }
 
-function createHistoricalRowFromLiveRow(row: LiveStrategyRow): HistoricalScreenerRow {
+function createHistoricalRowFromLiveRow(row: LiveStrategyRow): ScannerDisplayRow {
   const triggerCleared = !!row.trigger_price && row.trigger_price > 0 && row.last_price >= row.trigger_price
   const plannedEntry = row.signal_status === 'ENTRY_NOW'
     ? `Live entry Rs ${row.last_price.toFixed(2)}`
@@ -569,6 +1150,7 @@ function createHistoricalRowFromLiveRow(row: LiveStrategyRow): HistoricalScreene
       : `Live LTP Rs ${row.last_price.toFixed(2)}`
   return {
     symbol: row.symbol,
+    company_name: row.company_name,
     as_of: row.updated_at,
     setup_family: row.setup_family || row.strategy_label,
     strategy_id: row.strategy_id,
@@ -597,6 +1179,9 @@ function createHistoricalRowFromLiveRow(row: LiveStrategyRow): HistoricalScreene
     stop_loss: row.stop_loss,
     target_price: row.target_price,
     risk_reward: row.risk_reward,
+    source: row.source,
+    signal_status: row.signal_status as LiveSignal['status'],
+    confluence: row.confluence,
   }
 }
 
@@ -657,16 +1242,17 @@ function paperSourceLabel(trade: PaperTrade) {
   return trade.setup_family || 'Paper'
 }
 
-function createHistoricalRowFromCandidate(candidate: SwingCandidate): HistoricalScreenerRow {
+function createHistoricalRowFromCandidate(candidate: SwingCandidate): ScannerDisplayRow {
   return {
     symbol: candidate.symbol,
+    company_name: candidate.company_name,
     as_of: candidate.live_signal.as_of,
     setup_family: candidate.setup_family,
     strategy_id: candidate.live_signal.strategy_id,
     strategy_label: candidate.live_signal.strategy_label || candidate.setup_family,
     strategy_status: candidate.live_signal.strategy_status || 'Candidate',
     score: candidate.score,
-    trend_label: candidate.regime_fit >= 70 ? 'Constructive' : 'Mixed',
+    trend_label: candidate.live_signal.label || (candidate.regime_fit >= 70 ? 'Constructive' : 'Mixed'),
     close: candidate.last_price,
     sma20: candidate.last_price,
     sma50: candidate.last_price,
@@ -688,6 +1274,9 @@ function createHistoricalRowFromCandidate(candidate: SwingCandidate): Historical
     stop_loss: candidate.stop_loss,
     target_price: candidate.target_price,
     risk_reward: candidate.risk_reward,
+    source: candidate.source,
+    signal_status: candidate.live_signal.status,
+    confluence: candidate.confluence,
   }
 }
 
@@ -976,12 +1565,231 @@ function HistoricalChart({
   )
 }
 
+function ScannerResearchCell({
+  confluence,
+  score,
+}: {
+  confluence: ResearchConfluence | undefined
+  score: number
+}) {
+  if (!confluence) {
+    return (
+      <span className="scanner-confluence-cell scanner-confluence-empty">
+        <strong>Base setup</strong>
+        <small>Research layer pending</small>
+      </span>
+    )
+  }
+
+  const pillarCount = confluencePillarCount(confluence)
+  const strategyCount = confluenceStrategyCount(confluence)
+  return (
+    <span className={`scanner-confluence-cell tone-${researchTone(confluence, score)}`}>
+      <strong>{readableLabel(confluenceTradeState(confluence), 'Researching')}</strong>
+      <small>{pillarCount} pillar{pillarCount === 1 ? '' : 's'} · {strategyCount} strateg{strategyCount === 1 ? 'y' : 'ies'}</small>
+    </span>
+  )
+}
+
+function ScannerNewsCell({ news }: { news: ConfluenceNewsSummary | undefined }) {
+  if (!news) {
+    return (
+      <span className="scanner-news-cell scanner-news-empty">
+        <strong>Not linked</strong>
+        <small>News data pending</small>
+      </span>
+    )
+  }
+
+  const direction = readableLabel(news.direction, 'Mixed')
+  return (
+    <span className={`scanner-news-cell tone-${newsTone(news)}`}>
+      <strong>{direction}</strong>
+      <small>{newsSummaryLabel(news)}</small>
+    </span>
+  )
+}
+
+function ResearchCommitteePanel({
+  picks,
+  selectedSymbol,
+  onSelect,
+}: {
+  picks: ResearchCommitteePick[]
+  selectedSymbol: string | null
+  onSelect: (symbol: string) => void
+}) {
+  const entryNowCount = picks.filter((pick) => pick.state === 'ENTRY_NOW').length
+  const multiModelEntryNowCount = picks.filter((pick) => (
+    pick.state === 'ENTRY_NOW'
+    && pick.modelFamilies.length >= RESEARCH_COMMITTEE_MIN_MODEL_FAMILIES
+    && pick.conflictCount <= RESEARCH_COMMITTEE_MAX_CONFLICTS
+    && pick.primary.risk_reward >= RESEARCH_COMMITTEE_MIN_RISK_REWARD
+  )).length
+  const armedCount = picks.filter((pick) => pick.state === 'ARMED').length
+  const title = multiModelEntryNowCount > 0
+    ? 'Top picks: one stock, one decision'
+    : 'Research watchlist: waiting for independent confirmation'
+
+  return (
+    <Surface className="inner-surface research-committee-panel">
+      <div className="research-committee-head">
+        <div>
+          <span className="eyebrow">Research Committee</span>
+          <h3>{title}</h3>
+          <p>
+            Ranked once per symbol from current Dhan-live Candidate research. A true Top Pick needs Entry Now, at least {RESEARCH_COMMITTEE_MIN_PILLARS} independent evidence pillars, {RESEARCH_COMMITTEE_MIN_MODEL_FAMILIES} Candidate model families, R:R at least {RESEARCH_COMMITTEE_MIN_RISK_REWARD}:1, at most {RESEARCH_COMMITTEE_MAX_CONFLICTS} risk flag, and no bearish linked news. Correlated 52W and momentum variants count as one Trend breakout family; this is a research shortlist, not buy advice.
+          </p>
+        </div>
+        <div className="research-committee-stats">
+          <CandidateStat label="Shortlist" value={`${picks.length}/${RESEARCH_COMMITTEE_PICK_LIMIT}`} tone={picks.length > 0 ? 'positive' : 'neutral'} />
+          <CandidateStat label="Entry Now" value={String(entryNowCount)} tone={entryNowCount > 0 ? 'positive' : 'neutral'} />
+          <CandidateStat label="True Top Picks" value={String(multiModelEntryNowCount)} tone={multiModelEntryNowCount > 0 ? 'positive' : 'neutral'} />
+          <CandidateStat label="Armed" value={String(armedCount)} tone={armedCount > 0 ? 'warning' : 'neutral'} />
+        </div>
+      </div>
+
+      {picks.length > 0 ? (
+        <div className="research-committee-grid">
+          {picks.map((pick) => {
+            const trigger = pick.primary.trigger_price && pick.primary.trigger_price > 0
+              ? currency(pick.primary.trigger_price)
+              : 'Live confirmation'
+            const newsLabel = pick.newsTone === 'positive'
+              ? 'Catalyst supports'
+              : pick.newsTone === 'danger'
+                ? 'News caution'
+                : pick.news
+                  ? 'News neutral'
+                  : 'No catalyst'
+            return (
+              <button
+                key={pick.symbol}
+                type="button"
+                onClick={() => onSelect(pick.symbol)}
+                className={`committee-pick-card committee-state-${pick.state.toLowerCase().replace(/_/g, '-')} ${pick.symbol === selectedSymbol ? 'committee-pick-active' : ''}`.trim()}
+              >
+                <div className="committee-pick-top">
+                  <div className="committee-symbol-block">
+                    <span className="committee-rank">#{pick.rank}</span>
+                    <span>
+                      <strong>{pick.symbol}</strong>
+                      <small>{pick.companyName || pick.primary.strategy_label}</small>
+                    </span>
+                  </div>
+                  <span className="committee-score" title="Committee ranking score, not a trade signal">
+                    <strong>{pick.committeeScore}</strong>
+                    <small>rank</small>
+                  </span>
+                </div>
+
+                <div className="committee-pick-status">
+                  <StagePill label={researchCommitteeStateLabel(pick.state)} tone={researchCommitteeStateTone(pick.state)} />
+                  <span>{pick.primary.strategy_label}</span>
+                </div>
+
+                <p className="committee-reason">{pick.reason}</p>
+
+                <div className="committee-chip-row">
+                  <span>{pick.modelFamilies.join(' + ')}</span>
+                  <span className={`tone-${pick.newsTone}`}>{newsLabel}</span>
+                </div>
+
+                <div className="committee-plan-row">
+                  <span>Trigger {trigger}</span>
+                  <span>R:R {pick.primary.risk_reward.toFixed(1)}</span>
+                  <span>Research {pick.researchScore}/100</span>
+                </div>
+                <span className="committee-open-copy">Open full research <ArrowUpRight size={13} /></span>
+              </button>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="research-committee-empty">
+          <CircleAlert size={17} />
+          <p>
+            No current research picks qualify yet. The committee requires a current Dhan-live Candidate row in Entry Now or Armed state, at least {RESEARCH_COMMITTEE_MIN_PILLARS} independent evidence pillars, and no bearish linked news; watch-only, rejected, fragile, invalidated, no-trade, and stale rows stay in the raw research section below.
+          </p>
+        </div>
+      )}
+    </Surface>
+  )
+}
+
+function StrategyPlaybookPanel() {
+  return (
+    <Surface className="inner-surface strategy-playbook-panel">
+      <details open>
+        <summary className="strategy-playbook-summary">
+          <div>
+            <span className="eyebrow">Strategy playbook</span>
+            <h3>Three independent pillars, not a pile of duplicate votes</h3>
+            <p>Every current model label, its core filters, and its present role in research.</p>
+          </div>
+          <span className="strategy-playbook-summary-chip">{STRATEGY_PLAYBOOK_PILLARS.length} pillars + research feeds</span>
+        </summary>
+
+        <div className="strategy-playbook-body">
+          <div className="strategy-playbook-rules">
+            <span>Top Picks count independent pillars, not every matching label.</span>
+            <span>Research score ranks evidence; it is not a probability or a buy instruction.</span>
+            <span>Fresh data, a valid trade state, trigger, risk plan, and non-bearish news are still required.</span>
+          </div>
+
+          <div className="strategy-playbook-pillars">
+            {STRATEGY_PLAYBOOK_PILLARS.map((pillar) => (
+              <section key={pillar.name} className="strategy-playbook-pillar">
+                <div className="strategy-playbook-pillar-head">
+                  <span className="eyebrow">Evidence pillar</span>
+                  <h4>{pillar.name}</h4>
+                  <p>{pillar.description}</p>
+                </div>
+                <div className="strategy-playbook-entries">
+                  {pillar.entries.map((entry) => (
+                    <article key={entry.name} className="strategy-playbook-entry">
+                      <div className="strategy-playbook-entry-head">
+                        <strong>{entry.name}</strong>
+                        <StagePill label={entry.disposition} tone={entry.tone} />
+                      </div>
+                      <p>{entry.parameters}</p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+
+          <section className="strategy-playbook-feeds">
+            <div className="strategy-playbook-pillar-head">
+              <span className="eyebrow">Confirmation / research feeds</span>
+              <h4>Useful context, never extra votes</h4>
+              <p>Weekly and Bamboo signals can support a clean setup, but are not independent Top Pick strategies.</p>
+            </div>
+            <div className="strategy-playbook-feed-grid">
+              {STRATEGY_PLAYBOOK_RESEARCH_FEEDS.map((entry) => (
+                <article key={entry.name} className="strategy-playbook-entry">
+                  <div className="strategy-playbook-entry-head">
+                    <strong>{entry.name}</strong>
+                    <StagePill label={entry.disposition} tone={entry.tone} />
+                  </div>
+                  <p>{entry.parameters}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      </details>
+    </Surface>
+  )
+}
+
 function HistoricalScreenerTableRow({
   row,
   active,
   onSelect,
 }: {
-  row: HistoricalScreenerRow
+  row: ScannerDisplayRow
   active: boolean
   onSelect: (symbol: string) => void
 }) {
@@ -1013,7 +1821,201 @@ function HistoricalScreenerTableRow({
       <td>{currency(row.stop_loss)}</td>
       <td>{currency(row.target_price)}</td>
       <td>{row.volume_ratio > 0 ? `${row.volume_ratio.toFixed(2)}x` : row.avg_volume20.toLocaleString('en-IN')}</td>
+      <td><ScannerResearchCell confluence={row.confluence} score={row.score} /></td>
+      <td><ScannerNewsCell news={row.confluence?.news} /></td>
     </tr>
+  )
+}
+
+const SCORE_BREAKDOWN_FIELDS: Array<{ keys: Array<keyof ConfluenceScoreBreakdown>; label: string; adjustment?: boolean }> = [
+  { keys: ['model_score', 'base_score'], label: 'Model score' },
+  { keys: ['technical_quality', 'technical'], label: 'Technical' },
+  { keys: ['trend_quality', 'trend'], label: 'Trend' },
+  { keys: ['volume_quality', 'volume'], label: 'Volume' },
+  { keys: ['regime_quality', 'regime'], label: 'Regime' },
+  { keys: ['risk_reward_quality', 'risk_reward'], label: 'Risk / reward' },
+  { keys: ['catalyst_adjustment'], label: 'News catalyst', adjustment: true },
+  { keys: ['total_score'], label: 'Research score' },
+]
+
+function formatConfluenceScore(value: number, adjustment = false) {
+  if (adjustment) return `${value >= 0 ? '+' : ''}${value.toFixed(1)}`
+  return Number.isInteger(value) ? String(value) : value.toFixed(1)
+}
+
+function ResearchVerdictPanel({ candidate }: { candidate: SwingCandidate }) {
+  const confluence = candidate.confluence
+  const breakdown = confluence?.score_breakdown
+  const scoreMetrics = SCORE_BREAKDOWN_FIELDS
+    .map((field) => ({
+      ...field,
+      value: field.keys
+        .map((key) => asFiniteNumber(breakdown?.[key]))
+        .find((value): value is number => value !== null) ?? null,
+    }))
+    .filter((field): field is { keys: Array<keyof ConfluenceScoreBreakdown>; label: string; adjustment?: boolean; value: number } => field.value !== null)
+  const strategyMatches = confluence?.strategy_matches ?? []
+  const selectedMatches = strategyMatches.filter((match) => match.selected)
+  const researchScore = asFiniteNumber(confluence?.research_score) ?? asFiniteNumber(breakdown?.total_score) ?? candidate.score
+  const state = confluenceTradeState(confluence)
+  const hasConfluence = Boolean(confluence)
+
+  return (
+    <Surface className="inner-surface research-verdict-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Research Verdict</span>
+          <h3>{hasConfluence ? readableLabel(state, 'Researching') : 'Strategy score only'}</h3>
+        </div>
+        <StagePill label={hasConfluence ? readableLabel(state, 'Researching') : 'Confluence Pending'} tone={researchTone(confluence, candidate.score)} />
+      </div>
+
+      <p className="research-verdict-copy">
+        {hasConfluence
+          ? `${confluencePillarCount(confluence)} independent research pillar${confluencePillarCount(confluence) === 1 ? '' : 's'} are represented in this snapshot. Price and risk rules remain the entry gate.`
+          : 'This snapshot has not supplied structured confluence yet. The score and trade state shown above still come from the original strategy feed.'}
+      </p>
+
+      <div className="research-verdict-stats">
+        <CandidateStat label="Research Score" value={`${formatConfluenceScore(researchScore)}/100`} tone={researchTone(confluence, candidate.score)} />
+        <CandidateStat label="Strategy Matches" value={String(confluenceStrategyCount(confluence))} tone={confluenceStrategyCount(confluence) > 1 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Selected Models" value={String(selectedMatches.length)} tone={selectedMatches.length > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="News Read" value={confluence?.news ? readableLabel(confluence.news.direction, 'Mixed') : 'Not linked'} tone={newsTone(confluence?.news)} />
+      </div>
+
+      {scoreMetrics.length > 0 && (
+        <div className="score-breakdown-grid" aria-label="Research score breakdown">
+          {scoreMetrics.map((metric) => (
+            <div key={metric.keys.join('-')} className={metric.keys.includes('total_score') ? 'score-breakdown-item score-breakdown-total' : 'score-breakdown-item'}>
+              <span>{metric.label}</span>
+              <strong className={metric.adjustment && metric.value < 0 ? 'tone-danger' : metric.adjustment && metric.value > 0 ? 'tone-positive' : ''}>
+                {formatConfluenceScore(metric.value, metric.adjustment)}
+              </strong>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {strategyMatches.length > 0 && (
+        <div className="strategy-match-list">
+          <span className="micro-label">Strategy agreement</span>
+          <div className="strategy-match-chips">
+            {strategyMatches.map((match, index) => {
+              const label = match.strategy_label || match.setup_family || match.strategy_id || 'Strategy match'
+              const detail = match.signal_label || match.signal_status || match.strategy_status || match.status || match.reason
+              return (
+                <span key={`${label}-${index}`} className={match.selected ? 'strategy-match-chip strategy-match-selected' : 'strategy-match-chip'}>
+                  <strong>{label}</strong>
+                  {(match.timeframe || detail) && <small>{[match.timeframe, detail].filter(Boolean).join(' · ')}</small>}
+                </span>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </Surface>
+  )
+}
+
+function ResearchEvidencePanels({ confluence }: { confluence: ResearchConfluence | undefined }) {
+  const evidence = confluence?.evidence ?? []
+  const risks = confluence?.risks ?? []
+  if (evidence.length === 0 && risks.length === 0) return null
+
+  const renderFinding = (finding: string | ConfluenceFinding, index: number) => {
+    const text = confluenceFindingText(finding)
+    const href = confluenceFindingUrl(finding)
+    return (
+      <li key={`${text}-${index}`}>
+        {href ? (
+          <a href={href} target="_blank" rel="noreferrer" className="research-source-link">
+            <span>{text}</span>
+            <ExternalLink size={13} />
+          </a>
+        ) : text}
+      </li>
+    )
+  }
+
+  return (
+    <div className="split-grid research-evidence-grid">
+      {evidence.length > 0 && (
+        <Surface className="inner-surface">
+          <span className="eyebrow">Research Evidence</span>
+          <ul className="detail-list">
+            {evidence.map(renderFinding)}
+          </ul>
+        </Surface>
+      )}
+      {risks.length > 0 && (
+        <Surface className="inner-surface">
+          <span className="eyebrow">Conflicting Evidence</span>
+          <ul className="detail-list warning-list">
+            {risks.map(renderFinding)}
+          </ul>
+        </Surface>
+      )}
+    </div>
+  )
+}
+
+function ResearchNewsPanel({ news }: { news: ConfluenceNewsSummary | undefined }) {
+  if (!news) return null
+  const articles = confluenceNewsArticles(news)
+  const scoreAdjustment = asFiniteNumber(news.score_adjustment)
+  const lookbackHours = asFiniteNumber(news.lookback_hours)
+  const sentiment = asFiniteNumber(news.average_sentiment) ?? asFiniteNumber(news.avg_sentiment)
+  const impact = asFiniteNumber(news.max_impact)
+
+  return (
+    <Surface className={`inner-surface research-news-panel tone-${newsTone(news)}`}>
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Catalyst & News</span>
+          <h3>{readableLabel(news.direction, 'Mixed evidence')}</h3>
+        </div>
+        <StagePill label={newsSummaryLabel(news)} tone={newsTone(news)} />
+      </div>
+
+      {news.latest_reason && <p className="research-news-reason">{news.latest_reason}</p>}
+
+      <div className="research-news-stats">
+        <CandidateStat label="Lookback" value={lookbackHours === null ? 'N/A' : `${lookbackHours}h`} />
+        <CandidateStat label="Bullish" value={String(asFiniteNumber(news.bullish_articles) ?? 0)} tone="positive" />
+        <CandidateStat label="Bearish" value={String(asFiniteNumber(news.bearish_articles) ?? 0)} tone={(asFiniteNumber(news.bearish_articles) ?? 0) > 0 ? 'danger' : 'neutral'} />
+        <CandidateStat label="Score effect" value={scoreAdjustment === null ? 'N/A' : formatConfluenceScore(scoreAdjustment, true)} tone={scoreAdjustment !== null && scoreAdjustment < 0 ? 'danger' : scoreAdjustment !== null && scoreAdjustment > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Sentiment" value={sentiment === null ? 'N/A' : `${sentiment >= 0 ? '+' : ''}${sentiment.toFixed(2)}`} tone={sentiment !== null && sentiment < 0 ? 'danger' : sentiment !== null && sentiment > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Max impact" value={impact === null ? 'N/A' : `${impact.toFixed(1)}/5`} />
+      </div>
+
+      {articles.length > 0 ? (
+        <div className="research-news-links">
+          <span className="micro-label">Source articles</span>
+          {articles.map((article, index) => {
+            const title = article.title || article.reason || article.summary || 'Open linked news source'
+            const href = article.source_url || article.url
+            return href ? (
+              <a key={`${title}-${index}`} href={href} target="_blank" rel="noreferrer" className="research-news-link">
+                <span>
+                  <strong>{title}</strong>
+                  {(article.source || article.published_at) && <small>{[article.source, article.published_at ? compactDate(article.published_at) : ''].filter(Boolean).join(' · ')}</small>}
+                </span>
+                <ExternalLink size={14} />
+              </a>
+            ) : (
+              <div key={`${title}-${index}`} className="research-news-link research-news-link-static">
+                <span>
+                  <strong>{title}</strong>
+                  {(article.source || article.published_at) && <small>{[article.source, article.published_at ? compactDate(article.published_at) : ''].filter(Boolean).join(' · ')}</small>}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <p className="research-news-unlinked">News counts are included in this research snapshot, but no source article links were supplied.</p>
+      )}
+    </Surface>
   )
 }
 
@@ -1104,6 +2106,8 @@ function DetailPanel({
         <p>{liveSignal.reason}</p>
       </div>
 
+      <ResearchVerdictPanel candidate={resolvedCandidate} />
+
       <Surface className="inner-surface thesis-panel">
         <span className="eyebrow">Why It Qualified</span>
         <p>{resolvedCandidate.thesis}</p>
@@ -1154,6 +2158,9 @@ function DetailPanel({
           </div>
         </Surface>
       </div>
+
+      <ResearchEvidencePanels confluence={resolvedCandidate.confluence} />
+      <ResearchNewsPanel news={resolvedCandidate.confluence?.news} />
 
       <div className="split-grid">
         <Surface className="inner-surface">
@@ -1689,7 +2696,13 @@ function ScannerView({
       .map(createHistoricalRowFromLiveRow),
     [liveSnapshot],
   )
-  const sourceRows = liveRows
+  const sourceRows = useMemo(
+    () => liveRows.length > 0
+      ? liveRows
+      : (scanner?.candidates ?? []).map(createHistoricalRowFromCandidate),
+    [liveRows, scanner],
+  )
+  const committeePicks = useMemo(() => buildResearchCommitteePicks(sourceRows), [sourceRows])
 
   const families = useMemo(() => {
     const options = new Set<string>(['All'])
@@ -1715,6 +2728,10 @@ function ScannerView({
         row.symbol.toLowerCase().includes(term)
         || row.strategy_label.toLowerCase().includes(term)
         || row.strategy_status.toLowerCase().includes(term)
+        || readableLabel(confluenceTradeState(row.confluence), '').toLowerCase().includes(term)
+        || (row.confluence?.strategy_matches ?? []).some((match) => (
+          `${match.strategy_label ?? ''} ${match.setup_family ?? ''} ${match.strategy_id ?? ''}`.toLowerCase().includes(term)
+        ))
       return matchesFamily && matchesStrategy && matchesSearch
     })
   }, [deferredSearch, familyFilter, sourceRows, strategyFilter])
@@ -1727,7 +2744,7 @@ function ScannerView({
   const safePage = Math.min(page, totalPages)
   const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
   const groupedRows = useMemo(() => {
-    const groups = new Map<string, HistoricalScreenerRow[]>()
+    const groups = new Map<string, ScannerDisplayRow[]>()
     filtered.forEach((row) => {
       const key = row.strategy_label || strategyLabel(row.strategy_id)
       groups.set(key, [...(groups.get(key) ?? []), row])
@@ -1770,14 +2787,34 @@ function ScannerView({
   const bambooSignals = bambooLatest?.top_signals ?? []
   const freshSignalCount = freshSignals?.new_rows ?? 0
   const latestSignalDate = liveSnapshot?.updated_at ?? freshSignals?.signal_date ?? historicalScreener?.signal_date ?? historicalScreener?.rows[0]?.as_of ?? 'not available'
+  const historicalSignalDate = historicalScreener?.signal_date ?? historicalScreener?.rows[0]?.as_of ?? ''
+  const historicalDataStale = marketDateAgeDays(historicalSignalDate) > 4
   const liveFeedLabel = liveSnapshot?.feed_status === 'streaming'
     ? 'Dhan websocket live'
     : liveRows.length > 0
       ? `Live rows via ${liveSnapshot?.mode ?? 'websocket'}`
-      : 'Waiting for live quote rows'
+      : sourceRows.length > 0
+        ? 'HTTP research snapshot'
+        : 'Waiting for live quote rows'
+  const uniqueConfluenceRows = Array.from(new Map(
+    sourceRows
+      .filter((row) => row.confluence)
+      .map((row) => [row.symbol, row]),
+  ).values())
+  const multiStrategyCount = uniqueConfluenceRows.filter((row) => confluenceStrategyCount(row.confluence) > 1).length
+  const catalystSupportedCount = uniqueConfluenceRows.filter((row) => newsTone(row.confluence?.news) === 'positive').length
+  const newsConflictCount = uniqueConfluenceRows.filter((row) => newsTone(row.confluence?.news) === 'danger').length
 
   return (
     <div className="page-stack">
+      <ResearchCommitteePanel
+        picks={committeePicks}
+        selectedSymbol={selectedSymbol}
+        onSelect={onSelect}
+      />
+
+      <StrategyPlaybookPanel />
+
       <Surface>
         <div className="section-head scanner-toolbar">
           <div>
@@ -1836,8 +2873,8 @@ function ScannerView({
       <Surface>
         <div className="section-head scanner-toolbar">
           <div>
-            <span className="eyebrow">Strategy Scanner</span>
-              <h2>Signals grouped by active strategy from {latestSignalDate}</h2>
+            <span className="eyebrow">Raw Strategy Research</span>
+              <h2>All individual model signals from {latestSignalDate}</h2>
           </div>
           <div className="toolbar-right screener-toolbar-meta">
             <div className="mini-chip">
@@ -1854,9 +2891,9 @@ function ScannerView({
               className="text-input"
               placeholder="Search symbol"
             />
-            <button type="button" className="primary-button" onClick={onStageFresh} disabled={stagingFresh}>
+            <button type="button" className="primary-button" onClick={onStageFresh} disabled={stagingFresh || historicalDataStale}>
               <RefreshCw size={14} className={stagingFresh ? 'spin' : ''} />
-              <span>{stagingFresh ? 'Staging' : 'Stage Fresh Signals'}</span>
+              <span>{stagingFresh ? 'Staging' : historicalDataStale ? 'Refresh Data First' : 'Stage Fresh Signals'}</span>
             </button>
             <button type="button" className="ghost-button" onClick={onEnableLiveAlerts} disabled={liveAlertsEnabled}>
               <BellRing size={14} />
@@ -1869,11 +2906,30 @@ function ScannerView({
           </div>
         </div>
 
+        {historicalDataStale && (
+          <div className="warning-banner">
+            Entry safety gate: latest parquet signal date is {historicalSignalDate || 'unavailable'}. Historical rows remain visible for study, but paper staging is disabled until the feature data is current.
+          </div>
+        )}
+
         <div className="scanner-summary-strip">
           <CandidateStat label="New Signals" value={String(freshSignalCount)} tone={freshSignalCount > 0 ? 'positive' : 'neutral'} />
           <CandidateStat label="Auto-Staged" value={String(freshSignals?.staged_rows ?? 0)} tone={(freshSignals?.staged_rows ?? 0) > 0 ? 'positive' : 'neutral'} />
           <CandidateStat label="Already Seen" value={String(freshSignals?.seen_rows ?? 0)} tone={(freshSignals?.seen_rows ?? 0) > 0 ? 'warning' : 'neutral'} />
           <CandidateStat label="Live Updated" value={compactDate(latestSignalDate)} />
+        </div>
+
+        <div className="research-radar-strip">
+          <div>
+            <span className="eyebrow">Research Radar</span>
+            <p>Agreement is shown across independent pillars; news supports or challenges a setup but never creates an entry by itself.</p>
+          </div>
+          <div className="research-radar-stats">
+            <CandidateStat label="Confluence" value={`${uniqueConfluenceRows.length}/${new Set(sourceRows.map((row) => row.symbol)).size}`} tone={uniqueConfluenceRows.length > 0 ? 'positive' : 'neutral'} />
+            <CandidateStat label="Multi-Strategy" value={String(multiStrategyCount)} tone={multiStrategyCount > 0 ? 'positive' : 'neutral'} />
+            <CandidateStat label="Catalyst Support" value={String(catalystSupportedCount)} tone={catalystSupportedCount > 0 ? 'positive' : 'neutral'} />
+            <CandidateStat label="News Warnings" value={String(newsConflictCount)} tone={newsConflictCount > 0 ? 'danger' : 'neutral'} />
+          </div>
         </div>
 
         <LiveStrategyTape snapshot={liveSnapshot} socketState={liveSocketState} selectedStrategy={strategyFilter} onSelect={onSelect} />
@@ -1931,6 +2987,8 @@ function ScannerView({
                           <th>Stop</th>
                           <th>Target</th>
                           <th>Volume</th>
+                          <th>Research</th>
+                          <th>News</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1967,6 +3025,8 @@ function ScannerView({
                   <th>Stop</th>
                   <th>Target</th>
                   <th>Volume</th>
+                  <th>Research</th>
+                  <th>News</th>
                 </tr>
               </thead>
               <tbody>
@@ -2866,7 +3926,7 @@ function tradingWeekStart(signalDate: string) {
 }
 
 const STRATEGY_LABELS: Record<string, string> = {
-  'tuned-ma-breakout-v1': 'MA Breakout Lab',
+  'cash-portfolio-all': 'Cash-Constrained Portfolio',
   'tuned-panic-reversal-v1': 'Panic Reversal Lab',
   'weekly-supertrend-10-3': 'Weekly Supertrend 10-3',
   'king-candle-supertrend-breakout-v1': 'King Candle Supertrend Breakout',
@@ -2972,6 +4032,8 @@ function LiveStrategyTape({
           <span>Stop</span>
           <span>Target</span>
           <span>Score</span>
+          <span>Research</span>
+          <span>Catalyst</span>
         </div>
         {rows.map((row) => (
           <button key={`${row.strategy_id}-${row.symbol}`} type="button" className="live-strategy-row live-strategy-button" onClick={() => onSelect(row.symbol)}>
@@ -2983,6 +4045,8 @@ function LiveStrategyTape({
             <span>{currency(row.stop_loss)}</span>
             <span>{currency(row.target_price)}</span>
             <strong>{row.score}</strong>
+            <ScannerResearchCell confluence={row.confluence} score={row.score} />
+            <ScannerNewsCell news={row.confluence?.news} />
           </button>
         ))}
       </div>
@@ -3354,17 +4418,26 @@ function BacktestsView({
     visibleSummaries.find((summary) => summary.strategy_id === selectedStrategy) ??
     visibleSummaries[0] ??
     null
-  const selectedDiagnostic = dashboard.diagnostics.find((row) => row.strategy_id === selectedStrategy)
-  const yearlyRows = dashboard.yearly_returns.filter((row) => row.strategy_id === selectedStrategy)
+  const activeStrategyId = selectedSummary?.strategy_id ?? selectedStrategy
+  const selectedDiagnostic = dashboard.diagnostics.find((row) => row.strategy_id === activeStrategyId)
+  const yearlyRows = dashboard.yearly_returns.filter((row) => row.strategy_id === activeStrategyId)
   const selectedYearExists = selectedYear !== null && yearlyRows.some((row) => row.year === selectedYear)
   const activeYear = selectedYearExists ? selectedYear : yearlyRows[yearlyRows.length - 1]?.year ?? null
-  const monthlyRows = dashboard.monthly_returns.filter((row) => row.strategy_id === selectedStrategy)
+  const monthlyRows = dashboard.monthly_returns.filter((row) => row.strategy_id === activeStrategyId)
   const selectedYearMonths = activeYear ? monthlyRows.filter((row) => row.year === activeYear) : []
-  const selectedEquity = dashboard.equity_curve.filter((row) => row.strategy_id === selectedStrategy)
-  const dayQuality = dashboard.day_quality.find((row) => row.strategy_id === selectedStrategy)
+  const selectedEquity = dashboard.equity_curve.filter((row) => row.strategy_id === activeStrategyId)
+  const cashProfiles = dashboard.cash_profiles ?? []
+  const cashPortfolio = cashProfiles.find((row) => row.strategy_id === 'cash-portfolio-all')
+  const selectedCashProfile = cashProfiles.find((row) => row.strategy_id === activeStrategyId)
+  const selectedCashEquity = (dashboard.cash_equity_curve ?? []).filter((row) => row.strategy_id === activeStrategyId)
+  const selectedCashMonths = activeYear
+    ? (dashboard.cash_monthly_returns ?? []).filter((row) => row.strategy_id === activeStrategyId && row.year === activeYear)
+    : []
+  const dayQuality = dashboard.day_quality.find((row) => row.strategy_id === activeStrategyId)
   const visibleStrategyIds = new Set(visibleSummaries.map((summary) => summary.strategy_id))
   const visibleDiagnostics = dashboard.diagnostics.filter((row) => visibleStrategyIds.has(row.strategy_id))
   const dayQualityByStrategy = new Map(dashboard.day_quality.map((row) => [row.strategy_id, row]))
+  const cashByStrategy = new Map(cashProfiles.map((row) => [row.strategy_id, row]))
   const summaryByStrategy = new Map(visibleSummaries.map((summary) => [summary.strategy_id, summary]))
   const strategyRollups = new Map(visibleSummaries.map((summary) => {
     const months = dashboard.monthly_returns.filter((row) => row.strategy_id === summary.strategy_id)
@@ -3435,6 +4508,31 @@ function BacktestsView({
           {cache && <CandidateStat label="Data Window" value={`${cache.from_date || 'N/A'} to ${cache.to_date || 'N/A'}`} />}
         </div>
 
+        {cashPortfolio && (
+          <Surface className="inner-surface cash-reality-panel">
+            <div className="compact-section-head">
+              <div>
+                <span className="eyebrow">Cash Reality</span>
+                <h2>Portfolio after blocked overlapping trades</h2>
+              </div>
+              <div className="mini-chip">
+                <WalletCards size={14} />
+                <span>{currency(cashPortfolio.initial_capital)} base</span>
+              </div>
+            </div>
+            <div className="backtest-kpi-grid cash-kpi-grid">
+              <CandidateStat label="Cash P&L" value={currency(cashPortfolio.total_pnl)} tone={cashPortfolio.total_pnl >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="Cash Return" value={pct(cashPortfolio.return_pct)} tone={cashPortfolio.return_pct >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="Annualized" value={pct(cashPortfolio.annualized_return_pct)} tone={cashPortfolio.annualized_return_pct >= 0 ? 'positive' : 'danger'} />
+              <CandidateStat label="Taken / Skipped" value={`${cashPortfolio.trades_taken.toLocaleString('en-IN')} / ${cashPortfolio.skipped_entries.toLocaleString('en-IN')}`} tone={cashPortfolio.skipped_entries > 0 ? 'warning' : 'positive'} />
+              <CandidateStat label="Peak Used" value={`${pct(cashPortfolio.peak_capital_used_pct)} ${currency(cashPortfolio.peak_capital_used)}`} tone={cashPortfolio.peak_capital_used_pct <= 100 ? 'positive' : 'warning'} />
+              <CandidateStat label="Max Open" value={`${cashPortfolio.max_open_positions} positions`} />
+              <CandidateStat label="Max Drawdown" value={`${currency(cashPortfolio.max_drawdown_rs)} (${pct(cashPortfolio.max_drawdown_pct)})`} tone="danger" />
+              <CandidateStat label="Sharpe" value={`${cashPortfolio.sharpe_ratio.toFixed(2)} / ${cashPortfolio.sortino_ratio.toFixed(2)}`} tone={cashPortfolio.sharpe_ratio >= 1 ? 'positive' : 'warning'} />
+            </div>
+          </Surface>
+        )}
+
         {backtestMode === 'datewise' ? (
           <DatewiseBacktestView
             datewise={datewise}
@@ -3484,7 +4582,7 @@ function BacktestsView({
           </label>
           <label>
             <span>Strategy</span>
-            <select className="select-input" value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.currentTarget.value)}>
+            <select className="select-input" value={activeStrategyId} onChange={(event) => setSelectedStrategy(event.currentTarget.value)}>
               {visibleSummaries.map((summary) => (
                 <option key={summary.strategy_id} value={summary.strategy_id}>{strategyLabel(summary.strategy_id)}</option>
               ))}
@@ -3522,19 +4620,25 @@ function BacktestsView({
               <div className="method-score-row method-score-head">
                 <span>Strategy</span>
                 <span>Status</span>
-                <span>Return</span>
+                <span>Total Return</span>
+                <span>Annualized</span>
+                <span>Cash Ret</span>
                 <span>P&L</span>
+                <span>Taken / Skip</span>
                 <span>Win</span>
-                <span>Profit Factor</span>
-                <span>Profitable Months</span>
+                <span>PF</span>
+                <span>Sharpe</span>
+                <span>Months</span>
                 <span>Positive Days</span>
-                <span>Max DD</span>
+                <span>Max DD %</span>
+                <span>Loss Streak</span>
               </div>
               {visibleDiagnostics.map((row) => {
                 const canOpen = visibleSummaries.some((summary) => summary.strategy_id === row.strategy_id)
                 const positiveDaysPct = dayQualityByStrategy.get(row.strategy_id)?.positive_days_pct ?? 0
                 const summary = summaryByStrategy.get(row.strategy_id)
                 const rollup = strategyRollups.get(row.strategy_id)
+                const cashProfile = cashByStrategy.get(row.strategy_id)
                 return (
                   <button
                     key={row.strategy_id}
@@ -3548,12 +4652,17 @@ function BacktestsView({
                     <strong>{strategyLabel(row.strategy_id)}<small>{row.method_family}</small></strong>
                     <span>{row.status}</span>
                     <strong className={(rollup?.finalReturnPct ?? 0) >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(rollup?.finalReturnPct ?? 0)}</strong>
+                    <strong className={row.annualized_return_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(row.annualized_return_pct)}</strong>
+                    <strong className={(cashProfile?.return_pct ?? 0) >= 0 ? 'tone-positive' : 'tone-danger'}>{cashProfile ? pct(cashProfile.return_pct) : 'N/A'}</strong>
                     <strong className={(summary?.total_pnl ?? row.total_pnl) >= 0 ? 'tone-positive' : 'tone-danger'}>{currency(summary?.total_pnl ?? row.total_pnl)}</strong>
+                    <span>{cashProfile ? `${cashProfile.trades_taken}/${cashProfile.skipped_entries}` : 'N/A'}</span>
                     <span>{row.win_rate.toFixed(2)}%</span>
                     <span>{row.profit_factor.toFixed(2)}</span>
+                    <span className={row.sharpe_ratio >= 1 ? 'tone-positive' : row.sharpe_ratio >= 0 ? 'tone-warning' : 'tone-danger'}>{row.sharpe_ratio.toFixed(2)}</span>
                     <span>{rollup ? `${rollup.profitableMonths}/${rollup.totalMonths} (${rollup.monthPct.toFixed(0)}%)` : 'N/A'}</span>
                     <span>{positiveDaysPct.toFixed(2)}%</span>
-                    <strong className="tone-danger">{currency(row.max_drawdown_rs)}</strong>
+                    <strong className="tone-danger">{pct(row.max_drawdown_pct)}</strong>
+                    <span>{row.max_losing_streak}</span>
                   </button>
                 )
               })}
@@ -3574,24 +4683,42 @@ function BacktestsView({
               <div className="compact-section-head">
                 <div>
                   <span className="eyebrow">Selected Strategy</span>
-                  <h2>{strategyLabel(selectedStrategy)}</h2>
+                  <h2>{strategyLabel(activeStrategyId)}</h2>
                 </div>
                 <StagePill label={selectedDiagnostic?.status ?? 'Review'} tone={(selectedDiagnostic?.status ?? '') === 'Candidate' ? 'positive' : (selectedDiagnostic?.status ?? '') === 'Rejected' ? 'danger' : 'warning'} />
               </div>
               <div className="backtest-kpi-grid selected-kpi-grid">
                 <CandidateStat label="Total P&L" value={currency(selectedSummary.total_pnl)} tone={selectedSummary.total_pnl >= 0 ? 'positive' : 'danger'} />
                 <CandidateStat label="Return" value={pct(selectedEquity[selectedEquity.length - 1]?.cumulative_return_pct ?? selectedSummary.deployed_return_pct)} tone={selectedSummary.deployed_return_pct >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Annualized" value={selectedDiagnostic ? pct(selectedDiagnostic.annualized_return_pct) : 'N/A'} tone={(selectedDiagnostic?.annualized_return_pct ?? 0) >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Cash Return" value={selectedCashProfile ? pct(selectedCashProfile.return_pct) : 'N/A'} tone={(selectedCashProfile?.return_pct ?? 0) >= 0 ? 'positive' : 'danger'} />
+                <CandidateStat label="Cash Annualized" value={selectedCashProfile ? pct(selectedCashProfile.annualized_return_pct) : 'N/A'} tone={(selectedCashProfile?.annualized_return_pct ?? 0) >= 0 ? 'positive' : 'danger'} />
                 <CandidateStat label="Win Rate" value={`${selectedSummary.win_rate.toFixed(2)}%`} tone={selectedSummary.win_rate >= 50 ? 'positive' : 'warning'} />
                 <CandidateStat label="Profit Factor" value={selectedDiagnostic ? selectedDiagnostic.profit_factor.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.profit_factor ?? 0) >= 1.05 ? 'positive' : 'warning'} />
+                <CandidateStat label="Sharpe" value={selectedDiagnostic ? selectedDiagnostic.sharpe_ratio.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.sharpe_ratio ?? 0) >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="Cash Sharpe" value={selectedCashProfile ? selectedCashProfile.sharpe_ratio.toFixed(2) : 'N/A'} tone={(selectedCashProfile?.sharpe_ratio ?? 0) >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="Sortino" value={selectedDiagnostic ? selectedDiagnostic.sortino_ratio.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.sortino_ratio ?? 0) >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="Payoff" value={selectedDiagnostic ? selectedDiagnostic.payoff_ratio.toFixed(2) : 'N/A'} tone={(selectedDiagnostic?.payoff_ratio ?? 0) >= 1 ? 'positive' : 'warning'} />
+                <CandidateStat label="Avg Win" value={selectedDiagnostic ? pct(selectedDiagnostic.avg_win_pct) : 'N/A'} tone="positive" />
+                <CandidateStat label="Avg Loss" value={selectedDiagnostic ? pct(selectedDiagnostic.avg_loss_pct) : 'N/A'} tone="danger" />
                 <CandidateStat label="Profitable Months" value={`${profitableMonths}/${monthlyRows.length || 0}`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
-                <CandidateStat label="Monthly Hit Rate" value={`${profitableMonthPct.toFixed(1)}%`} tone={profitableMonthPct >= 55 ? 'positive' : 'warning'} />
                 <CandidateStat label="Positive Days" value={dayQuality ? `${dayQuality.positive_days_pct.toFixed(2)}%` : 'N/A'} tone={(dayQuality?.positive_days_pct ?? 0) >= 55 ? 'positive' : 'warning'} />
-                <CandidateStat label="Max Drawdown" value={dayQuality ? currency(dayQuality.max_drawdown_rs) : 'N/A'} tone="danger" />
+                <CandidateStat label="Max Drawdown" value={dayQuality ? `${currency(dayQuality.max_drawdown_rs)} (${selectedDiagnostic ? pct(selectedDiagnostic.max_drawdown_pct) : 'N/A'})` : 'N/A'} tone="danger" />
+                <CandidateStat label="Cash Max DD" value={selectedCashProfile ? `${currency(selectedCashProfile.max_drawdown_rs)} (${pct(selectedCashProfile.max_drawdown_pct)})` : 'N/A'} tone="danger" />
+                <CandidateStat label="Taken / Skipped" value={selectedCashProfile ? `${selectedCashProfile.trades_taken.toLocaleString('en-IN')} / ${selectedCashProfile.skipped_entries.toLocaleString('en-IN')}` : 'N/A'} tone={(selectedCashProfile?.skipped_entries ?? 0) > 0 ? 'warning' : 'positive'} />
+                <CandidateStat label="Peak Cash Used" value={selectedCashProfile ? `${pct(selectedCashProfile.peak_capital_used_pct)} ${currency(selectedCashProfile.peak_capital_used)}` : 'N/A'} tone={(selectedCashProfile?.peak_capital_used_pct ?? 0) <= 100 ? 'positive' : 'warning'} />
+                <CandidateStat label="Loss Streak" value={selectedDiagnostic ? `${selectedDiagnostic.max_losing_streak} trades` : 'N/A'} tone={(selectedDiagnostic?.max_losing_streak ?? 99) <= 4 ? 'positive' : 'warning'} />
               </div>
             </Surface>
 
             <div className="backtest-grid backtest-insight-grid">
-              <StrategyEquityCurvePanel strategyId={selectedStrategy} rows={selectedEquity} />
+              <StrategyEquityCurvePanel strategyId={activeStrategyId} rows={selectedEquity} />
+              <StrategyCashRealityPanel
+                strategyId={activeStrategyId}
+                profile={selectedCashProfile}
+                rows={selectedCashEquity}
+                months={selectedCashMonths}
+              />
               <StrategySuccessMetricsPanel
                 summary={selectedSummary}
                 diagnostic={selectedDiagnostic}
@@ -3604,7 +4731,7 @@ function BacktestsView({
                 <div className="compact-section-head">
                   <div>
                     <span className="eyebrow">Yearly Returns</span>
-                    <h2>{strategyLabel(selectedStrategy)}</h2>
+                    <h2>{strategyLabel(activeStrategyId)}</h2>
                   </div>
                 </div>
                 <div className="backtest-table">
@@ -3658,13 +4785,14 @@ function BacktestsView({
               <div className="monthly-pnl-grid">
                 {MONTH_LABELS.map((label, index) => {
                   const month = selectedYearMonths.find((row) => row.month === index + 1)
+                  const hasTrades = (month?.trades ?? 0) > 0
                   const pnl = month?.pnl ?? 0
                   const activeClass = pnl > 0 ? 'monthly-cell-positive' : pnl < 0 ? 'monthly-cell-negative' : 'monthly-cell-flat'
                   return (
                     <div key={`${activeYear}-${label}`} className={`monthly-cell ${activeClass}`}>
                       <span>{label}</span>
-                      <strong>{month ? currency(pnl) : 'No trades'}</strong>
-                      <small>{month ? `${month.trades.toLocaleString('en-IN')} trades | ${pct(month.return_pct)}` : '0 trades'}</small>
+                      <strong>{hasTrades ? currency(pnl) : 'No trades'}</strong>
+                      <small>{hasTrades ? `${month!.trades.toLocaleString('en-IN')} trades | ${pct(month!.return_pct)}` : '0 trades'}</small>
                     </div>
                   )
                 })}
@@ -3793,6 +4921,94 @@ function StrategyEquityCurvePanel({
   )
 }
 
+function StrategyCashRealityPanel({
+  strategyId,
+  profile,
+  rows,
+  months,
+}: {
+  strategyId: string
+  profile?: BacktestCashProfile
+  rows: BacktestCashEquityPoint[]
+  months: BacktestDashboardResponse['cash_monthly_returns']
+}) {
+  if (!profile || rows.length === 0) {
+    return (
+      <Surface className="inner-surface backtest-panel equity-panel empty-panel">
+        <div className="empty-icon-shell">
+          <WalletCards size={18} />
+        </div>
+        <h3>No cash curve yet</h3>
+        <p>Run the backtest again to build cash-constrained analytics.</p>
+      </Surface>
+    )
+  }
+
+  const width = 760
+  const height = 240
+  const padX = 38
+  const padY = 24
+  const innerWidth = width - padX * 2
+  const innerHeight = height - padY * 2
+  const values = rows.map((row) => row.return_pct)
+  const minValue = Math.min(0, ...values)
+  const maxValue = Math.max(0, ...values)
+  const span = Math.max(maxValue - minValue, 1)
+  const pointFor = (value: number, index: number) => {
+    const x = padX + (index / Math.max(rows.length - 1, 1)) * innerWidth
+    const y = padY + ((maxValue - value) / span) * innerHeight
+    return { x, y }
+  }
+  const points = rows.map((row, index) => pointFor(row.return_pct, index))
+  const linePath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ')
+  const zeroY = pointFor(0, 0).y
+  const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${zeroY.toFixed(2)} L ${points[0].x.toFixed(2)} ${zeroY.toFixed(2)} Z`
+  const latest = rows[rows.length - 1]
+  const worstDrawdown = Math.min(...rows.map((row) => row.drawdown_rs))
+  const bestPoint = rows.reduce((best, row) => (row.cumulative_pnl > best.cumulative_pnl ? row : best), rows[0])
+  const greenMonths = months.filter((row) => row.pnl > 0).length
+
+  return (
+    <Surface className="inner-surface backtest-panel equity-panel cash-curve-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Cash Equity</span>
+          <h2>{strategyLabel(strategyId)} executable curve</h2>
+        </div>
+        <div className="mini-chip">
+          <WalletCards size={14} />
+          <span>{profile.trades_taken}/{profile.candidate_trades} taken</span>
+        </div>
+      </div>
+
+      <div className="equity-chart-shell">
+        <svg viewBox={`0 0 ${width} ${height}`} className="equity-chart" role="img" aria-label={`${strategyLabel(strategyId)} cash-constrained equity curve`}>
+          {[0, 1, 2, 3].map((line) => {
+            const y = padY + (line / 3) * innerHeight
+            return <line key={line} x1={padX} x2={padX + innerWidth} y1={y} y2={y} className="chart-grid-line" />
+          })}
+          <line x1={padX} x2={padX + innerWidth} y1={zeroY} y2={zeroY} className="equity-zero-line" />
+          <path d={areaPath} className="cash-equity-area" />
+          <path d={linePath} className="cash-equity-line" />
+        </svg>
+        <div className="equity-axis-labels">
+          <span>{rows[0].trade_date}</span>
+          <span>{latest.trade_date}</span>
+        </div>
+      </div>
+
+      <div className="chart-summary-grid">
+        <CandidateStat label="Cash P&L" value={currency(profile.total_pnl)} tone={profile.total_pnl >= 0 ? 'positive' : 'danger'} />
+        <CandidateStat label="Cash Return" value={pct(profile.return_pct)} tone={profile.return_pct >= 0 ? 'positive' : 'danger'} />
+        <CandidateStat label="Worst DD" value={currency(worstDrawdown)} tone="danger" />
+        <CandidateStat label="Peak" value={`${bestPoint.trade_date} ${currency(bestPoint.cumulative_pnl)}`} tone="positive" />
+        <CandidateStat label="Months" value={`${greenMonths}/${months.length || 0}`} tone={profile.positive_months_pct >= 55 ? 'positive' : 'warning'} />
+        <CandidateStat label="Blocked" value={`${profile.cash_blocked_entries} cash / ${profile.duplicate_entries_skipped} dup`} tone={profile.skipped_entries > 0 ? 'warning' : 'positive'} />
+      </div>
+    </Surface>
+  )
+}
+
 function MonthlyReturnBars({
   rows,
   activeYear,
@@ -3815,12 +5031,13 @@ function MonthlyReturnBars({
       <div className="monthly-bar-area" role="img" aria-label={`${activeYear ?? 'Selected year'} monthly P&L bar chart`}>
         {MONTH_LABELS.map((label, index) => {
           const month = rowsByMonth.get(index + 1)
+          const hasTrades = (month?.trades ?? 0) > 0
           const pnl = month?.pnl ?? 0
-          const height = month ? Math.max(8, (Math.abs(pnl) / maxAbsPnl) * 100) : 0
+          const height = hasTrades ? Math.max(8, (Math.abs(pnl) / maxAbsPnl) * 100) : 0
           const tone = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'flat'
           return (
             <div key={`monthly-bar-${activeYear}-${label}`} className="monthly-bar-column">
-              <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{month ? compactCurrency(pnl) : '-'}</strong>
+              <strong className={pnl >= 0 ? 'tone-positive' : 'tone-danger'}>{hasTrades ? compactCurrency(pnl) : '-'}</strong>
               <div className="monthly-bar-track">
                 <span className={`monthly-bar-fill monthly-bar-${tone}`} style={{ height: `${height}%` }} />
               </div>
@@ -3843,7 +5060,7 @@ function StrategySuccessMetricsPanel({
   dayQuality?: BacktestDayQuality
 }) {
   const recoveryFactor = diagnostic && diagnostic.max_drawdown_rs < 0
-    ? summary.total_pnl / Math.abs(diagnostic.max_drawdown_rs)
+    ? diagnostic.recovery_factor
     : null
   const stopShare = summary.total_trades > 0 ? (summary.sl_exits / summary.total_trades) * 100 : 0
   const timeExitShare = summary.total_trades > 0 ? (summary.time_exits / summary.total_trades) * 100 : 0
@@ -3855,16 +5072,34 @@ function StrategySuccessMetricsPanel({
       tone: (diagnostic?.profit_factor ?? 0) >= 1.3 ? 'positive' : (diagnostic?.profit_factor ?? 0) >= 1.1 ? 'warning' : 'danger',
     },
     {
-      label: 'Expectancy',
-      value: diagnostic ? pct(diagnostic.expectancy_pct) : pct(summary.avg_return_pct),
-      note: 'Average trade should stay positive after fees and slippage.',
-      tone: (diagnostic?.expectancy_pct ?? summary.avg_return_pct) > 0 ? 'positive' : 'danger',
+      label: 'Annualized return',
+      value: diagnostic ? pct(diagnostic.annualized_return_pct) : 'N/A',
+      note: 'This annualizes the equity-curve return on fixed strategy capital.',
+      tone: (diagnostic?.annualized_return_pct ?? 0) >= 25 ? 'positive' : (diagnostic?.annualized_return_pct ?? 0) > 0 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Sharpe / Sortino',
+      value: diagnostic ? `${diagnostic.sharpe_ratio.toFixed(2)} / ${diagnostic.sortino_ratio.toFixed(2)}` : 'N/A',
+      note: 'Risk-adjusted daily P&L; above 1 is decent, above 2 is strong.',
+      tone: (diagnostic?.sharpe_ratio ?? 0) >= 1.5 && (diagnostic?.sortino_ratio ?? 0) >= 2 ? 'positive' : (diagnostic?.sharpe_ratio ?? 0) >= 0.75 ? 'warning' : 'danger',
     },
     {
       label: 'Recovery factor',
       value: recoveryFactor === null ? 'N/A' : recoveryFactor.toFixed(2),
       note: 'Total profit divided by max drawdown; higher means smoother compounding.',
       tone: (recoveryFactor ?? 0) >= 2 ? 'positive' : (recoveryFactor ?? 0) >= 1 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Max losing streak',
+      value: diagnostic ? `${diagnostic.max_losing_streak} trades` : 'N/A',
+      note: 'Longest consecutive losing trade run in chronological order.',
+      tone: (diagnostic?.max_losing_streak ?? 99) <= 4 ? 'positive' : (diagnostic?.max_losing_streak ?? 99) <= 8 ? 'warning' : 'danger',
+    },
+    {
+      label: 'Payoff',
+      value: diagnostic ? `${pct(diagnostic.avg_win_pct)} / ${pct(diagnostic.avg_loss_pct)}` : 'N/A',
+      note: 'Average win versus average loss after the backtest exit model.',
+      tone: (diagnostic?.payoff_ratio ?? 0) >= 1.4 ? 'positive' : (diagnostic?.payoff_ratio ?? 0) >= 1 ? 'warning' : 'danger',
     },
     {
       label: 'Consistency',
@@ -4120,6 +5355,769 @@ function DatewiseMoverList({
   )
 }
 
+function MarketHubView({
+  news,
+  deals,
+  activity,
+  events,
+  predictions,
+  loading,
+  refreshing,
+  status,
+  dealError,
+  activityError,
+  eventError,
+  symbol,
+  source,
+  dealType,
+  activityMetric,
+  highImpactOnly,
+  onSymbolChange,
+  onSourceChange,
+  onDealTypeChange,
+  onActivityMetricChange,
+  onHighImpactChange,
+  onLoad,
+  onRefresh,
+  onSelect,
+}: {
+  news: NewsItem[]
+  deals: NseLargeDeal[]
+  activity: MarketActivityItem[]
+  events: CorporateEvent[]
+  predictions: BacktestPrediction[]
+  loading: boolean
+  refreshing: boolean
+  status: string
+  dealError: string
+  activityError: string
+  eventError: string
+  symbol: string
+  source: string
+  dealType: string
+  activityMetric: string
+  highImpactOnly: boolean
+  onSymbolChange: (value: string) => void
+  onSourceChange: (value: string) => void
+  onDealTypeChange: (value: string) => void
+  onActivityMetricChange: (value: string) => void
+  onHighImpactChange: (value: boolean) => void
+  onLoad: () => void
+  onRefresh: () => void
+  onSelect: (symbol: string) => void
+}) {
+  const uniqueArticles = new Set(news.map((item) => item.article_id)).size
+  const linkedSymbols = new Set(news.map((item) => item.symbol).filter(Boolean)).size
+  const bullish = news.filter((item) => item.direction === 'BULLISH').length
+  const bearish = news.filter((item) => item.direction === 'BEARISH').length
+  const actionableCatalysts = news.filter((item) => item.symbol && item.impact_score >= 2.5).length
+  const dealValueCr = deals.reduce((sum, deal) => sum + deal.value_lakh / 100, 0)
+  const shockers = activity.filter((item) => item.metric_type === 'volume_shockers')
+  const topVolume = activity.reduce((max, item) => Math.max(max, item.volume_multiplier || 0), 0)
+  const sourceOptions = Array.from(new Set(news.map((item) => item.source).filter(Boolean))).sort()
+
+  return (
+    <div className="page-stack market-hub-page">
+      <Surface className="market-hub-control">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">Market Command Center</span>
+            <h2>News, NSE deals, volume shockers, and active stocks</h2>
+          </div>
+          <div className="row-actions">
+            <button type="button" className="ghost-button" onClick={onLoad} disabled={loading || refreshing}>
+              <RefreshCw size={14} className={loading ? 'spin' : ''} />
+              <span>{loading ? 'Loading' : 'Reload'}</span>
+            </button>
+            <button type="button" className="primary-button" onClick={onRefresh} disabled={refreshing}>
+              <Zap size={14} />
+              <span>{refreshing ? 'Refreshing' : 'Refresh Sources'}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="market-filter-grid">
+          <label className="input-with-icon">
+            <Search size={13} />
+            <input
+              value={symbol}
+              onChange={(event) => onSymbolChange(event.target.value.toUpperCase())}
+              placeholder="Symbol"
+              className="text-input"
+            />
+          </label>
+          <select value={source} onChange={(event) => onSourceChange(event.target.value)} className="select-input">
+            <option value="">All news sources</option>
+            {sourceOptions.map((option) => (
+              <option key={option} value={option}>{formatSourceName(option)}</option>
+            ))}
+          </select>
+          <select value={dealType} onChange={(event) => onDealTypeChange(event.target.value)} className="select-input">
+            <option value="">All NSE deals</option>
+            <option value="BULK">Bulk deals</option>
+            <option value="BLOCK">Block deals</option>
+          </select>
+          <select value={activityMetric} onChange={(event) => onActivityMetricChange(event.target.value)} className="select-input">
+            <option value="">All activity</option>
+            <option value="volume_shockers">Volume shockers</option>
+            <option value="most_active">Most active stocks</option>
+          </select>
+          <button
+            type="button"
+            className={highImpactOnly ? 'filter-chip filter-chip-active' : 'filter-chip'}
+            onClick={() => onHighImpactChange(!highImpactOnly)}
+          >
+            <Filter size={13} />
+            <span>Impact 2.5+</span>
+          </button>
+        </div>
+
+        {status && <div className="success-banner">{status}</div>}
+        {dealError && <div className="warning-banner">NSE deals: {dealError}</div>}
+        {activityError && <div className="warning-banner">Market activity: {activityError}</div>}
+        {eventError && <div className="warning-banner">Previous catalysts: {eventError}</div>}
+      </Surface>
+
+      <div className="market-stat-grid">
+        <CandidateStat label="Articles" value={String(uniqueArticles)} />
+        <CandidateStat label="Linked Symbols" value={String(linkedSymbols)} tone={linkedSymbols > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="NSE Deal Value" value={`Rs ${dealValueCr.toFixed(1)}Cr`} tone={deals.length > 0 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Shockers" value={String(shockers.length)} tone={shockers.length > 0 ? 'warning' : 'neutral'} />
+        <CandidateStat label="Top Vol X" value={topVolume > 0 ? `${topVolume.toFixed(2)}x` : '0x'} tone={topVolume >= 3 ? 'positive' : 'neutral'} />
+        <CandidateStat label="Catalyst Checks" value={String(actionableCatalysts)} tone={actionableCatalysts > 0 ? 'warning' : 'neutral'} />
+      </div>
+
+      <FivePercentStrategyBrief catalystCount={actionableCatalysts} bullish={bullish} bearish={bearish} />
+
+      <PredictionHistoryPanel predictions={predictions} loading={loading} onSelect={onSelect} />
+
+      <PreviousCatalystsPanel events={events} loading={loading} onSelect={onSelect} />
+
+      <div className="market-feed-grid">
+        <MarketActivityPanel activity={activity} loading={loading} onSelect={onSelect} />
+        <LargeDealsPanel deals={deals} loading={loading} onSelect={onSelect} />
+      </div>
+
+      <NewsTapePanel news={news} deals={deals} activity={activity} loading={loading} onSelect={onSelect} />
+    </div>
+  )
+}
+
+function FivePercentStrategyBrief({
+  catalystCount,
+  bullish,
+  bearish,
+}: {
+  catalystCount: number
+  bullish: number
+  bearish: number
+}) {
+  return (
+    <Surface className="five-percent-brief">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Corrected Historical Backtest · Paper Only</span>
+          <h2>5% target / 10-session swing plan</h2>
+        </div>
+        <span className="stage-pill tone-warning">Needs fresh confirmation</span>
+      </div>
+      <div className="strategy-brief-grid">
+        <div className="strategy-rule-stack">
+          <strong>Entry must pass every gate</strong>
+          <ol>
+            <li>Realized same-day financial-result filing; a headline or scheduled event is not enough.</li>
+            <li>Relative volume at least 8x the 50-session baseline.</li>
+            <li>Close in the upper 30% of the signal candle, in an uptrend, and at least 85% of the prior 52-week high.</li>
+            <li>Enter next session only; use a 5% stop, 5% target, and mandatory session-10 exit.</li>
+          </ol>
+        </div>
+        <div className="strategy-evidence-grid">
+          <span><strong>+1.09%</strong><small>Full backtest expectancy</small></span>
+          <span><strong>+2.05%</strong><small>Validation expectancy</small></span>
+          <span><strong>+0.24%</strong><small>Held-out OOS expectancy</small></span>
+          <span><strong>1.11</strong><small>OOS profit factor</small></span>
+          <span><strong>45.7%</strong><small>OOS 5% target hit</small></span>
+          <span><strong>35</strong><small>OOS trades</small></span>
+        </div>
+      </div>
+      <div className="strategy-brief-foot">
+        <span>{catalystCount} current checks · tone: {bullish} bullish / {bearish} bearish.</span>
+        <span>Event-only baselines lost money. These are backtest results, not successful live predictions.</span>
+      </div>
+    </Surface>
+  )
+}
+
+function PredictionHistoryPanel({
+  predictions,
+  loading,
+  onSelect,
+}: {
+  predictions: BacktestPrediction[]
+  loading: boolean
+  onSelect: (symbol: string) => void
+}) {
+  const [outcomeFilter, setOutcomeFilter] = useState<'all' | 'target' | 'miss'>('all')
+  const filtered = predictions.filter((row) => (
+    outcomeFilter === 'all'
+      ? true
+      : outcomeFilter === 'target'
+        ? row.target_hit === true
+        : row.target_hit !== true
+  ))
+  const visible = filtered.slice(0, 6)
+  const targetHits = predictions.filter((row) => row.target_hit === true).length
+
+  return (
+    <Surface className="prediction-history-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Historical Simulation · Not Live Calls</span>
+          <h2>What the corrected strategy predicted in the past</h2>
+        </div>
+        <span className="mini-chip">{targetHits} target hits / {predictions.length} loaded</span>
+      </div>
+      <div className="prediction-history-toolbar">
+        <p>These rows are backtested next-session entries. Prospective paper predictions have not accumulated yet.</p>
+        <div className="news-view-toggle" role="group" aria-label="Historical prediction outcome">
+          <button type="button" className={outcomeFilter === 'all' ? 'active' : ''} onClick={() => setOutcomeFilter('all')}>Recent</button>
+          <button type="button" className={outcomeFilter === 'target' ? 'active' : ''} onClick={() => setOutcomeFilter('target')}>5% hit</button>
+          <button type="button" className={outcomeFilter === 'miss' ? 'active' : ''} onClick={() => setOutcomeFilter('miss')}>Miss / stop</button>
+        </div>
+      </div>
+      {loading && predictions.length === 0 ? (
+        <MarketRowsSkeleton count={3} />
+      ) : visible.length === 0 ? (
+        <MarketEmpty icon={<Target size={18} />} label="Historical prediction evidence is unavailable" />
+      ) : (
+        <div className="prediction-history-grid">
+          {visible.map((row) => {
+            const outcome = row.outcome || row.exit_reason || (row.target_hit ? 'TARGET' : 'NOT TARGET')
+            const eventTitle = row.event_title || row.event_titles || row.event_category || row.event_categories || 'Financial-results catalyst'
+            const returnPct = Number(row.net_return_pct)
+            return (
+              <div key={`${row.strategy || 'strategy'}-${row.symbol}-${row.signal_date}`} className="prediction-history-card">
+                <div className="market-row-badges">
+                  <button type="button" className="symbol-link" onClick={() => onSelect(row.symbol)}>{row.symbol}</button>
+                  <span className={`stage-pill ${row.target_hit ? 'tone-positive' : outcome.toUpperCase().includes('STOP') ? 'tone-danger' : 'tone-warning'}`}>{outcome}</span>
+                  <span className="stage-pill tone-neutral">{row.split || 'backtest'}</span>
+                </div>
+                <strong>{eventTitle}</strong>
+                <small>{row.signal_date} signal · {row.exit_date} exit · {row.hold_sessions} sessions</small>
+                <div className="prediction-history-facts">
+                  <span><small>Net return</small><strong className={returnPct >= 0 ? 'tone-positive' : 'tone-danger'}>{Number.isFinite(returnPct) ? `${returnPct >= 0 ? '+' : ''}${returnPct.toFixed(2)}%` : 'Unavailable'}</strong></span>
+                  <span><small>Signal volume</small><strong>{typeof row.relvol50 === 'number' && Number.isFinite(row.relvol50) ? `${row.relvol50.toFixed(2)}x` : 'Unavailable'}</strong></span>
+                  <span><small>5% target</small><strong>{row.target_hit ? 'Hit' : 'Not hit'}</strong></span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </Surface>
+  )
+}
+
+function PreviousCatalystsPanel({
+  events,
+  loading,
+  onSelect,
+}: {
+  events: CorporateEvent[]
+  loading: boolean
+  onSelect: (symbol: string) => void
+}) {
+  const rankedEvents = Array.from(
+    new Map(events.map((event) => [event.event_id, event])).values(),
+  ).sort((left, right) => {
+    const freshness = marketTimestampValue(right.event_time || right.event_date) - marketTimestampValue(left.event_time || left.event_date)
+    return freshness !== 0 ? freshness : right.catalyst_score - left.catalyst_score
+  })
+  const visibleEvents = rankedEvents.slice(0, 6)
+
+  return (
+    <Surface className="previous-catalysts-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Previous Catalysts · 730-Day Context</span>
+          <h2>Recent corporate events worth comparing</h2>
+        </div>
+        <span className="mini-chip">Top {visibleEvents.length} of {rankedEvents.length}</span>
+      </div>
+      <p className="previous-catalysts-note">This is an event archive, not a success record. Price outcomes remain unavailable until the event-performance endpoint is linked.</p>
+      {loading && events.length === 0 ? (
+        <MarketRowsSkeleton count={3} />
+      ) : visibleEvents.length === 0 ? (
+        <MarketEmpty icon={<CalendarDays size={18} />} label="No previous corporate events in the current filter" />
+      ) : (
+        <div className="previous-catalyst-grid">
+          {visibleEvents.map((event) => (
+            <details key={event.event_id} className="previous-catalyst-card">
+              <summary>
+                <div className="market-row-badges">
+                  <span className="symbol-chip-static">{event.symbol}</span>
+                  <span className="stage-pill tone-neutral">{formatSourceName(event.event_category || 'event')}</span>
+                </div>
+                <strong>{event.title}</strong>
+                <small>
+                  {marketTimestamp(event.event_time || event.event_date)} · Catalyst score {Number.isFinite(event.catalyst_score) ? event.catalyst_score.toFixed(2) : 'unavailable'}
+                  {(event.evidence_count ?? 0) > 1 ? ` · ${event.evidence_count} linked filings` : ''}
+                </small>
+              </summary>
+              <div className="previous-catalyst-detail">
+                <p>{event.summary || 'No event summary was returned.'}</p>
+                <span><strong>Historical outcome</strong>Not tracked by this event response.</span>
+                <div className="news-detail-actions">
+                  <button type="button" className="ghost-button ghost-button-small" onClick={() => onSelect(event.symbol)}>Open {event.symbol}</button>
+                  {(event.source_url || event.attachment_url) && (
+                    <a href={event.source_url || event.attachment_url} target="_blank" rel="noreferrer" className="ghost-button ghost-button-small news-source-action">
+                      <span>Open filing</span>
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
+                </div>
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
+    </Surface>
+  )
+}
+
+function MarketActivityPanel({
+  activity,
+  loading,
+  onSelect,
+}: {
+  activity: MarketActivityItem[]
+  loading: boolean
+  onSelect: (symbol: string) => void
+}) {
+  const [rowLimit, setRowLimit] = useState(6)
+  const rankedActivity = [...activity].sort((left, right) => {
+    const freshness = marketTimestampValue(right.snapshot_at || right.fetched_at) - marketTimestampValue(left.snapshot_at || left.fetched_at)
+    if (freshness !== 0) return freshness
+    if (right.volume_multiplier !== left.volume_multiplier) return right.volume_multiplier - left.volume_multiplier
+    return right.value_cr - left.value_cr
+  })
+  const visibleActivity = rankedActivity.slice(0, rowLimit)
+
+  return (
+    <Surface className="market-feed-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Moneycontrol Activity</span>
+          <h2>Volume shockers and active stocks</h2>
+        </div>
+        <div className="market-panel-controls">
+          <span className="mini-chip">Top {Math.min(rowLimit, activity.length)} of {activity.length}</span>
+          <label className="compact-limit-control">
+            <span>Show</span>
+            <select value={rowLimit} onChange={(event) => setRowLimit(Number(event.target.value))} aria-label="Volume rows to show">
+              <option value={6}>6</option>
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      {loading ? (
+        <MarketRowsSkeleton count={5} />
+      ) : activity.length === 0 ? (
+        <MarketEmpty icon={<Activity size={18} />} label="No activity rows yet" />
+      ) : (
+        <div className="market-row-list">
+          {visibleActivity.map((item, index) => {
+            const sourceUrl = item.share_url || item.source_url || 'https://www.moneycontrol.com/stocks/market-stats/'
+            return (
+              <div key={`${item.row_id}-${index}`} className="market-activity-row">
+                <div className="market-row-main">
+                  <div className="market-row-badges">
+                    <span className="stage-pill">#{item.rank || index + 1}</span>
+                    <span className="stage-pill tone-warning">{formatActivityMetric(item.metric_type)}</span>
+                    <button type="button" className="symbol-chip" onClick={() => onSelect(item.symbol)}>{item.symbol}</button>
+                  </div>
+                  <strong>{item.stock_name || item.symbol}</strong>
+                  <small>{item.snapshot_at || item.fetched_at}</small>
+                </div>
+                <div className="market-row-metrics">
+                  <span>{currency(item.price)}<small>Price</small></span>
+                  <span className={item.change_pct >= 0 ? 'tone-positive' : 'tone-danger'}>{pct(item.change_pct)}<small>Move</small></span>
+                  <span className={item.volume_multiplier >= 3 ? 'tone-positive' : 'tone-neutral'}>{item.volume_multiplier > 0 ? `${item.volume_multiplier.toFixed(2)}x` : '-'}<small>Vol x</small></span>
+                  <span>{item.value_cr.toFixed(1)}Cr<small>Value</small></span>
+                </div>
+                <a href={sourceUrl} target="_blank" rel="noreferrer" className="icon-link" aria-label="Open Moneycontrol source">
+                  <ExternalLink size={14} />
+                </a>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {activity.length > visibleActivity.length && (
+        <p className="market-panel-foot">Ranked newest first, then by volume surge and traded value. Use the limit control to inspect more.</p>
+      )}
+    </Surface>
+  )
+}
+
+function LargeDealsPanel({
+  deals,
+  loading,
+  onSelect,
+}: {
+  deals: NseLargeDeal[]
+  loading: boolean
+  onSelect: (symbol: string) => void
+}) {
+  const [rowLimit, setRowLimit] = useState(6)
+  const rankedDeals = [...deals].sort((left, right) => {
+    const freshness = marketTimestampValue(right.deal_date || right.fetched_at) - marketTimestampValue(left.deal_date || left.fetched_at)
+    if (freshness !== 0) return freshness
+    return right.value_lakh - left.value_lakh
+  })
+  const visibleDeals = rankedDeals.slice(0, rowLimit)
+
+  return (
+    <Surface className="market-feed-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">NSE Official</span>
+          <h2>Bulk and block disclosures</h2>
+        </div>
+        <div className="market-panel-controls">
+          <span className="mini-chip">Top {Math.min(rowLimit, deals.length)} of {deals.length}</span>
+          <label className="compact-limit-control">
+            <span>Show</span>
+            <select value={rowLimit} onChange={(event) => setRowLimit(Number(event.target.value))} aria-label="NSE deal rows to show">
+              <option value={6}>6</option>
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      {loading ? (
+        <MarketRowsSkeleton count={5} />
+      ) : deals.length === 0 ? (
+        <MarketEmpty icon={<Landmark size={18} />} label="No NSE deal rows yet" />
+      ) : (
+        <div className="market-row-list">
+          {visibleDeals.map((deal, index) => (
+            <div key={`${deal.deal_id}-${index}`} className="market-deal-row">
+              <div className="market-row-main">
+                <div className="market-row-badges">
+                  <span className="stage-pill">{deal.deal_type || 'DEAL'}</span>
+                  <span className={deal.side === 'BUY' ? 'stage-pill tone-positive' : deal.side === 'SELL' ? 'stage-pill tone-danger' : 'stage-pill'}>{deal.side || 'NA'}</span>
+                  <button type="button" className="symbol-chip" onClick={() => onSelect(deal.symbol)}>{deal.symbol}</button>
+                </div>
+                <strong>{deal.client_name || 'Unknown client'}</strong>
+                <small>{deal.security_name || deal.symbol} · {deal.deal_date}</small>
+              </div>
+              <div className="market-row-metrics deal-metrics">
+                <span>{compactNumber(deal.quantity)}<small>Qty</small></span>
+                <span>{currency(deal.price)}<small>Price</small></span>
+                <span className="tone-positive">Rs {(deal.value_lakh / 100).toFixed(2)}Cr<small>Value</small></span>
+              </div>
+              <a href={deal.source_url || 'https://www.nseindia.com/market-data/large-deals'} target="_blank" rel="noreferrer" className="icon-link" aria-label="Open NSE source">
+                <ExternalLink size={14} />
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
+      {deals.length > visibleDeals.length && (
+        <p className="market-panel-foot">Ranked newest deal date first, then by disclosed value. A disclosure is evidence, not an entry by itself.</p>
+      )}
+    </Surface>
+  )
+}
+
+function NewsTapePanel({
+  news,
+  deals,
+  activity,
+  pastEvidence = [],
+  loading,
+  onSelect,
+}: {
+  news: NewsItem[]
+  deals: NseLargeDeal[]
+  activity: MarketActivityItem[]
+  pastEvidence?: NewsPastEvidence[]
+  loading: boolean
+  onSelect: (symbol: string) => void
+}) {
+  const [deskView, setDeskView] = useState<NewsDeskView>('actionable')
+  const [sortMode, setSortMode] = useState<NewsDeskSort>('latest')
+  const [rowLimit, setRowLimit] = useState(8)
+
+  const uniqueNews = Array.from(
+    new Map(news.map((item) => [`${item.article_id}|${item.symbol || 'MARKET'}`, item])).values(),
+  )
+
+  const activityBySymbol = new Map<string, MarketActivityItem>()
+  activity.forEach((item) => {
+    const symbol = item.symbol.trim().toUpperCase()
+    if (!symbol) return
+    const current = activityBySymbol.get(symbol)
+    const currentTime = marketTimestampValue(current?.snapshot_at || current?.fetched_at)
+    const nextTime = marketTimestampValue(item.snapshot_at || item.fetched_at)
+    if (!current || nextTime > currentTime || (nextTime === currentTime && item.volume_multiplier > current.volume_multiplier)) {
+      activityBySymbol.set(symbol, item)
+    }
+  })
+
+  type DealEvidence = { count: number; valueCr: number; buyCr: number; sellCr: number; latestAt: number }
+  const dealsBySymbol = new Map<string, DealEvidence>()
+  deals.forEach((deal) => {
+    const symbol = deal.symbol.trim().toUpperCase()
+    if (!symbol) return
+    const valueCr = deal.value_lakh / 100
+    const current = dealsBySymbol.get(symbol) ?? { count: 0, valueCr: 0, buyCr: 0, sellCr: 0, latestAt: 0 }
+    current.count += 1
+    current.valueCr += valueCr
+    if (deal.side.toUpperCase() === 'BUY') current.buyCr += valueCr
+    if (deal.side.toUpperCase() === 'SELL') current.sellCr += valueCr
+    current.latestAt = Math.max(current.latestAt, marketTimestampValue(deal.deal_date || deal.fetched_at))
+    dealsBySymbol.set(symbol, current)
+  })
+
+  const evidenceFor = (item: NewsItem) => {
+    const symbol = item.symbol.trim().toUpperCase()
+    return {
+      activity: activityBySymbol.get(symbol),
+      deal: dealsBySymbol.get(symbol),
+    }
+  }
+
+  const compareNews = (left: NewsItem, right: NewsItem) => {
+    const leftEvidence = evidenceFor(left)
+    const rightEvidence = evidenceFor(right)
+    const leftTime = marketTimestampValue(left.published_at || left.fetched_at)
+    const rightTime = marketTimestampValue(right.published_at || right.fetched_at)
+    const leftVolume = leftEvidence.activity?.volume_multiplier ?? 0
+    const rightVolume = rightEvidence.activity?.volume_multiplier ?? 0
+    const leftDeals = leftEvidence.deal?.valueCr ?? 0
+    const rightDeals = rightEvidence.deal?.valueCr ?? 0
+
+    if (sortMode === 'volume' && rightVolume !== leftVolume) return rightVolume - leftVolume
+    if (sortMode === 'deals' && rightDeals !== leftDeals) return rightDeals - leftDeals
+    if (sortMode === 'impact' && right.impact_score !== left.impact_score) return right.impact_score - left.impact_score
+    if (rightTime !== leftTime) return rightTime - leftTime
+    if (rightVolume !== leftVolume) return rightVolume - leftVolume
+    if (rightDeals !== leftDeals) return rightDeals - leftDeals
+    return right.impact_score - left.impact_score
+  }
+
+  const linkedNews = uniqueNews.filter((item) => item.symbol).sort(compareNews)
+  const actionableNews = linkedNews.filter((item) => {
+    const evidence = evidenceFor(item)
+    return item.impact_score >= 2.5
+      || (evidence.activity?.volume_multiplier ?? 0) >= 2
+      || (evidence.deal?.valueCr ?? 0) > 0
+  })
+  const selectedNews = deskView === 'actionable' ? actionableNews : linkedNews
+  const visibleNews = selectedNews.slice(0, rowLimit)
+  const marketNews = uniqueNews.filter((item) => !item.symbol).sort(compareNews)
+  const visibleMarketNews = marketNews.slice(0, 4)
+  const pastEvidenceByKey = new Map(
+    pastEvidence.map((item) => [`${item.article_id}|${item.symbol.trim().toUpperCase()}`, item]),
+  )
+
+  const renderRows = (rows: NewsItem[]) => (
+    <div className="compact-news-list">
+      {rows.map((item) => {
+        const direction = item.direction || 'NEUTRAL'
+        const context = item.reason || item.summary || 'No explanatory context was returned by the news API.'
+        const evidence = evidenceFor(item)
+        const past = pastEvidenceByKey.get(`${item.article_id}|${item.symbol.trim().toUpperCase()}`)
+        const volumeMultiplier = evidence.activity?.volume_multiplier ?? 0
+        const dealValueCr = evidence.deal?.valueCr ?? 0
+        const isFinancialResult = /result|earnings|quarter|profit/i.test(`${item.title} ${item.reason} ${item.category}`)
+        const hasEntryVolume = Boolean(item.symbol) && volumeMultiplier >= 8
+        const action = !item.symbol
+          ? 'CONTEXT ONLY'
+          : direction === 'BEARISH'
+            ? 'REVIEW RISK / AVOID FRESH LONG'
+            : direction === 'BULLISH' && item.impact_score >= 2.5 && isFinancialResult && hasEntryVolume
+              ? 'CHECK FULL ENTRY GATES'
+              : 'WATCH — NEEDS CONFIRMATION'
+        const actionTone = direction === 'BEARISH'
+          ? 'tone-danger'
+          : action === 'CHECK FULL ENTRY GATES'
+            ? 'tone-positive'
+            : 'tone-warning'
+        const predictionStatus = past?.prediction_status
+          || (item.symbol ? 'Research check only — not a confirmed entry' : 'Market context — no stock prediction')
+
+        return (
+          <details key={`${item.article_id}-${item.symbol || 'market'}`} className={item.symbol ? 'compact-news-card compact-news-card-linked' : 'compact-news-card'}>
+            <summary className="compact-news-summary">
+              <div className="compact-news-main">
+                <div className="market-row-badges">
+                  {item.symbol ? <span className="symbol-chip-static">{item.symbol}</span> : <span className="stage-pill">MARKET</span>}
+                  <span className={`stage-pill ${direction === 'BULLISH' ? 'tone-positive' : direction === 'BEARISH' ? 'tone-danger' : direction === 'WATCH' ? 'tone-warning' : ''}`}>{direction}</span>
+                  <span className="stage-pill tone-neutral">{formatSourceName(item.source)}</span>
+                </div>
+                <strong>{item.title}</strong>
+                <small>
+                  {marketTimestamp(item.published_at || item.fetched_at)}
+                  {item.company_name ? ` · ${item.company_name}` : ''}
+                </small>
+              </div>
+              <div className="compact-news-decision">
+                <strong className={actionTone}>{action}</strong>
+                <span>
+                  {volumeMultiplier > 0 ? `${volumeMultiplier.toFixed(2)}x volume` : 'Volume unavailable'}
+                  {' · '}
+                  {dealValueCr > 0 ? `Rs ${dealValueCr.toFixed(2)}Cr deals` : 'No matched NSE deal'}
+                </span>
+                <small>Open evidence</small>
+              </div>
+            </summary>
+
+            <div className="compact-news-detail">
+              <p className="news-context">{context}</p>
+              <div className="news-evidence-grid">
+                <span className={item.impact_score >= 2.5 ? 'tone-positive' : 'tone-neutral'}><strong>{item.impact_score.toFixed(2)}</strong><small>API impact</small></span>
+                <span><strong>{formatConfidence(item.symbol ? item.match_confidence : item.confidence)}</strong><small>{item.symbol ? 'Symbol match' : 'API confidence'}</small></span>
+                <span className={volumeMultiplier >= 8 ? 'tone-positive' : 'tone-neutral'}><strong>{volumeMultiplier > 0 ? `${volumeMultiplier.toFixed(2)}x` : 'Unavailable'}</strong><small>Volume surge (8x gate)</small></span>
+                <span className={dealValueCr > 0 ? 'tone-positive' : 'tone-neutral'}><strong>{dealValueCr > 0 ? `Rs ${dealValueCr.toFixed(2)}Cr` : 'No match'}</strong><small>NSE deal value</small></span>
+              </div>
+
+              {item.symbol ? (
+                <div className="news-paper-plan">
+                  <span><small>Action</small><strong className={actionTone}>{action}</strong></span>
+                  <span><small>Paper target</small><strong>+5%</strong></span>
+                  <span><small>Risk stop</small><strong>-5%</strong></span>
+                  <span><small>Max horizon</small><strong>10 sessions</strong></span>
+                </div>
+              ) : (
+                <div className="news-context-callout">Context can change market risk, but it does not inherit the stock-entry target or stop.</div>
+              )}
+
+              <div className="news-prediction-audit">
+                <span><strong>Prediction status</strong>{predictionStatus}</span>
+                <span>
+                  <strong>Past evidence</strong>
+                  {past
+                    ? `${past.outcome || 'Evaluated'}${Number.isFinite(past.return_pct) ? ` · ${past.return_pct! >= 0 ? '+' : ''}${past.return_pct!.toFixed(2)}%` : ''}${typeof past.target_hit === 'boolean' ? ` · 5% target ${past.target_hit ? 'hit' : 'not hit'}` : ''}${past.evaluated_at ? ` · ${marketTimestamp(past.evaluated_at)}` : ''}`
+                    : 'Unavailable — the current news API does not return post-event performance.'}
+                </span>
+                <span><strong>Evidence source</strong>{item.model ? `News score: ${item.model}` : 'Scoring model unavailable'}{evidence.activity ? ` · Activity: ${formatActivityMetric(evidence.activity.metric_type)}` : ''}{evidence.deal ? ` · NSE rows: ${evidence.deal.count} (buy Rs ${evidence.deal.buyCr.toFixed(2)}Cr / sell Rs ${evidence.deal.sellCr.toFixed(2)}Cr)` : ''}</span>
+              </div>
+
+              <div className="news-detail-actions">
+                {item.symbol && <button type="button" className="ghost-button ghost-button-small" onClick={() => onSelect(item.symbol)}>Open {item.symbol}</button>}
+                {item.url && (
+                  <a href={item.url} target="_blank" rel="noreferrer" className="ghost-button ghost-button-small news-source-action">
+                    <span>Open source</span>
+                    <ExternalLink size={12} />
+                  </a>
+                )}
+              </div>
+            </div>
+          </details>
+        )
+      })}
+    </div>
+  )
+
+  return (
+    <Surface className="market-feed-panel">
+      <div className="compact-section-head">
+        <div>
+          <span className="eyebrow">Action Desk · Bounded Shortlist</span>
+          <h2>Latest catalysts ranked with volume and NSE deal evidence</h2>
+        </div>
+        <span className="mini-chip">Showing {visibleNews.length} of {selectedNews.length}</span>
+      </div>
+      {loading ? (
+        <MarketRowsSkeleton count={5} />
+      ) : uniqueNews.length === 0 ? (
+        <MarketEmpty icon={<Newspaper size={18} />} label="No news rows yet" />
+      ) : (
+        <div className="ranked-news-sections">
+          <div className="news-desk-toolbar">
+            <div className="news-view-toggle" role="group" aria-label="News shortlist view">
+              <button type="button" className={deskView === 'actionable' ? 'active' : ''} onClick={() => setDeskView('actionable')}>Actionable ({actionableNews.length})</button>
+              <button type="button" className={deskView === 'linked' ? 'active' : ''} onClick={() => setDeskView('linked')}>All linked ({linkedNews.length})</button>
+            </div>
+            <label className="compact-select-control">
+              <span>Rank</span>
+              <select value={sortMode} onChange={(event) => setSortMode(event.target.value as NewsDeskSort)}>
+                <option value="latest">Latest + evidence</option>
+                <option value="volume">Volume surge first</option>
+                <option value="deals">NSE deal value first</option>
+                <option value="impact">API impact first</option>
+              </select>
+            </label>
+            <label className="compact-select-control">
+              <span>Show</span>
+              <select value={rowLimit} onChange={(event) => setRowLimit(Number(event.target.value))}>
+                <option value={5}>5</option>
+                <option value={8}>8</option>
+                <option value={12}>12</option>
+                <option value={20}>20 max</option>
+              </select>
+            </label>
+          </div>
+
+          <section className="news-section">
+            <div className="news-section-head">
+              <div>
+                <strong>{deskView === 'actionable' ? 'Top action checks' : 'All stock-linked headlines'}</strong>
+                <small>Newest first by default; volume and deal facts are tie-breakers. Expand only the rows you need.</small>
+              </div>
+              <span className="mini-chip">Max {rowLimit} rows</span>
+            </div>
+            {visibleNews.length > 0
+              ? renderRows(visibleNews)
+              : <MarketEmpty icon={<Target size={18} />} label="No catalysts meet the current evidence filter" />}
+            {selectedNews.length > visibleNews.length && (
+              <p className="market-panel-foot">{selectedNews.length - visibleNews.length} lower-ranked rows are hidden. Increase “Show” only when you need deeper review.</p>
+            )}
+          </section>
+
+          {marketNews.length > 0 && (
+            <details className="market-context-drawer">
+              <summary>
+                <span><strong>Market-wide context</strong><small>Separated because these headlines are not stock entry triggers.</small></span>
+                <span className="mini-chip">Top {visibleMarketNews.length} of {marketNews.length}</span>
+              </summary>
+              <div className="market-context-drawer-body">{renderRows(visibleMarketNews)}</div>
+            </details>
+          )}
+        </div>
+      )}
+    </Surface>
+  )
+}
+
+function MarketRowsSkeleton({ count }: { count: number }) {
+  return (
+    <div className="market-row-list">
+      {Array.from({ length: count }).map((_, index) => (
+        <div key={index} className="market-skeleton-row">
+          <div className="skeleton-block skeleton-line-wide" />
+          <div className="skeleton-block skeleton-line-short" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function MarketEmpty({ icon, label }: { icon: ReactNode; label: string }) {
+  return (
+    <div className="market-empty">
+      <div className="empty-icon-shell">{icon}</div>
+      <p>{label}</p>
+    </div>
+  )
+}
+
 function SettingsView({
   broker,
   accounts,
@@ -4275,6 +6273,11 @@ export default function App() {
   const [backtests, setBacktests] = useState<BacktestDashboardResponse | null>(null)
   const [backtestCache, setBacktestCache] = useState<BacktestCacheStatus | null>(null)
   const [pythonBacktestLab, setPythonBacktestLab] = useState<PythonBacktestLabResponse | null>(null)
+  const [newsItems, setNewsItems] = useState<NewsItem[]>([])
+  const [nseLargeDeals, setNseLargeDeals] = useState<NseLargeDeal[]>([])
+  const [marketActivity, setMarketActivity] = useState<MarketActivityItem[]>([])
+  const [corporateEvents, setCorporateEvents] = useState<CorporateEvent[]>([])
+  const [backtestPredictions, setBacktestPredictions] = useState<BacktestPrediction[]>([])
   const [liveSnapshot, setLiveSnapshot] = useState<LiveStrategySnapshot | null>(null)
   const [liveSocketState, setLiveSocketState] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting')
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(initialRoute.symbol)
@@ -4285,6 +6288,7 @@ export default function App() {
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [loadingHome, setLoadingHome] = useState(false)
   const [loadingScanner, setLoadingScanner] = useState(false)
+  const [loadingMarketHub, setLoadingMarketHub] = useState(false)
   const [runningBacktest, setRunningBacktest] = useState(false)
   const [runningPythonBacktestLab, setRunningPythonBacktestLab] = useState(false)
   const [loadingBacktestDashboard, setLoadingBacktestDashboard] = useState(false)
@@ -4292,6 +6296,16 @@ export default function App() {
   const [refreshingBacktestCache, setRefreshingBacktestCache] = useState(false)
   const [stagingFresh, setStagingFresh] = useState(false)
   const [refreshingFeatureCache, setRefreshingFeatureCache] = useState(false)
+  const [refreshingMarketHub, setRefreshingMarketHub] = useState(false)
+  const [marketHubStatus, setMarketHubStatus] = useState('')
+  const [marketHubDealError, setMarketHubDealError] = useState('')
+  const [marketHubActivityError, setMarketHubActivityError] = useState('')
+  const [marketHubEventError, setMarketHubEventError] = useState('')
+  const [marketHubSymbol, setMarketHubSymbol] = useState('')
+  const [marketHubSource, setMarketHubSource] = useState('')
+  const [marketHubDealType, setMarketHubDealType] = useState('')
+  const [marketHubActivityMetric, setMarketHubActivityMetric] = useState('')
+  const [marketHubHighImpactOnly, setMarketHubHighImpactOnly] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [liveAlertsEnabled, setLiveAlertsEnabled] = useState(() => {
@@ -4449,6 +6463,92 @@ export default function App() {
     }
   }
 
+  const loadMarketHub = async () => {
+    setLoadingMarketHub(true)
+    setError('')
+    setMarketHubDealError('')
+    setMarketHubActivityError('')
+    setMarketHubEventError('')
+    const cleanSymbol = marketHubSymbol.trim().toUpperCase()
+    try {
+      const [nextNews, nextDeals, nextActivity, nextEvents, nextPredictions] = await Promise.all([
+        getNews({
+          symbol: cleanSymbol || undefined,
+          source: marketHubSource || undefined,
+          min_impact: marketHubHighImpactOnly ? 2.5 : undefined,
+          limit: 150,
+        }).catch((err) => {
+          setError(errorMessage(err))
+          return [] as NewsItem[]
+        }),
+        getNseLargeDeals({
+          symbol: cleanSymbol || undefined,
+          deal_type: marketHubDealType || undefined,
+          limit: 120,
+        }).catch((err) => {
+          setMarketHubDealError(errorMessage(err))
+          return [] as NseLargeDeal[]
+        }),
+        getMarketActivity({
+          symbol: cleanSymbol || undefined,
+          metric_type: marketHubActivityMetric || undefined,
+          limit: 150,
+        }).catch((err) => {
+          setMarketHubActivityError(errorMessage(err))
+          return [] as MarketActivityItem[]
+        }),
+        getCorporateEvents({
+          symbol: cleanSymbol || undefined,
+          lookback_days: 730,
+          limit: 20,
+        }).catch((err) => {
+          setMarketHubEventError(errorMessage(err))
+          return [] as CorporateEvent[]
+        }),
+        getNewsPredictionHistory({ limit: 60 }).then((response) => response.predictions).catch(() => [] as BacktestPrediction[]),
+      ])
+      startTransition(() => {
+        setNewsItems(nextNews)
+        setNseLargeDeals(nextDeals)
+        setMarketActivity(nextActivity)
+        setCorporateEvents(nextEvents)
+        setBacktestPredictions(nextPredictions)
+      })
+    } finally {
+      setLoadingMarketHub(false)
+    }
+  }
+
+  const refreshMarketHubSources = async () => {
+    setRefreshingMarketHub(true)
+    setError('')
+    setMarketHubStatus('')
+    setMarketHubDealError('')
+    setMarketHubActivityError('')
+    setMarketHubEventError('')
+    try {
+      const newsResult: NewsRefreshResult = await refreshNews()
+      let activityResult: MarketActivityRefreshResult | null = null
+      try {
+        activityResult = await refreshMarketActivity()
+      } catch (err) {
+        setMarketHubActivityError(errorMessage(err))
+      }
+      await loadMarketHub()
+      if (newsResult.deal_error) {
+        setMarketHubDealError(newsResult.deal_error)
+      }
+      setMarketHubStatus(
+        `Fetched ${newsResult.articles} articles, ${newsResult.deals ?? 0} NSE deals, ${activityResult?.rows ?? 0} activity rows`,
+      )
+      window.setTimeout(() => setMarketHubStatus(''), 7000)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRefreshingMarketHub(false)
+    }
+  }
+
   const refreshAll = async () => {
     setRefreshing(true)
     setError('')
@@ -4460,6 +6560,11 @@ export default function App() {
 
       if (view === 'scanner' || view === 'stock') {
         await loadScannerData()
+        return
+      }
+
+      if (view === 'market') {
+        await loadMarketHub()
         return
       }
 
@@ -4532,6 +6637,11 @@ export default function App() {
     autoLoadedScanner.current = true
     void loadScannerData()
   }, [view, scanner, historicalScreener, loadingScanner])
+
+  useEffect(() => {
+    if (view !== 'market') return
+    void loadMarketHub()
+  }, [view, marketHubSymbol, marketHubSource, marketHubDealType, marketHubActivityMetric, marketHubHighImpactOnly])
 
   const stageFreshNow = async () => {
     setStagingFresh(true)
@@ -4822,6 +6932,11 @@ export default function App() {
     (paperTrades.find((trade) => trade.symbol === selectedSymbol)
       ? createCandidateFromPaperTrade(paperTrades.find((trade) => trade.symbol === selectedSymbol) as PaperTrade)
       : null)
+  const selectedDossierCandidate =
+    (detailCandidate?.symbol === selectedSymbol ? detailCandidate : null)
+    ?? selectedActionCandidate
+    ?? scanner?.candidates.find((candidate) => candidate.symbol === selectedSymbol)
+    ?? null
   const watchSymbols = new Set(watchlist.map((item) => item.symbol))
   const activePaperTrades = paperTrades.filter((trade) => trade.enabled === 1)
   const closedPaperTrades = paperTrades.filter((trade) => trade.enabled !== 1 && trade.close_reason !== 'removed')
@@ -4969,6 +7084,34 @@ export default function App() {
                 onReload={loadHomeDashboard}
               />
             )}
+            {view === 'market' && (
+              <MarketHubView
+                news={newsItems}
+                deals={nseLargeDeals}
+                activity={marketActivity}
+                events={corporateEvents}
+                predictions={backtestPredictions}
+                loading={loadingMarketHub}
+                refreshing={refreshingMarketHub}
+                status={marketHubStatus}
+                dealError={marketHubDealError}
+                activityError={marketHubActivityError}
+                eventError={marketHubEventError}
+                symbol={marketHubSymbol}
+                source={marketHubSource}
+                dealType={marketHubDealType}
+                activityMetric={marketHubActivityMetric}
+                highImpactOnly={marketHubHighImpactOnly}
+                onSymbolChange={setMarketHubSymbol}
+                onSourceChange={setMarketHubSource}
+                onDealTypeChange={setMarketHubDealType}
+                onActivityMetricChange={setMarketHubActivityMetric}
+                onHighImpactChange={setMarketHubHighImpactOnly}
+                onLoad={loadMarketHub}
+                onRefresh={refreshMarketHubSources}
+                onSelect={openStock}
+              />
+            )}
             {view === 'scanner' && (
               <ScannerView
                 scanner={scanner}
@@ -5030,12 +7173,12 @@ export default function App() {
             {view === 'settings' && <SettingsView broker={broker} accounts={accounts} />}
             {view === 'stock' && (
               <StockDetailView
-                candidate={selectedActionCandidate}
+                candidate={selectedDossierCandidate}
                 historicalRow={selectedHistoricalRow}
                 history={history}
                 historyRange={historyRange}
-                watchlisted={!!selectedActionCandidate && watchSymbols.has(selectedActionCandidate.symbol)}
-                queued={!!selectedActionCandidate && queueSymbols.has(selectedActionCandidate.symbol)}
+                watchlisted={!!selectedDossierCandidate && watchSymbols.has(selectedDossierCandidate.symbol)}
+                queued={!!selectedDossierCandidate && queueSymbols.has(selectedDossierCandidate.symbol)}
                 onWatch={addToWatchlist}
                 onQueue={addToPaperDesk}
                 onHistoryRangeChange={setHistoryRange}

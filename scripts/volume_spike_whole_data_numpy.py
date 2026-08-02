@@ -151,6 +151,7 @@ def extract_candidates_for_target(
     args: argparse.Namespace,
     search_specs: list[dict[str, float | int | str]],
     holds: list[int],
+    stop_target_pairs: list[tuple[float, float]],
 ) -> tuple[pd.DataFrame, np.ndarray]:
     if df.empty:
         return pd.DataFrame(), np.array([], dtype="datetime64[D]")
@@ -271,21 +272,24 @@ def extract_candidates_for_target(
         }
     )
     for hold in holds:
-        sim = simulate_for_candidate_rows(
-            o,
-            h,
-            l,
-            c,
-            cand_day.astype(np.int32),
-            cand_symbol.astype(np.int32),
-            cand_entry_idx.astype(np.int32),
-            int(hold),
-            float(args.stop_pct),
-            float(args.target_pct),
-            float(args.round_trip_cost_pct),
-        )
-        for key, value in sim.items():
-            out[key] = value
+        for stop_pct, target_pct in stop_target_pairs:
+            sim = simulate_for_candidate_rows(
+                o,
+                h,
+                l,
+                c,
+                cand_day.astype(np.int32),
+                cand_symbol.astype(np.int32),
+                cand_entry_idx.astype(np.int32),
+                int(hold),
+                float(stop_pct),
+                float(target_pct),
+                float(args.round_trip_cost_pct),
+            )
+            suffix = result_suffix(int(hold), float(stop_pct), float(target_pct))
+            for key, value in sim.items():
+                base, _legacy_hold = key.rsplit("_h", 1)
+                out[f"{base}_{suffix}"] = value
     return out, target_dates
 
 
@@ -298,6 +302,24 @@ def first_candidate_indices(mask: np.ndarray, day_idx: np.ndarray, symbol_idx: n
     return selected[first].astype(np.int32)
 
 
+def pct_key(value: float) -> str:
+    return f"{float(value):g}".replace("-", "m").replace(".", "p")
+
+
+def result_suffix(hold: int, stop_pct: float, target_pct: float) -> str:
+    return f"h{int(hold)}_sl{pct_key(stop_pct)}_tg{pct_key(target_pct)}"
+
+
+def result_col(table: pd.DataFrame, base: str, hold: int, stop_pct: float, target_pct: float) -> str:
+    keyed = f"{base}_{result_suffix(hold, stop_pct, target_pct)}"
+    if keyed in table.columns:
+        return keyed
+    legacy = f"{base}_h{int(hold)}"
+    if legacy in table.columns:
+        return legacy
+    raise KeyError(f"Missing result column for {base}, hold={hold}, stop={stop_pct}, target={target_pct}")
+
+
 def evaluate_spec(
     table: pd.DataFrame,
     spec: dict[str, float | int | str],
@@ -308,7 +330,9 @@ def evaluate_spec(
     min_trades: int,
 ) -> tuple[dict[str, float | int | str], np.ndarray]:
     hold = int(spec["hold_minutes"])
-    net_col = f"net_h{hold}"
+    stop_pct = float(spec.get("stop_pct", 3.0))
+    target_pct = float(spec.get("target_pct", 3.0))
+    net_col = result_col(table, "net", hold, stop_pct, target_pct)
     net_all = table[net_col].to_numpy(np.float32)
     entry_idx = table["entry_idx"].to_numpy(np.int32)
     mask = (
@@ -333,10 +357,23 @@ def evaluate_spec(
     return row, rows
 
 
-def tradebook_from_rows(table: pd.DataFrame, rows: np.ndarray, hold: int, pattern_name: str | None = None) -> pd.DataFrame:
+def tradebook_from_rows(
+    table: pd.DataFrame,
+    rows: np.ndarray,
+    hold: int,
+    pattern_name: str | None = None,
+    stop_pct: float = 3.0,
+    target_pct: float = 3.0,
+) -> pd.DataFrame:
     if rows.size == 0:
         return pd.DataFrame()
     part = table.iloc[rows].copy()
+    exit_idx_col = result_col(table, "exit_idx", hold, stop_pct, target_pct)
+    exit_price_col = result_col(table, "exit_price", hold, stop_pct, target_pct)
+    exit_type_col = result_col(table, "exit_type", hold, stop_pct, target_pct)
+    exit_offset_col = result_col(table, "exit_offset", hold, stop_pct, target_pct)
+    gross_col = result_col(table, "gross", hold, stop_pct, target_pct)
+    net_col = result_col(table, "net", hold, stop_pct, target_pct)
     out = pd.DataFrame(
         {
             "date": part["date"],
@@ -347,13 +384,15 @@ def tradebook_from_rows(table: pd.DataFrame, rows: np.ndarray, hold: int, patter
             "entry_bucket": part["entry_bucket"].astype(np.int16),
             "entry_time": lab.minute_labels(part["entry_idx"].to_numpy(np.int32)),
             "entry_price": part["entry_price"].astype(np.float32),
-            "exit_bucket": part[f"exit_idx_h{hold}"].astype(np.int32) + 1,
-            "exit_time": lab.minute_labels(part[f"exit_idx_h{hold}"].to_numpy(np.int32)),
-            "exit_price": part[f"exit_price_h{hold}"].astype(np.float32),
-            "exit_type": part[f"exit_type_h{hold}"],
-            "hold_minutes": part[f"exit_offset_h{hold}"].astype(np.int16),
-            "gross_pct": part[f"gross_h{hold}"].astype(np.float32),
-            "net_pct": part[f"net_h{hold}"].astype(np.float32),
+            "exit_bucket": part[exit_idx_col].astype(np.int32) + 1,
+            "exit_time": lab.minute_labels(part[exit_idx_col].to_numpy(np.int32)),
+            "exit_price": part[exit_price_col].astype(np.float32),
+            "exit_type": part[exit_type_col],
+            "hold_minutes": part[exit_offset_col].astype(np.int16),
+            "gross_pct": part[gross_col].astype(np.float32),
+            "net_pct": part[net_col].astype(np.float32),
+            "stop_pct": float(stop_pct),
+            "target_pct": float(target_pct),
             "gap_pct": part["gap_pct"].astype(np.float32),
             "bar_rvol": part["bar_rvol"].astype(np.float32),
             "vol20_rvol": part["vol20_rvol"].astype(np.float32),
@@ -380,9 +419,10 @@ def daily_from_tradebook(tradebook: pd.DataFrame, dates_np: np.ndarray) -> pd.Da
     return lab.daily_summary(day_net, counts, day_wins, dates_np, np.ones(dates_np.size, dtype=bool))
 
 
-def save_chart_set(out_dir: Path, daily: pd.DataFrame, prefix: str) -> None:
-    lab.plot_curve(daily, out_dir / f"{prefix}equity_curve.png")
-    lab.plot_daily_bars(daily, out_dir / f"{prefix}daily_net.png")
+def save_chart_set(out_dir: Path, daily: pd.DataFrame, prefix: str, title: str | None = None) -> None:
+    chart_title = title or "Volume-spike short, one position per symbol/day"
+    lab.plot_curve(daily, out_dir / f"{prefix}equity_curve.png", chart_title)
+    lab.plot_daily_bars(daily, out_dir / f"{prefix}daily_net.png", f"{chart_title}: daily net")
 
 
 def baseline_spec_from_args(args: argparse.Namespace) -> dict[str, float | int | str]:
@@ -433,6 +473,7 @@ def run(args: argparse.Namespace) -> None:
     search_specs = specs or [baseline_spec]
     broad_specs = [*search_specs, baseline_spec]
     holds = sorted({int(spec["hold_minutes"]) for spec in broad_specs})
+    stop_target_pairs = sorted({(float(spec["stop_pct"]), float(spec["target_pct"])) for spec in broad_specs})
 
     chunks_dir = out_dir / "candidate_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
@@ -473,7 +514,7 @@ def run(args: argparse.Namespace) -> None:
         log(f"Chunk {first_key}-{last_key}: reading {len(context_paths)} files")
         df = read_chunk(context_paths, end, target_symbols)
         log(f"Chunk {first_key}-{last_key}: rows {len(df):,}, symbols {df['symbol'].nunique() if not df.empty else 0:,}")
-        candidates, dates = extract_candidates_for_target(df, target_start, target_end, args, broad_specs, holds)
+        candidates, dates = extract_candidates_for_target(df, target_start, target_end, args, broad_specs, holds, stop_target_pairs)
         log(f"Chunk {first_key}-{last_key}: broad candidates {len(candidates):,}")
         if not candidates.empty:
             candidates.to_parquet(candidate_path, index=False)
@@ -505,22 +546,32 @@ def run(args: argparse.Namespace) -> None:
     table.to_parquet(out_dir / "broad_candidate_rows.parquet", index=False)
 
     baseline_row, baseline_rows = evaluate_spec(table, baseline_spec, day_idx, symbol_idx, dates_np, trade_day_mask, int(args.min_trades))
-    baseline_tradebook = tradebook_from_rows(table, baseline_rows, int(baseline_spec["hold_minutes"]))
+    baseline_hold = int(baseline_spec["hold_minutes"])
+    baseline_stop = float(baseline_spec["stop_pct"])
+    baseline_target = float(baseline_spec["target_pct"])
+    baseline_tradebook = tradebook_from_rows(
+        table,
+        baseline_rows,
+        baseline_hold,
+        stop_pct=baseline_stop,
+        target_pct=baseline_target,
+    )
     baseline_daily = daily_from_tradebook(baseline_tradebook, dates_np)
     summary = lab.metric_summary(
         baseline_tradebook["net_pct"].to_numpy(np.float32),
         np.bincount(day_idx[baseline_rows], weights=baseline_tradebook["net_pct"].to_numpy(np.float32), minlength=dates_np.size).astype(np.float32),
         np.bincount(day_idx[baseline_rows], minlength=dates_np.size).astype(np.float32),
-        table.iloc[baseline_rows][f"target_first_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
-        table.iloc[baseline_rows][f"stop_first_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
-        table.iloc[baseline_rows][f"timeout_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
+        table.iloc[baseline_rows][result_col(table, "target_first", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
+        table.iloc[baseline_rows][result_col(table, "stop_first", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
+        table.iloc[baseline_rows][result_col(table, "timeout", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
         trade_day_mask,
     )
 
     baseline_tradebook.to_csv(out_dir / "tradebook.csv", index=False)
     baseline_daily.to_csv(out_dir / "daily_summary.csv", index=False)
     summary.to_csv(out_dir / "summary.csv", index=False)
-    save_chart_set(out_dir, baseline_daily, "")
+    baseline_title = f"Volume-spike {args.preset} short: SL {baseline_stop:g}%, TG {baseline_target:g}%, hold {baseline_hold}m"
+    save_chart_set(out_dir, baseline_daily, "", baseline_title)
     baseline_diag = lab.write_diagnostics("", baseline_tradebook, baseline_daily, out_dir)
     live_section = ""
     if args.live_signals:
@@ -566,11 +617,22 @@ def run(args: argparse.Namespace) -> None:
             _, best_rows = evaluate_spec(table, best_spec, day_idx, symbol_idx, dates_np, trade_day_mask, int(args.min_trades))
         if best_spec is not None:
             best_hold = int(best_spec["hold_minutes"])
-            best_tradebook = tradebook_from_rows(table, best_rows, best_hold, str(best_spec["name"]))
+            best_tradebook = tradebook_from_rows(
+                table,
+                best_rows,
+                best_hold,
+                str(best_spec["name"]),
+                stop_pct=float(best_spec["stop_pct"]),
+                target_pct=float(best_spec["target_pct"]),
+            )
             best_daily = daily_from_tradebook(best_tradebook, dates_np)
             best_tradebook.to_csv(out_dir / "best_pattern_tradebook.csv", index=False)
             best_daily.to_csv(out_dir / "best_pattern_daily_summary.csv", index=False)
-            save_chart_set(out_dir, best_daily, "best_pattern_")
+            best_title = (
+                f"Best volume-spike short: SL {float(best_spec['stop_pct']):g}%, "
+                f"TG {float(best_spec['target_pct']):g}%, hold {best_hold}m"
+            )
+            save_chart_set(out_dir, best_daily, "best_pattern_", best_title)
             best_diag = lab.write_diagnostics("best_pattern", best_tradebook, best_daily, out_dir)
             log(f"Best global pattern: {best_spec['name']} | trades {len(best_tradebook):,} | score {float(pattern_results.iloc[0]['score']):0.2f}")
 
@@ -578,6 +640,8 @@ def run(args: argparse.Namespace) -> None:
         "name",
         "score",
         "hold_minutes",
+        "stop_pct",
+        "target_pct",
         "bar_rvol_min",
         "vol20_rvol_min",
         "cum_rvol_min",
@@ -699,6 +763,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-drop-from-high", default=lab.SEARCH_DROP_FROM_HIGH)
     parser.add_argument("--search-gap-up-min", default=lab.SEARCH_GAP_UP_MIN)
     parser.add_argument("--search-mom15-windows", default=lab.SEARCH_MOM15_WINDOWS)
+    parser.add_argument("--search-stop-pcts", default=None)
+    parser.add_argument("--search-target-pcts", default=None)
     parser.add_argument("--grid-limit", type=int, default=0)
     parser.add_argument("--min-trades", type=int, default=250)
     return parser.parse_args()

@@ -16,9 +16,12 @@
  *   bun run scripts/fetch-margin-stocks.ts --output data/margin-stocks.json
  */
 
-const ACCESS_TOKEN =
-  "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0OTYzNzI5LCJpYXQiOjE3NzQ4NzczMjksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwODk2NDk3In0.BYuo-AN9nj5bMcLS-6I5ACwmKT6j1nB7QBrMN4UsU5PN7h6r_8DnYjT87VTIaM0mzxN6unlbPgzSksq9EvUD8g";
-const CLIENT_ID = "1100896497";
+const ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN ?? "";
+const CLIENT_ID = process.env.DHAN_CLIENT_ID ?? "";
+
+if (!ACCESS_TOKEN || !CLIENT_ID) {
+  throw new Error("Set DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID before running this script");
+}
 
 const SCRIP_CSV_URL =
   "https://images.dhan.co/api-data/api-scrip-master-detailed.csv";

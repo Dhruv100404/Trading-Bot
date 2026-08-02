@@ -11,7 +11,7 @@ use crate::api::AppState;
 use crate::api::swing::get_live_quotes;
 use crate::types::{is_nse_holiday, now_ist};
 
-pub(crate) const DEFAULT_PAPER_MAX_SESSIONS: u16 = 5;
+pub(crate) const DEFAULT_PAPER_MAX_SESSIONS: u16 = 10;
 
 const CREATE_PAPER_TRADES: &str = r#"
 CREATE TABLE IF NOT EXISTS trading.paper_trades (

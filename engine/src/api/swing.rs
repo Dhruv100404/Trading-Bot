@@ -8,7 +8,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use chrono::{Datelike, TimeZone, Timelike, Utc};
+use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use clickhouse::Row;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
@@ -91,6 +91,94 @@ pub struct LiveSignal {
     trigger_source: Option<String>,
 }
 
+/// Explainable score context for a research candidate.  The quality fields are
+/// 0-100 diagnostics, not additional entry triggers; `model_score` is the
+/// selected strategy score before the (capped) news adjustment.
+#[derive(Serialize, Clone)]
+pub struct ResearchScoreBreakdown {
+    model_score: u8,
+    technical_quality: u8,
+    trend_quality: u8,
+    volume_quality: u8,
+    regime_quality: u8,
+    risk_reward_quality: u8,
+    catalyst_adjustment: i8,
+    total_score: u8,
+}
+
+/// One strategy evaluation contributing to the current research view.  A
+/// symbol can have both daily and weekly evaluations; `selected` identifies
+/// the rule that drives the live decision state.
+#[derive(Serialize, Clone)]
+pub struct StrategyMatch {
+    timeframe: String,
+    strategy_id: String,
+    strategy_label: String,
+    strategy_status: String,
+    setup_family: String,
+    signal_status: String,
+    signal_label: String,
+    score: u8,
+    selected: bool,
+    trigger_price: Option<f32>,
+    trigger_source: Option<String>,
+    as_of: String,
+    reason: String,
+}
+
+/// A structured reason either supporting the research thesis or identifying
+/// a risk.  These deliberately mirror the scanner's prose reasons while
+/// retaining a stable pillar/stance contract for the UI.
+#[derive(Serialize, Clone)]
+pub struct ResearchEvidenceItem {
+    pillar: String,
+    stance: String,
+    title: String,
+    detail: String,
+}
+
+/// Bounded, recent news context.  A news catalyst can adjust ranking but can
+/// never independently turn a non-entry signal into an entry.
+#[derive(Serialize, Clone)]
+pub struct NewsEvidenceSummary {
+    lookback_hours: u16,
+    article_count: u64,
+    bullish_articles: u64,
+    bearish_articles: u64,
+    average_sentiment: f32,
+    max_impact: f32,
+    direction: String,
+    score_adjustment: i8,
+    latest_reason: Option<String>,
+    latest_headline: Option<String>,
+    latest_source: Option<String>,
+    latest_url: Option<String>,
+}
+
+/// Shared research payload emitted by both HTTP candidates and live websocket
+/// strategy rows.  It separates research quality from the trade state so a
+/// high-ranked rejected/watch rule cannot look like an approved entry.
+#[derive(Serialize, Clone)]
+pub struct ResearchConfluence {
+    /// Ranking score only. It is intentionally separate from `trade_state`.
+    research_score: u8,
+    /// Compatibility alias for the research decision state.
+    research_state: String,
+    /// Action gate: ENTRY_READY, ARMED, WATCH, NO_TRADE, or INVALIDATED.
+    trade_state: String,
+    /// High-level confluence verdict; NO_TRADE/INVALIDATED always report BLOCKED.
+    confluence_state: String,
+    /// Compatibility alias for the number of independent supporting pillars.
+    pillar_count: u8,
+    supporting_pillars: u8,
+    conflicting_pillars: u8,
+    score_breakdown: ResearchScoreBreakdown,
+    strategy_matches: Vec<StrategyMatch>,
+    evidence: Vec<ResearchEvidenceItem>,
+    risks: Vec<ResearchEvidenceItem>,
+    news: NewsEvidenceSummary,
+}
+
 #[derive(Serialize, Clone)]
 pub struct SwingCandidate {
     symbol: String,
@@ -115,6 +203,7 @@ pub struct SwingCandidate {
     risks: Vec<String>,
     source: String,
     live_signal: LiveSignal,
+    confluence: ResearchConfluence,
 }
 
 #[derive(Serialize)]
@@ -367,6 +456,22 @@ struct StrategyStatusRow {
     status: String,
 }
 
+/// Recent, symbol-level news evidence.  This is deliberately an input to the
+/// ranking, not an entry trigger: price and risk rules must still approve a trade.
+#[derive(Row, Deserialize, Clone, Default)]
+struct NewsConfluenceRow {
+    symbol: String,
+    article_count: u64,
+    bullish_articles: u64,
+    bearish_articles: u64,
+    avg_sentiment: f64,
+    max_impact: f64,
+    latest_reason: String,
+    latest_headline: String,
+    latest_source: String,
+    latest_url: String,
+}
+
 const QUOTE_CACHE_TTL_SECS: u64 = 20;
 const PAPER_CAPITAL_PER_SIGNAL: f64 = 50_000.0;
 
@@ -521,6 +626,7 @@ pub struct LiveStrategyRow {
     risk_reward: f32,
     source: String,
     updated_at: String,
+    confluence: ResearchConfluence,
 }
 
 #[derive(Serialize, Clone)]
@@ -679,6 +785,13 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
     let symbols = watch_rows.iter().map(|row| row.symbol.clone()).collect::<Vec<_>>();
     let baselines = load_live_signal_baselines(&state, &symbols).await.unwrap_or_default();
     let strategy_statuses = load_latest_strategy_statuses(&state).await.unwrap_or_default();
+    let mut news_confluence = load_recent_news_confluence(&state, &symbols)
+        .await
+        .map_err(|err| {
+            tracing::warn!("live news confluence lookup failed: {}", err);
+            err
+        })
+        .unwrap_or_default();
     let mut quote_map = initial_live_quotes(&state, &credentials, &watch_rows).await.unwrap_or_default();
     let snapshot = build_live_strategy_snapshot(
         broker.clone(),
@@ -690,6 +803,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
         &baselines,
         &strategy_statuses,
         &weekly_lab_candidates,
+        &news_confluence,
         Some("Connecting to Dhan live market feed...".to_string()),
     );
     if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
@@ -713,6 +827,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
             baselines,
             strategy_statuses,
             weekly_lab_candidates,
+            news_confluence,
             "websocket-connect-failed",
             "Dhan websocket connection failed; keeping the live panel refreshed from REST quote snapshots.",
         ).await;
@@ -739,6 +854,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
                 &baselines,
                 &strategy_statuses,
                 &weekly_lab_candidates,
+                &news_confluence,
                 Some("Connected to Dhan websocket, but instrument subscription failed.".to_string()),
             );
             let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
@@ -747,10 +863,18 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
     }
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
+    let mut last_news_refresh = Instant::now();
     let mut last_sent = Instant::now() - Duration::from_secs(2);
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                if last_news_refresh.elapsed() >= Duration::from_secs(NEWS_CONFLUENCE_REFRESH_SECONDS) {
+                    match load_recent_news_confluence(&state, &symbols).await {
+                        Ok(refreshed) => news_confluence = refreshed,
+                        Err(err) => tracing::warn!("live news confluence refresh failed: {}", err),
+                    }
+                    last_news_refresh = Instant::now();
+                }
                 let snapshot = build_live_strategy_snapshot(
                     broker.clone(),
                     "dhan-websocket",
@@ -761,6 +885,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
                     &baselines,
                     &strategy_statuses,
                     &weekly_lab_candidates,
+                    &news_confluence,
                     None,
                 );
                 if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
@@ -805,6 +930,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
                                 &baselines,
                                 &strategy_statuses,
                                 &weekly_lab_candidates,
+                                &news_confluence,
                                 None,
                             );
                             if !publish_live_snapshot(&mut socket, &state, &snapshot).await {
@@ -827,6 +953,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
                             &baselines,
                             &strategy_statuses,
                             &weekly_lab_candidates,
+                            &news_confluence,
                             Some("Dhan websocket disconnected. Reopen Strategies to reconnect.".to_string()),
                         );
                         let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
@@ -844,6 +971,7 @@ async fn stream_live_strategies(mut socket: WebSocket, state: AppState) {
                             &baselines,
                             &strategy_statuses,
                             &weekly_lab_candidates,
+                            &news_confluence,
                             Some(format!("Dhan websocket error: {err}")),
                         );
                         let _ = publish_live_snapshot(&mut socket, &state, &snapshot).await;
@@ -965,16 +1093,26 @@ async fn stream_rest_strategy_snapshots(
     baselines: HashMap<String, HistoricalScreenerFeatureRow>,
     strategy_statuses: HashMap<String, String>,
     weekly_lab_candidates: HashMap<String, WeeklyLabCandidate>,
+    mut news_confluence: HashMap<String, NewsConfluenceRow>,
     feed_status: &str,
     message: &str,
 ) {
     let mut interval = time::interval(Duration::from_secs(10));
+    let symbols = watch_rows.iter().map(|row| row.symbol.clone()).collect::<Vec<_>>();
+    let mut last_news_refresh = Instant::now();
     let mut first = true;
     loop {
         if !first {
             if let Ok(quotes) = initial_live_quotes(&state, &credentials, &watch_rows).await {
                 quote_map = quotes;
             }
+        }
+        if last_news_refresh.elapsed() >= Duration::from_secs(NEWS_CONFLUENCE_REFRESH_SECONDS) {
+            match load_recent_news_confluence(&state, &symbols).await {
+                Ok(refreshed) => news_confluence = refreshed,
+                Err(err) => tracing::warn!("live news confluence refresh failed: {}", err),
+            }
+            last_news_refresh = Instant::now();
         }
         let snapshot = build_live_strategy_snapshot(
             broker.clone(),
@@ -986,6 +1124,7 @@ async fn stream_rest_strategy_snapshots(
             &baselines,
             &strategy_statuses,
             &weekly_lab_candidates,
+            &news_confluence,
             Some(message.to_string()),
         );
         first = false;
@@ -1057,6 +1196,7 @@ fn build_live_strategy_snapshot(
     baselines: &HashMap<String, HistoricalScreenerFeatureRow>,
     strategy_statuses: &HashMap<String, String>,
     weekly_lab_candidates: &HashMap<String, WeeklyLabCandidate>,
+    news_confluence: &HashMap<String, NewsConfluenceRow>,
     message: Option<String>,
 ) -> LiveStrategySnapshot {
     let regular_session = is_regular_session_now();
@@ -1071,7 +1211,7 @@ fn build_live_strategy_snapshot(
         .filter_map(|watch| {
             let quote = quote_map.get(&watch.security_id)?;
             let seed = seed_from_quote(watch, quote, volume_map);
-            let candidate = build_live_candidate(
+            let mut candidate = build_live_candidate(
                 seed,
                 &market_regime,
                 baselines.get(&watch.symbol),
@@ -1079,6 +1219,9 @@ fn build_live_strategy_snapshot(
                 weekly_lab_candidates.get(&watch.symbol),
                 regular_session,
             );
+            if let Some(news) = news_confluence.get(&watch.symbol) {
+                apply_news_evidence(&mut candidate, news);
+            }
             if candidate.live_signal.strategy_id == "unscored" || candidate.live_signal.strategy_id == "unlinked-screener" {
                 return None;
             }
@@ -1105,6 +1248,7 @@ fn build_live_strategy_snapshot(
                 risk_reward: candidate.risk_reward,
                 source: candidate.source,
                 updated_at: now.clone(),
+                confluence: candidate.confluence,
             })
         })
         .collect::<Vec<_>>();
@@ -1606,6 +1750,13 @@ async fn build_dashboard_bundle(
             err
         })
         .unwrap_or_default();
+    let news_confluence = load_recent_news_confluence(state, &symbols)
+        .await
+        .map_err(|err| {
+            tracing::warn!("news confluence lookup failed: {}", err);
+            err
+        })
+        .unwrap_or_default();
     let seeds = build_candidate_seeds(&watch_rows, &volume_map, live_quote_map.as_ref());
     let market_regime = compute_market_regime(&seeds, broker.live_quotes);
     let mut candidates: Vec<SwingCandidate> = seeds
@@ -1616,6 +1767,8 @@ async fn build_dashboard_bundle(
             build_live_candidate(seed, &market_regime, baseline, &strategy_statuses, weekly_lab, regular_session)
         })
         .collect();
+
+    apply_news_confluence(&mut candidates, &news_confluence);
 
     candidates.sort_by(|a, b| {
         live_signal_rank(&a.live_signal.status)
@@ -1670,6 +1823,1032 @@ pub(crate) async fn get_live_quotes(
     }
 
     Ok(fetched)
+}
+
+async fn load_recent_news_confluence(
+    state: &AppState,
+    symbols: &[String],
+) -> anyhow::Result<HashMap<String, NewsConfluenceRow>> {
+    if symbols.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Symbols originate in our Dhan watchlist. Escape quotes nevertheless so a
+    // malformed master-record symbol cannot alter this read-only query.
+    let symbol_list = symbols
+        .iter()
+        .map(|symbol| format!("'{}'", symbol.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT s.symbol, \
+            count() AS article_count, \
+            countIf(s.direction = 'BULLISH' AND s.sentiment >= 0.18 AND s.impact_score >= 1.2) AS bullish_articles, \
+            countIf(s.direction = 'BEARISH' AND s.sentiment <= -0.18 AND s.impact_score >= 1.2) AS bearish_articles, \
+            avg(s.sentiment) AS avg_sentiment, \
+            toFloat64(max(s.impact_score)) AS max_impact, \
+            /* Feed text is external input. Hex encodes it before the ClickHouse
+               client decodes rows, so one malformed source byte cannot hide
+               news evidence for every scanner symbol. */ \
+            argMax(hex(toValidUTF8(s.reason)), s.inserted_at) AS latest_reason, \
+            argMax(hex(toValidUTF8(a.title)), s.inserted_at) AS latest_headline, \
+            argMax(hex(toValidUTF8(a.source)), s.inserted_at) AS latest_source, \
+            argMax(hex(toValidUTF8(a.url)), s.inserted_at) AS latest_url \
+         FROM (SELECT article_id, symbol, sentiment, impact_score, direction, reason, inserted_at \
+               FROM trading.news_scores FINAL) AS s \
+         LEFT JOIN (SELECT article_id, source, title, url \
+                    FROM trading.news_articles FINAL) AS a \
+           ON a.article_id = s.article_id \
+         WHERE s.inserted_at >= now() - INTERVAL 72 HOUR AND s.symbol IN ({symbol_list}) \
+         GROUP BY s.symbol"
+    );
+    let mut rows = state.ch.query(&query).fetch_all::<NewsConfluenceRow>().await?;
+    for row in &mut rows {
+        row.latest_reason = decode_hex_text(&row.latest_reason);
+        row.latest_headline = decode_hex_text(&row.latest_headline);
+        row.latest_source = decode_hex_text(&row.latest_source);
+        row.latest_url = decode_hex_text(&row.latest_url);
+    }
+    Ok(rows.into_iter().map(|row| (row.symbol.clone(), row)).collect())
+}
+
+fn apply_news_confluence(
+    candidates: &mut [SwingCandidate],
+    evidence_by_symbol: &HashMap<String, NewsConfluenceRow>,
+) {
+    for candidate in candidates {
+        let Some(evidence) = evidence_by_symbol.get(&candidate.symbol) else {
+            continue;
+        };
+        apply_news_evidence(candidate, evidence);
+    }
+}
+
+const NEWS_CONFLUENCE_LOOKBACK_HOURS: u16 = 72;
+const NEWS_CONFLUENCE_REFRESH_SECONDS: u64 = 300;
+
+fn default_news_evidence_summary() -> NewsEvidenceSummary {
+    NewsEvidenceSummary {
+        lookback_hours: NEWS_CONFLUENCE_LOOKBACK_HOURS,
+        article_count: 0,
+        bullish_articles: 0,
+        bearish_articles: 0,
+        average_sentiment: 0.0,
+        max_impact: 0.0,
+        direction: "NONE".to_string(),
+        score_adjustment: 0,
+        latest_reason: None,
+        latest_headline: None,
+        latest_source: None,
+        latest_url: None,
+    }
+}
+
+fn non_empty_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn decode_hex_text(value: &str) -> String {
+    if value.is_empty() || value.len() % 2 != 0 {
+        return String::new();
+    }
+
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let Some(high) = hex_value(pair[0]) else {
+            return String::new();
+        };
+        let Some(low) = hex_value(pair[1]) else {
+            return String::new();
+        };
+        decoded.push((high << 4) | low);
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn news_direction_and_adjustment(evidence: &NewsConfluenceRow) -> (String, i8) {
+    let positive = evidence.bullish_articles > evidence.bearish_articles
+        && evidence.avg_sentiment >= 0.18
+        && evidence.max_impact >= 1.2;
+    let negative = evidence.bearish_articles > evidence.bullish_articles
+        && evidence.avg_sentiment <= -0.18
+        && evidence.max_impact >= 1.2;
+
+    if positive {
+        (
+            "BULLISH".to_string(),
+            (3 + evidence.bullish_articles.min(3) * 2) as i8,
+        )
+    } else if negative {
+        (
+            "BEARISH".to_string(),
+            -((3 + evidence.bearish_articles.min(3) * 2) as i8),
+        )
+    } else if evidence.bullish_articles > 0 && evidence.bearish_articles > 0 {
+        ("MIXED".to_string(), 0)
+    } else {
+        ("NEUTRAL".to_string(), 0)
+    }
+}
+
+fn apply_news_evidence(candidate: &mut SwingCandidate, evidence: &NewsConfluenceRow) {
+    let (direction, adjustment) = news_direction_and_adjustment(evidence);
+    let reason = non_empty_text(&evidence.latest_reason).unwrap_or_else(|| {
+        "Recent news was scored without a reusable explanation.".to_string()
+    });
+    candidate.confluence.news = NewsEvidenceSummary {
+        lookback_hours: NEWS_CONFLUENCE_LOOKBACK_HOURS,
+        article_count: evidence.article_count,
+        bullish_articles: evidence.bullish_articles,
+        bearish_articles: evidence.bearish_articles,
+        average_sentiment: evidence.avg_sentiment as f32,
+        max_impact: evidence.max_impact as f32,
+        direction: direction.clone(),
+        score_adjustment: adjustment,
+        latest_reason: non_empty_text(&evidence.latest_reason),
+        latest_headline: non_empty_text(&evidence.latest_headline),
+        latest_source: non_empty_text(&evidence.latest_source),
+        latest_url: non_empty_text(&evidence.latest_url),
+    };
+
+    let total_score = ((candidate.confluence.score_breakdown.model_score as i16) + adjustment as i16)
+        .clamp(0, 99) as u8;
+    candidate.score = total_score;
+    candidate.confluence.research_score = total_score;
+    candidate.confluence.score_breakdown.catalyst_adjustment = adjustment;
+    candidate.confluence.score_breakdown.total_score = total_score;
+
+    if adjustment > 0 {
+        let detail = format!(
+            "{} bullish article(s), average sentiment {:+.2}, and impact up to {:.1}/5. {}",
+            evidence.bullish_articles,
+            evidence.avg_sentiment,
+            evidence.max_impact,
+            reason
+        );
+        candidate.reasons.push(format!("News confluence: {detail}"));
+        candidate.thesis = format!(
+            "{} Price setup is supported by independent recent news evidence. {}",
+            candidate.thesis, reason
+        );
+        candidate.confluence.evidence.push(research_evidence_item(
+            "catalyst",
+            "SUPPORT",
+            "Recent bullish catalyst",
+            detail,
+        ));
+    } else if adjustment < 0 {
+        let detail = format!(
+            "{} bearish article(s), average sentiment {:+.2}, and impact up to {:.1}/5. {}",
+            evidence.bearish_articles,
+            evidence.avg_sentiment,
+            evidence.max_impact,
+            reason
+        );
+        candidate.risks.push(format!("Conflicting news: {detail}"));
+        candidate.confluence.risks.push(research_evidence_item(
+            "catalyst",
+            "RISK",
+            "Recent conflicting news",
+            detail,
+        ));
+    } else if evidence.article_count > 0 {
+        candidate.confluence.evidence.push(research_evidence_item(
+            "catalyst",
+            "NEUTRAL",
+            "Recent news is not directional",
+            format!(
+                "{} recent scored article(s) are {} rather than a corroborating catalyst. {}",
+                evidence.article_count,
+                direction.to_ascii_lowercase(),
+                reason
+            ),
+        ));
+    }
+
+    refresh_confluence_pillar_counts(&mut candidate.confluence);
+}
+
+fn research_evidence_item(
+    pillar: &str,
+    stance: &str,
+    title: &str,
+    detail: impl Into<String>,
+) -> ResearchEvidenceItem {
+    ResearchEvidenceItem {
+        pillar: pillar.to_string(),
+        stance: stance.to_string(),
+        title: title.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn research_trade_state(signal_status: &str) -> &'static str {
+    match signal_status {
+        "ENTRY_NOW" => "ENTRY_READY",
+        "WAIT_FOR_TRIGGER" => "ARMED",
+        "WATCH" => "WATCH",
+        "INVALIDATED" => "INVALIDATED",
+        _ => "NO_TRADE",
+    }
+}
+
+fn research_confluence_state(trade_state: &str) -> &'static str {
+    match trade_state {
+        "ENTRY_READY" => "CONFIRMED",
+        "ARMED" => "BUILDING",
+        "WATCH" => "WATCH_ONLY",
+        "INVALIDATED" | "NO_TRADE" => "BLOCKED",
+        _ => "MIXED",
+    }
+}
+
+fn signal_matches_selected(signal: &LiveSignal, selected: &LiveSignal) -> bool {
+    signal.strategy_id == selected.strategy_id
+        && signal.as_of == selected.as_of
+        && signal.status == selected.status
+        && signal.score == selected.score
+}
+
+fn strategy_match_from_signal(
+    timeframe: &str,
+    signal: &LiveSignal,
+    selected: bool,
+) -> StrategyMatch {
+    StrategyMatch {
+        timeframe: timeframe.to_string(),
+        strategy_id: signal.strategy_id.clone(),
+        strategy_label: signal.strategy_label.clone(),
+        strategy_status: signal.strategy_status.clone(),
+        setup_family: signal.setup_family.clone(),
+        signal_status: signal.status.clone(),
+        signal_label: signal.label.clone(),
+        score: signal.score,
+        selected,
+        trigger_price: signal.trigger_price,
+        trigger_source: signal.trigger_source.clone(),
+        as_of: signal.as_of.clone(),
+        reason: signal.reason.clone(),
+    }
+}
+
+/// A confluence match is research evidence, not another order instruction.
+/// Only models with a current feature baseline and an approved research status
+/// are allowed into this list.  In particular, a rejected/fragile rule must
+/// not turn into a "vote" merely because its technical condition happens to
+/// be true today.
+fn strategy_status_is_research_valid(status: &str) -> bool {
+    matches!(status, "Candidate" | "Watch")
+}
+
+fn signal_as_of_is_current(signal: &LiveSignal, max_age_days: i64) -> bool {
+    let Some(date_token) = signal.as_of.split_whitespace().rev().find_map(|token| {
+        NaiveDate::parse_from_str(token, "%Y-%m-%d").ok()
+    }) else {
+        return false;
+    };
+    let age_days = (now_ist().date_naive() - date_token).num_days();
+    (0..=max_age_days).contains(&age_days)
+}
+
+fn signal_is_current_research_confirmation(timeframe: &str, signal: &LiveSignal) -> bool {
+    let max_age_days = if timeframe == "weekly" {
+        WEEKLY_LAB_MAX_SIGNAL_AGE_DAYS
+    } else {
+        4
+    };
+    signal_as_of_is_current(signal, max_age_days)
+        && strategy_status_is_research_valid(&signal.strategy_status)
+        && !matches!(signal.strategy_id.as_str(), "unscored" | "unlinked-screener")
+        && !matches!(signal.status.as_str(), "NO_TRADE" | "INVALIDATED")
+}
+
+/// Multiple labels are often different expressions of the same price state.
+/// Confluence deliberately collapses correlated daily labels into one research
+/// family instead of treating every near-high/breakout variation as a separate
+/// vote. Weekly evidence remains visible as a timeframe confirmation of that
+/// same family.
+fn research_model_family_key(strategy_id: &str, setup_family: &str) -> &'static str {
+    match strategy_id {
+        "momentum-core-v1"
+        | "near-52w-high-v1"
+        | "near-52w-high-runner-v2"
+        | "near-52w-high-volume-v3"
+        | "swing-breakout-v1"
+        | "breakout-continuation-v1"
+        | "compression-breakout-v1"
+        | "rs-leader-continuation-v1"
+        | "weekly-supertrend-10-3"
+        | "king-candle-quality-v1" => "trend-breakout",
+        "pullback-20dma-v1" | "pullback-quality-v2" => "pullback",
+        "failed-breakdown-reclaim-v1"
+        | "rsi10-pullback-reversion-v1"
+        | "tuned-panic-reversal-v1" => "reversal",
+        _ if setup_family.eq_ignore_ascii_case("Unscored") => "unscored",
+        _ => "other",
+    }
+}
+
+fn research_model_family_label(strategy_id: &str, setup_family: &str) -> String {
+    match research_model_family_key(strategy_id, setup_family) {
+        "trend-breakout" => "Trend Breakout".to_string(),
+        "pullback" => "Pullback".to_string(),
+        "reversal" => "Oversold Reversal".to_string(),
+        _ => setup_family.to_string(),
+    }
+}
+
+fn strategy_match_from_current_signal(
+    timeframe: &str,
+    signal: &LiveSignal,
+    selected: bool,
+) -> Option<StrategyMatch> {
+    if !signal_is_current_research_confirmation(timeframe, signal) {
+        return None;
+    }
+    let mut strategy_match = strategy_match_from_signal(timeframe, signal, selected);
+    strategy_match.setup_family = research_model_family_label(
+        &strategy_match.strategy_id,
+        &strategy_match.setup_family,
+    );
+    Some(strategy_match)
+}
+
+fn independent_daily_confirmation(
+    strategy_id: &str,
+    strategy_label: &str,
+    strategy_status: String,
+    setup_family: &str,
+    score: u8,
+    as_of: &str,
+    trigger_price: Option<f32>,
+    trigger_source: Option<&str>,
+    reason: String,
+) -> Option<StrategyMatch> {
+    if !strategy_status_is_research_valid(&strategy_status) {
+        return None;
+    }
+    let is_candidate = strategy_status == "Candidate";
+    Some(StrategyMatch {
+        timeframe: "daily".to_string(),
+        strategy_id: strategy_id.to_string(),
+        strategy_label: strategy_label.to_string(),
+        strategy_status,
+        setup_family: research_model_family_label(strategy_id, setup_family),
+        // These are explicitly research confirmations.  The selected live
+        // signal remains the sole authority for ENTRY_NOW / trade_state.
+        signal_status: if is_candidate {
+            "WAIT_FOR_TRIGGER".to_string()
+        } else {
+            "WATCH".to_string()
+        },
+        signal_label: if is_candidate {
+            "Independent confirmation".to_string()
+        } else {
+            "Research watch confirmation".to_string()
+        },
+        score,
+        selected: false,
+        trigger_price,
+        trigger_source: trigger_source.map(str::to_string),
+        as_of: as_of.to_string(),
+        reason,
+    })
+}
+
+fn model_confirmation_should_replace(candidate: &StrategyMatch, existing: &StrategyMatch) -> bool {
+    if candidate.selected != existing.selected {
+        return candidate.selected;
+    }
+    let candidate_candidate = candidate.strategy_status == "Candidate";
+    let existing_candidate = existing.strategy_status == "Candidate";
+    if candidate_candidate != existing_candidate {
+        return candidate_candidate;
+    }
+    candidate.score > existing.score
+        || (candidate.score == existing.score && candidate.strategy_id < existing.strategy_id)
+}
+
+fn collapse_research_model_matches(matches: Vec<StrategyMatch>) -> Vec<StrategyMatch> {
+    let mut collapsed = Vec::<StrategyMatch>::new();
+    for strategy_match in matches {
+        let family = research_model_family_key(
+            &strategy_match.strategy_id,
+            &strategy_match.setup_family,
+        );
+        // Weekly evidence is retained as a timeframe confirmation, but it
+        // shares its same model-family key with the corresponding daily
+        // signal.  That keeps it visible in the dossier without granting a
+        // second independent-model vote to the Top Picks ranking.
+        if let Some(index) = collapsed.iter().position(|existing| {
+            existing.timeframe == strategy_match.timeframe
+                && research_model_family_key(&existing.strategy_id, &existing.setup_family) == family
+        }) {
+            if model_confirmation_should_replace(&strategy_match, &collapsed[index]) {
+                collapsed[index] = strategy_match;
+            }
+        } else {
+            collapsed.push(strategy_match);
+        }
+    }
+    collapsed.sort_by(|left, right| {
+        right
+            .selected
+            .cmp(&left.selected)
+            .then_with(|| left.timeframe.cmp(&right.timeframe))
+            .then_with(|| left.strategy_label.cmp(&right.strategy_label))
+    });
+    collapsed
+}
+
+/// Evaluate the current quote against the distinct, already-defined daily
+/// models.  This is intentionally separate from `evaluate_live_signal`: it
+/// provides research corroboration only and never participates in selecting
+/// the live entry, stop, target, or trade state.
+fn independent_current_daily_matches(
+    seed: &CandidateSeed,
+    baseline: Option<&HistoricalScreenerFeatureRow>,
+    strategy_statuses: &HashMap<String, String>,
+) -> Vec<StrategyMatch> {
+    let Some(row) = baseline else {
+        return Vec::new();
+    };
+    let Some(baseline_date) = row
+        .trade_date
+        .as_deref()
+        .filter(|value| signal_date_is_fresh(value))
+    else {
+        return Vec::new();
+    };
+
+    let historical_close = row.day_close.unwrap_or(seed.prev_close as f64).max(0.01);
+    let close = seed.last_price as f64;
+    let high = seed.high_price.max(seed.last_price) as f64;
+    let low = seed.low_price.min(seed.last_price) as f64;
+    let sma20 = replace_latest_average(row.sma20.unwrap_or(historical_close), historical_close, close, 20.0);
+    let sma50 = replace_latest_average(row.sma50.unwrap_or(historical_close), historical_close, close, 50.0);
+    let sma200 = replace_latest_average(row.sma200.unwrap_or(historical_close), historical_close, close, 200.0);
+    let avg_volume20 = row.avg_volume20.unwrap_or(0.0).max(1.0);
+    let high_52w = row.high_52w.unwrap_or(high).max(high).max(0.01);
+    let low_52w = row.low_52w.unwrap_or(low).min(low);
+    let high_20d = row.high_20d.unwrap_or(high).max(high);
+    if close <= 0.0 || high_20d <= 0.0 || low_52w <= 0.0 {
+        return Vec::new();
+    }
+
+    let day_volume = if seed.day_volume > 0.0 {
+        seed.day_volume
+    } else {
+        parse_volume(row.day_volume.as_deref())
+    };
+    let volume_ratio = day_volume / avg_volume20;
+    let prior_high20 = row.prior_high20.filter(|value| *value > 0.0).unwrap_or(high_20d);
+    let prior_high55 = row.prior_high55.filter(|value| *value > 0.0).unwrap_or(prior_high20);
+    let prior_high252 = row.prior_high252.filter(|value| *value > 0.0).unwrap_or(high_52w);
+    let prior_low20 = row.prior_low20.filter(|value| *value > 0.0).unwrap_or(low);
+    let prior_close3 = row.prior_close3.filter(|value| *value > 0.0).unwrap_or(close);
+    let rsi10 = row.rsi10.unwrap_or(50.0);
+    let rs60_rank = row.rs60_rank.unwrap_or(0.5).clamp(0.0, 1.0);
+    let rs120_rank = row.rs120_rank.unwrap_or(0.5).clamp(0.0, 1.0);
+    let atr14 = row.atr14.unwrap_or_else(|| (high - low).abs()).max(close * 0.01);
+    let close_location = if high > low {
+        ((close - low) / (high - low)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let range_atr = if atr14 > 0.0 { (high - low).max(0.0) / atr14 } else { 0.0 };
+    let recovery_from_low_pct = if low > 0.0 { (close - low).max(0.0) / low } else { 0.0 };
+    let ret3 = if prior_close3 > 0.0 { close / prior_close3 - 1.0 } else { 0.0 };
+    let breakout_pct = ((high_20d - close) / high_20d) * 100.0;
+    let distance_to_52w_high_pct = ((high_52w - close) / high_52w) * 100.0;
+    let range_span = (high_52w - low_52w).max(0.01);
+    let range_position_pct = ((close - low_52w) / range_span) * 100.0;
+    let trend_up = close > sma20 && sma20 > sma50;
+    let rsi10_pullback = close > sma200 && rsi10 < 30.0;
+    let breakout_close = close > prior_high20 && close_location >= 0.60;
+    let compression_breakout = breakout_close
+        && volume_ratio >= 1.05
+        && (atr14 / close) < 0.08
+        && ((high - low).max(0.0) / close) <= ((atr14 / close) * 1.05).max(0.015);
+    let failed_breakdown_reclaim = low < prior_low20
+        && close > prior_low20
+        && close_location >= 0.65
+        && volume_ratio >= 0.8;
+    let tuned_panic_reversal = ret3 <= -0.08
+        && range_atr >= 1.35
+        && close_location >= 0.64
+        && recovery_from_low_pct >= 0.012
+        && atr14 > 0.0;
+    let relative_strength_leader = rs60_rank >= 0.75
+        && rs120_rank >= 0.65
+        && close > sma50
+        && (distance_to_52w_high_pct <= 10.0 || close > prior_high55 || close > prior_high252);
+    let score = live_strategy_score(
+        trend_up,
+        breakout_pct,
+        distance_to_52w_high_pct,
+        volume_ratio,
+        close >= sma20 * 0.98 && close <= sma20 * 1.03,
+        range_position_pct,
+    );
+    let lost_structure = close < sma50 * 0.985 || range_position_pct < 40.0;
+    if lost_structure {
+        return Vec::new();
+    }
+
+    let as_of = format!("{} / baseline {}", seed.source, baseline_date);
+    let status_for = |strategy_id: &str| {
+        strategy_statuses
+            .get(strategy_id)
+            .cloned()
+            .unwrap_or_else(|| default_strategy_status(strategy_id).to_string())
+    };
+    let mut matches = Vec::new();
+
+    if distance_to_52w_high_pct <= 3.0 && range_position_pct >= 85.0 && trend_up && score >= 92 {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "momentum-core-v1",
+            "Momentum Core",
+            status_for("momentum-core-v1"),
+            "Trend Breakout",
+            score,
+            &as_of,
+            Some(round2((high_52w * 1.001) as f32)),
+            Some("52W high + 0.1%"),
+            format!(
+                "Trend, 52W range position {:.0}%, and current volume {:.2}x its 20D average meet Momentum Core conditions.",
+                range_position_pct,
+                volume_ratio
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if breakout_close && trend_up && volume_ratio >= 1.1 && score >= 88 {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "breakout-continuation-v1",
+            "Breakout Continuation",
+            status_for("breakout-continuation-v1"),
+            "Trend Breakout",
+            score,
+            &as_of,
+            Some(round2((prior_high20 * 1.001) as f32)),
+            Some("Prior 20D high + 0.1%"),
+            format!(
+                "Close is above the prior 20D high with {:.2}x volume and a {:.0}% close location.",
+                volume_ratio,
+                close_location * 100.0
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if compression_breakout && score >= 88 {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "compression-breakout-v1",
+            "Compression Breakout",
+            status_for("compression-breakout-v1"),
+            "Trend Breakout",
+            score,
+            &as_of,
+            Some(round2((prior_high20 * 1.001) as f32)),
+            Some("Prior 20D high + 0.1%"),
+            format!(
+                "A tight {:.2} ATR range broke above the prior 20D high on {:.2}x volume.",
+                range_atr,
+                volume_ratio
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if relative_strength_leader && score >= 86 {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "rs-leader-continuation-v1",
+            "RS Leader Continuation",
+            status_for("rs-leader-continuation-v1"),
+            "Relative Strength",
+            score,
+            &as_of,
+            Some(round2((prior_high55 * 1.001) as f32)),
+            Some("Prior 55D high + 0.1%"),
+            format!(
+                "RS60 is {:.0}%, RS120 is {:.0}%, and price remains above SMA50.",
+                rs60_rank * 100.0,
+                rs120_rank * 100.0
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if rsi10_pullback {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "rsi10-pullback-reversion-v1",
+            "RSI10 Pullback",
+            status_for("rsi10-pullback-reversion-v1"),
+            "Oversold Reversal",
+            score,
+            &as_of,
+            None,
+            None,
+            format!(
+                "RSI10 is {:.1} while price remains above SMA200, meeting the oversold reversion screen.",
+                rsi10
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if failed_breakdown_reclaim && score >= 86 {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "failed-breakdown-reclaim-v1",
+            "Failed Breakdown Reclaim",
+            status_for("failed-breakdown-reclaim-v1"),
+            "Failed Breakdown Reclaim",
+            score,
+            &as_of,
+            Some(round2(prior_low20 as f32)),
+            Some("Prior 20D low reclaim"),
+            format!(
+                "Price undercut then reclaimed the prior 20D low with a {:.0}% close location and {:.2}x volume.",
+                close_location * 100.0,
+                volume_ratio
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+    if tuned_panic_reversal {
+        if let Some(strategy_match) = independent_daily_confirmation(
+            "tuned-panic-reversal-v1",
+            "Panic Reversal Lab",
+            status_for("tuned-panic-reversal-v1"),
+            "Oversold Reversal",
+            score,
+            &as_of,
+            Some(round2((low + 0.25 * (high - low)) as f32)),
+            Some("25% recovery from intraday low"),
+            format!(
+                "The 3D move is {:+.1}%, range is {:.2} ATR, and the close has recovered {:.1}% from the low.",
+                ret3 * 100.0,
+                range_atr,
+                recovery_from_low_pct * 100.0
+            ),
+        ) {
+            matches.push(strategy_match);
+        }
+    }
+
+    matches
+}
+
+fn signal_quality(signal: &LiveSignal) -> u8 {
+    if signal.status == "INVALIDATED" {
+        15
+    } else if signal.strategy_status == "Rejected" || signal.status == "NO_TRADE" {
+        30
+    } else if signal.status == "ENTRY_NOW" {
+        92
+    } else if signal.status == "WATCH" {
+        68
+    } else if signal.strategy_id == "unscored" {
+        35
+    } else {
+        76
+    }
+}
+
+fn technical_quality(seed: &CandidateSeed, selected: &LiveSignal, model_score: u8) -> u8 {
+    let mut quality: i16 = 35;
+    if seed.distance_to_high_pct <= 1.5 {
+        quality += 25;
+    } else if seed.distance_to_high_pct <= 4.0 {
+        quality += 14;
+    }
+    if seed.day_change_pct >= 2.0 {
+        quality += 15;
+    } else if seed.day_change_pct >= 0.5 {
+        quality += 9;
+    } else if seed.day_change_pct < -1.5 {
+        quality -= 12;
+    }
+    if seed.recovery_pct >= 1.0 {
+        quality += 8;
+    }
+    quality += ((model_score as i16 - 50).max(0) / 4).min(12);
+    if selected.status == "INVALIDATED" {
+        quality -= 30;
+    }
+    quality.clamp(10, 100) as u8
+}
+
+fn trend_quality(daily: &LiveSignal, weekly: Option<&LiveSignal>) -> u8 {
+    let daily_quality = signal_quality(daily) as u16;
+    let Some(weekly) = weekly else {
+        return daily_quality as u8;
+    };
+    let weekly_quality = signal_quality(weekly) as u16;
+    if daily.strategy_id == "unscored" {
+        weekly_quality as u8
+    } else {
+        ((daily_quality + weekly_quality) / 2) as u8
+    }
+}
+
+fn volume_quality(seed: &CandidateSeed, baseline: Option<&HistoricalScreenerFeatureRow>) -> u8 {
+    if let Some(baseline) = baseline {
+        let avg_volume = baseline.avg_volume20.unwrap_or(0.0);
+        if avg_volume > 0.0 && seed.day_volume > 0.0 {
+            let ratio = seed.day_volume / avg_volume;
+            return if ratio >= 1.5 {
+                95
+            } else if ratio >= 1.2 {
+                82
+            } else if ratio >= 1.0 {
+                68
+            } else if ratio >= 0.75 {
+                48
+            } else {
+                28
+            };
+        }
+    }
+
+    match seed.liquidity_bucket.as_str() {
+        "MEGA" => 70,
+        "LARGE" => 62,
+        "MID" => 52,
+        _ => 42,
+    }
+}
+
+fn regime_quality(regime: &MarketRegime) -> u8 {
+    match regime.tone.as_str() {
+        "bullish" => 85,
+        "neutral" => 65,
+        "cautious" => 40,
+        _ => 50,
+    }
+}
+
+fn risk_reward_quality(risk_reward: f32) -> u8 {
+    if risk_reward >= 4.0 {
+        100
+    } else if risk_reward >= 3.0 {
+        90
+    } else if risk_reward >= 2.0 {
+        80
+    } else if risk_reward >= 1.5 {
+        65
+    } else {
+        40
+    }
+}
+
+fn refresh_confluence_pillar_counts(confluence: &mut ResearchConfluence) {
+    let supporting = confluence
+        .evidence
+        .iter()
+        .filter(|item| item.stance == "SUPPORT")
+        .map(|item| item.pillar.as_str())
+        .collect::<HashSet<_>>();
+    let conflicting = confluence
+        .risks
+        .iter()
+        .filter(|item| item.stance == "RISK")
+        .map(|item| item.pillar.as_str())
+        .collect::<HashSet<_>>();
+    confluence.supporting_pillars = supporting.len().min(u8::MAX as usize) as u8;
+    confluence.pillar_count = confluence.supporting_pillars;
+    confluence.conflicting_pillars = conflicting.len().min(u8::MAX as usize) as u8;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_research_confluence(
+    seed: &CandidateSeed,
+    regime: &MarketRegime,
+    baseline: Option<&HistoricalScreenerFeatureRow>,
+    daily_signal: &LiveSignal,
+    daily_model_matches: &[StrategyMatch],
+    weekly_signal: Option<&LiveSignal>,
+    selected_signal: &LiveSignal,
+    model_score: u8,
+    risk_reward: f32,
+    stop_loss: f32,
+) -> ResearchConfluence {
+    let trade_state = research_trade_state(&selected_signal.status).to_string();
+    let technical = technical_quality(seed, selected_signal, model_score);
+    let trend = trend_quality(daily_signal, weekly_signal);
+    let volume = volume_quality(seed, baseline);
+    let regime_score = regime_quality(regime);
+    let rr_score = risk_reward_quality(risk_reward);
+    let mut strategy_matches = daily_model_matches.to_vec();
+    if let Some(daily_match) = strategy_match_from_current_signal(
+        "daily",
+        daily_signal,
+        signal_matches_selected(daily_signal, selected_signal),
+    ) {
+        strategy_matches.push(daily_match);
+    }
+    if let Some(weekly_signal) = weekly_signal {
+        if let Some(weekly_match) = strategy_match_from_current_signal(
+            "weekly",
+            weekly_signal,
+            signal_matches_selected(weekly_signal, selected_signal),
+        ) {
+            strategy_matches.push(weekly_match);
+        }
+    }
+    // Keep only genuine, fresh model-family confirmations.  The selected
+    // signal is added above only when it meets the same validity rule, so a
+    // rejected or stale rule remains visible as a decision risk rather than a
+    // misleading strategy agreement.
+    let strategy_matches = collapse_research_model_matches(strategy_matches);
+
+    let mut evidence = Vec::new();
+    let mut risks = Vec::new();
+    if technical >= 60 {
+        evidence.push(research_evidence_item(
+            "technical",
+            "SUPPORT",
+            "Price structure is constructive",
+            format!(
+                "LTP is {:.2}% from the session high with a {:+.2}% day move.",
+                seed.distance_to_high_pct, seed.day_change_pct
+            ),
+        ));
+    } else {
+        risks.push(research_evidence_item(
+            "technical",
+            "RISK",
+            "Price structure needs confirmation",
+            format!(
+                "LTP is {:.2}% from the session high with a {:+.2}% day move.",
+                seed.distance_to_high_pct, seed.day_change_pct
+            ),
+        ));
+    }
+
+    if trend >= 60 {
+        evidence.push(research_evidence_item(
+            "trend",
+            "SUPPORT",
+            "Trend evidence is present",
+            format!(
+                "Daily: {} ({}){}.",
+                daily_signal.strategy_label,
+                daily_signal.label,
+                weekly_signal
+                    .map(|signal| format!("; weekly: {} ({})", signal.strategy_label, signal.label))
+                    .unwrap_or_default()
+            ),
+        ));
+    } else {
+        risks.push(research_evidence_item(
+            "trend",
+            "RISK",
+            "Trend evidence is weak or invalidated",
+            selected_signal.reason.clone(),
+        ));
+    }
+
+    if volume >= 60 {
+        evidence.push(research_evidence_item(
+            "volume",
+            "SUPPORT",
+            "Liquidity or volume supports execution",
+            format!(
+                "{} liquidity bucket; live volume is {}.",
+                seed.liquidity_bucket,
+                seed.day_volume.round() as u64
+            ),
+        ));
+    } else {
+        risks.push(research_evidence_item(
+            "volume",
+            "RISK",
+            "Volume confirmation is limited",
+            format!(
+                "{} liquidity bucket; live volume is {}.",
+                seed.liquidity_bucket,
+                seed.day_volume.round() as u64
+            ),
+        ));
+    }
+
+    if regime.tone == "bullish" {
+        evidence.push(research_evidence_item(
+            "regime",
+            "SUPPORT",
+            "Market breadth is supportive",
+            regime.summary.clone(),
+        ));
+    } else if regime.tone == "cautious" {
+        risks.push(research_evidence_item(
+            "regime",
+            "RISK",
+            "Market breadth is cautious",
+            regime.summary.clone(),
+        ));
+    }
+
+    if rr_score >= 65 {
+        evidence.push(research_evidence_item(
+            "risk_reward",
+            "SUPPORT",
+            "Risk/reward plan is defined",
+            format!("Planned reward/risk is {:.2}R.", risk_reward),
+        ));
+    } else {
+        risks.push(research_evidence_item(
+            "risk_reward",
+            "RISK",
+            "Risk/reward plan is below target",
+            format!("Planned reward/risk is {:.2}R.", risk_reward),
+        ));
+    }
+    risks.push(research_evidence_item(
+        "risk_management",
+        "RISK",
+        "Structural invalidation level",
+        format!("The thesis weakens below Rs {:.2}.", stop_loss),
+    ));
+
+    match trade_state.as_str() {
+        "ENTRY_READY" => evidence.push(research_evidence_item(
+            "decision",
+            "SUPPORT",
+            "Live entry gate is cleared",
+            selected_signal.reason.clone(),
+        )),
+        "ARMED" => risks.push(research_evidence_item(
+            "decision",
+            "RISK",
+            "Trigger or session gate is still open",
+            selected_signal.reason.clone(),
+        )),
+        "WATCH" => risks.push(research_evidence_item(
+            "decision",
+            "RISK",
+            "Strategy is watch-only",
+            selected_signal.reason.clone(),
+        )),
+        "INVALIDATED" => risks.push(research_evidence_item(
+            "decision",
+            "RISK",
+            "Live structure is invalidated",
+            selected_signal.reason.clone(),
+        )),
+        _ => risks.push(research_evidence_item(
+            "decision",
+            "RISK",
+            "Research rank is not a trade approval",
+            format!(
+                "{} is {} in the latest strategy diagnostics. {}",
+                selected_signal.strategy_label, selected_signal.strategy_status, selected_signal.reason
+            ),
+        )),
+    }
+
+    let mut confluence = ResearchConfluence {
+        research_score: model_score,
+        research_state: trade_state.clone(),
+        trade_state: trade_state.clone(),
+        confluence_state: research_confluence_state(&trade_state).to_string(),
+        pillar_count: 0,
+        supporting_pillars: 0,
+        conflicting_pillars: 0,
+        score_breakdown: ResearchScoreBreakdown {
+            model_score,
+            technical_quality: technical,
+            trend_quality: trend,
+            volume_quality: volume,
+            regime_quality: regime_score,
+            risk_reward_quality: rr_score,
+            catalyst_adjustment: 0,
+            total_score: model_score,
+        },
+        strategy_matches,
+        evidence,
+        risks,
+        news: default_news_evidence_summary(),
+    };
+    refresh_confluence_pillar_counts(&mut confluence);
+    confluence
 }
 
 fn read_cached_quotes(
@@ -2182,8 +3361,9 @@ fn build_live_candidate(
     let fallback_family = classify_setup_family(&seed);
     let fallback_score = fallback_candidate_score(&seed, &fallback_family, regime);
     let daily_signal = evaluate_live_signal(&seed, baseline, strategy_statuses, entry_window_open);
+    let daily_model_matches = independent_current_daily_matches(&seed, baseline, strategy_statuses);
     let weekly_signal = weekly_lab.map(|row| evaluate_weekly_lab_signal(&seed, row, entry_window_open));
-    let live_signal = choose_live_signal(daily_signal, weekly_signal);
+    let live_signal = choose_live_signal(daily_signal.clone(), weekly_signal.clone());
 
     let family = if live_signal.setup_family == "Unscored" {
         fallback_family.clone()
@@ -2281,6 +3461,18 @@ fn build_live_candidate(
             seed.symbol
         ),
     };
+    let confluence = build_research_confluence(
+        &seed,
+        regime,
+        baseline,
+        &daily_signal,
+        &daily_model_matches,
+        weekly_signal.as_ref(),
+        &live_signal,
+        score,
+        risk_reward,
+        stop_loss,
+    );
 
     SwingCandidate {
         symbol: seed.symbol,
@@ -2305,6 +3497,7 @@ fn build_live_candidate(
         risks,
         source: seed.source,
         live_signal,
+        confluence,
     }
 }
 
@@ -2740,12 +3933,10 @@ fn strategy_exit_plan(strategy_id: &str) -> Option<(f32, f32, &'static str)> {
         "king-candle-quality-v1" => Some((40.0, 8.0, "20-30 weeks / weekly ST trail")),
         "weekly-supertrend-10-3" => Some((40.0, 10.0, "20-30 weeks / weekly ST trail")),
         "swing-breakout-v1" => Some((8.0, 4.0, "10 sessions")),
-        "breakout-volume-v2" => Some((10.0, 4.0, "12 sessions")),
         "pullback-20dma-v1" => Some((6.0, 3.0, "10 sessions")),
         "pullback-quality-v2" => Some((7.0, 3.0, "12 sessions")),
         "rsi10-pullback-reversion-v1" => Some((4.0, 4.0, "5 sessions")),
         "near-52w-high-v1" => Some((10.0, 5.0, "15 sessions")),
-        "near-52w-high-tight-v2" => Some((8.0, 4.0, "12 sessions")),
         "near-52w-high-runner-v2" => Some((12.0, 5.0, "20 sessions")),
         "near-52w-high-volume-v3" => Some((10.0, 4.5, "15 sessions")),
         "momentum-core-v1" => Some((15.0, 6.0, "25 sessions")),
@@ -2882,6 +4073,19 @@ fn build_candidate(seed: CandidateSeed, regime: &MarketRegime) -> SwingCandidate
             seed.symbol
         ),
     };
+    let fallback_signal = default_live_signal();
+    let confluence = build_research_confluence(
+        &seed,
+        regime,
+        None,
+        &fallback_signal,
+        &[],
+        None,
+        &fallback_signal,
+        score,
+        risk_reward,
+        stop_loss,
+    );
 
     SwingCandidate {
         symbol: seed.symbol,
@@ -2905,7 +4109,8 @@ fn build_candidate(seed: CandidateSeed, regime: &MarketRegime) -> SwingCandidate
         reasons,
         risks,
         source: seed.source,
-        live_signal: default_live_signal(),
+        live_signal: fallback_signal,
+        confluence,
     }
 }
 
@@ -3003,6 +4208,19 @@ fn load_weekly_lab_candidates() -> HashMap<String, WeeklyLabCandidate> {
     out
 }
 
+// King Candle entries may remain armed for four completed weeks.  Beyond that
+// window the CSV is research history, not current evidence, and must never
+// affect a live decision or a Top Pick.
+const WEEKLY_LAB_MAX_SIGNAL_AGE_DAYS: i64 = 28;
+
+fn weekly_lab_signal_is_fresh(value: &str) -> bool {
+    let Ok(signal_date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+        return false;
+    };
+    let age_days = (now_ist().date_naive() - signal_date).num_days();
+    (0..=WEEKLY_LAB_MAX_SIGNAL_AGE_DAYS).contains(&age_days)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_weekly_lab_file(
     path: &str,
@@ -3016,9 +4234,18 @@ fn load_weekly_lab_file(
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
+    let mut stale_rows = 0usize;
+    let mut newest_stale_date = String::new();
     for line in content.lines().skip(1) {
         let cols = line.split(',').map(str::trim).collect::<Vec<_>>();
         if cols.len() < 12 || cols[0].is_empty() {
+            continue;
+        }
+        if !weekly_lab_signal_is_fresh(cols[2]) {
+            stale_rows += 1;
+            if cols[2] > newest_stale_date.as_str() {
+                newest_stale_date = cols[2].to_string();
+            }
             continue;
         }
         let symbol = cols[0].to_string();
@@ -3045,6 +4272,15 @@ fn load_weekly_lab_file(
             body_ratio: parse_csv_f32(cols[9]),
             range_atr: parse_csv_f32(cols[11]),
         });
+    }
+    if stale_rows > 0 {
+        tracing::warn!(
+            "ignored {} stale weekly lab rows from {} (newest signal date: {}; max age: {} days)",
+            stale_rows,
+            path,
+            newest_stale_date,
+            WEEKLY_LAB_MAX_SIGNAL_AGE_DAYS,
+        );
     }
 }
 
@@ -4175,14 +5411,11 @@ fn strategy_match_for_screener(
     sma20: f64,
     sma200: f64,
     rsi10: f64,
-    tuned_ma_breakout: bool,
+    _tuned_ma_breakout: bool,
     tuned_panic_reversal: bool,
 ) -> (&'static str, &'static str) {
     if tuned_panic_reversal {
         return ("tuned-panic-reversal-v1", "Panic Reversal Lab");
-    }
-    if tuned_ma_breakout {
-        return ("tuned-ma-breakout-v1", "MA Breakout Lab");
     }
     if day_close > sma200 && rsi10 < 30.0 {
         return ("rsi10-pullback-reversion-v1", "RSI10 Pullback");
@@ -4214,14 +5447,8 @@ fn strategy_match_for_screener(
     if distance_to_52w_high_pct <= 6.0 && volume_ratio >= 1.15 && range_position_pct >= 75.0 && score >= 88 {
         return ("near-52w-high-volume-v3", "52W Volume");
     }
-    if distance_to_52w_high_pct <= 4.0 && range_position_pct >= 75.0 && score >= 88 {
-        return ("near-52w-high-tight-v2", "52W Tight");
-    }
     if setup_family == "Near 52W High" && score >= 80 {
         return ("near-52w-high-v1", "Near 52W High");
-    }
-    if setup_family == "Breakout Setup" && score >= 90 && volume_ratio >= 1.5 && breakout_pct <= 1.0 && trend_up {
-        return ("breakout-volume-v2", "Breakout Volume");
     }
     if setup_family == "Breakout Setup" || setup_family == "Breakout Continuation" {
         return ("swing-breakout-v1", "Swing Breakout");
@@ -4233,7 +5460,6 @@ fn default_strategy_status(strategy_id: &str) -> &'static str {
     match strategy_id {
         "king-candle-quality-v1" => "Candidate",
         "weekly-supertrend-10-3" => "Watch",
-        "tuned-ma-breakout-v1" => "Candidate",
         "tuned-panic-reversal-v1" => "Watch",
         "momentum-core-v1" => "Candidate",
         "rsi10-pullback-reversion-v1" => "Candidate",
@@ -4242,8 +5468,8 @@ fn default_strategy_status(strategy_id: &str) -> &'static str {
         "breakout-continuation-v1" => "Watch",
         "rs-leader-continuation-v1" => "Watch",
         "near-52w-high-runner-v2" => "Watch",
-        "near-52w-high-v1" | "near-52w-high-tight-v2" | "near-52w-high-volume-v3" => "Fragile",
-        "pullback-20dma-v1" | "pullback-quality-v2" | "swing-breakout-v1" | "breakout-volume-v2" => "Rejected",
+        "near-52w-high-v1" | "near-52w-high-volume-v3" => "Fragile",
+        "pullback-20dma-v1" | "pullback-quality-v2" | "swing-breakout-v1" => "Rejected",
         _ => "Unlinked",
     }
 }
@@ -4441,6 +5667,15 @@ fn is_paper_eligible_signal(row: &HistoricalScreenerRow) -> bool {
     matches!(row.strategy_status.as_str(), "Candidate" | "Watch")
         && paper_rule_for_strategy(&row.strategy_id).is_some()
         && row.close > 0.0
+        && signal_date_is_fresh(&row.as_of)
+}
+
+fn signal_date_is_fresh(value: &str) -> bool {
+    let Ok(signal_date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+        return false;
+    };
+    let age_days = (now_ist().date_naive() - signal_date).num_days();
+    (0..=4).contains(&age_days)
 }
 
 fn signal_key_for(row: &HistoricalScreenerRow) -> String {
@@ -4455,11 +5690,6 @@ struct PaperRule {
 
 fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
     let rule = match strategy_id {
-        "tuned-ma-breakout-v1" => PaperRule {
-            stop_loss_pct: 6.0,
-            take_profit_pct: 12.0,
-            source: "tuned MA breakout lab model",
-        },
         "tuned-panic-reversal-v1" => PaperRule {
             stop_loss_pct: 4.0,
             take_profit_pct: 10.0,
@@ -4468,7 +5698,6 @@ fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
         "near-52w-high-v1"
         | "near-52w-high-runner-v2"
         | "near-52w-high-volume-v3"
-        | "near-52w-high-tight-v2"
         | "momentum-core-v1" => PaperRule {
             stop_loss_pct: 5.0,
             take_profit_pct: 10.0,
@@ -4489,7 +5718,7 @@ fn paper_rule_for_strategy(strategy_id: &str) -> Option<PaperRule> {
             take_profit_pct: 7.0,
             source: "daily failed-breakdown reclaim model",
         },
-        "compression-breakout-v1" | "breakout-continuation-v1" | "swing-breakout-v1" | "breakout-volume-v2" => PaperRule {
+        "compression-breakout-v1" | "breakout-continuation-v1" | "swing-breakout-v1" => PaperRule {
             stop_loss_pct: 4.0,
             take_profit_pct: 8.0,
             source: "swing-breakout backtest family",

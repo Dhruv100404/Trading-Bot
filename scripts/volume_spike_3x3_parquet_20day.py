@@ -58,6 +58,8 @@ SEARCH_VOLUME_ACCEL_MAX = "2,3"
 SEARCH_DROP_FROM_HIGH = "2,3,4"
 SEARCH_GAP_UP_MIN = "0.5,1"
 SEARCH_MOM15_WINDOWS = "-2:0,-1:0,-0.5:0,0:1.5"
+SEARCH_STOP_PCTS = "1,1.5,2,2.5,3,4"
+SEARCH_TARGET_PCTS = "1,1.5,2,2.5,3,4,5"
 
 COLS = [
     "date",
@@ -814,11 +816,11 @@ def load_target_symbols() -> pd.Index:
     return mega.union(large)
 
 
-def plot_curve(daily: pd.DataFrame, path: Path) -> None:
+def plot_curve(daily: pd.DataFrame, path: Path, title: str = "Parquet volume-spike short, one position per symbol/day") -> None:
     fig, ax = plt.subplots(figsize=(14, 7))
-    ax.plot(pd.to_datetime(daily["date"]), daily["cum_net_pct"], label="baseline position-book")
+    ax.plot(pd.to_datetime(daily["date"]), daily["cum_net_pct"], label="position-book")
     ax.axhline(0.0, color="black", linewidth=0.8)
-    ax.set_title("Parquet baseline volume-spike 3%/3% short, one position per symbol/day")
+    ax.set_title(title)
     ax.set_ylabel("cumulative net, summed trade %")
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -827,14 +829,14 @@ def plot_curve(daily: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def plot_daily_bars(daily: pd.DataFrame, path: Path) -> None:
+def plot_daily_bars(daily: pd.DataFrame, path: Path, title: str = "Daily net by trade date") -> None:
     fig, ax = plt.subplots(figsize=(14, 7))
     x = np.arange(daily.shape[0], dtype=np.float32)
     ax.bar(x, daily["day_net_pct"].to_numpy(np.float32), label="daily net")
     ax.axhline(0.0, color="black", linewidth=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(daily["date"], rotation=45, ha="right")
-    ax.set_title("Daily net by trade date")
+    ax.set_title(title)
     ax.set_ylabel("daily net, summed trade %")
     ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
@@ -844,7 +846,11 @@ def plot_daily_bars(daily: pd.DataFrame, path: Path) -> None:
 
 def pattern_grid_specs(args: argparse.Namespace) -> list[dict[str, float | int | str]]:
     specs: list[dict[str, float | int | str]] = []
-    for bar, vol20, cum, accel, drop, gap_min, mom, hold in itertools.product(
+    raw_stop_values = getattr(args, "search_stop_pcts", None) or str(args.stop_pct)
+    raw_target_values = getattr(args, "search_target_pcts", None) or str(args.target_pct)
+    stop_values = parse_float_list(raw_stop_values)
+    target_values = parse_float_list(raw_target_values)
+    for bar, vol20, cum, accel, drop, gap_min, mom, hold, stop_pct, target_pct in itertools.product(
         parse_float_list(args.search_bar_rvol),
         parse_float_list(args.search_vol20_rvol),
         parse_float_list(args.search_cum_rvol),
@@ -853,11 +859,16 @@ def pattern_grid_specs(args: argparse.Namespace) -> list[dict[str, float | int |
         parse_float_list(args.search_gap_up_min),
         parse_window_list(args.search_mom15_windows),
         parse_int_list(args.search_holds),
+        stop_values,
+        target_values,
     ):
         mom_min, mom_max = mom
         specs.append(
             {
-                "name": f"rv{bar:g}_v20{vol20:g}_cum{cum:g}_acc{accel:g}_drop{drop:g}_gap{gap_min:g}_m{mom_min:g}_{mom_max:g}_h{hold}",
+                "name": (
+                    f"rv{bar:g}_v20{vol20:g}_cum{cum:g}_acc{accel:g}_drop{drop:g}_gap{gap_min:g}"
+                    f"_m{mom_min:g}_{mom_max:g}_h{hold}_sl{stop_pct:g}_tg{target_pct:g}"
+                ),
                 "bar_rvol_min": float(bar),
                 "vol20_rvol_min": float(vol20),
                 "cum_rvol_min": float(cum),
@@ -867,8 +878,8 @@ def pattern_grid_specs(args: argparse.Namespace) -> list[dict[str, float | int |
                 "mom15_min": float(mom_min),
                 "mom15_max": float(mom_max),
                 "hold_minutes": int(hold),
-                "stop_pct": float(args.stop_pct),
-                "target_pct": float(args.target_pct),
+                "stop_pct": float(stop_pct),
+                "target_pct": float(target_pct),
             }
         )
     if args.grid_limit and len(specs) > args.grid_limit:
@@ -901,6 +912,35 @@ def plot_pattern_search(results: pd.DataFrame, out_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(chart_dir / "pattern_validation_vs_oos.png", dpi=150)
     plt.close(fig)
+
+    if {"stop_pct", "target_pct", "out_of_sample_avg_net_pct", "score"}.issubset(results.columns):
+        for value_col, file_name, title in [
+            ("out_of_sample_avg_net_pct", "stop_target_oos_avg_heatmap.png", "Best OOS expectancy by stop/target"),
+            ("score", "stop_target_score_heatmap.png", "Best walk-forward score by stop/target"),
+        ]:
+            pivot = results.pivot_table(index="stop_pct", columns="target_pct", values=value_col, aggfunc="max")
+            pivot = pivot.sort_index().sort_index(axis=1)
+            if pivot.empty:
+                continue
+            data = pivot.to_numpy(dtype=np.float32)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            im = ax.imshow(data, aspect="auto", cmap="RdYlGn")
+            ax.set_xticks(np.arange(pivot.shape[1]))
+            ax.set_xticklabels([f"{value:g}" for value in pivot.columns])
+            ax.set_yticks(np.arange(pivot.shape[0]))
+            ax.set_yticklabels([f"{value:g}" for value in pivot.index])
+            ax.set_xlabel("target %")
+            ax.set_ylabel("stop %")
+            ax.set_title(title)
+            for i in range(pivot.shape[0]):
+                for j in range(pivot.shape[1]):
+                    value = data[i, j]
+                    if np.isfinite(value):
+                        ax.text(j, i, f"{value:0.2f}", ha="center", va="center", fontsize=8, color="#111111")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(chart_dir / file_name, dpi=150)
+            plt.close(fig)
 
 
 def run_pattern_search(
@@ -1129,6 +1169,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-drop-from-high", default=SEARCH_DROP_FROM_HIGH, help="Comma-separated minimum drop-from-day-high percentages.")
     parser.add_argument("--search-gap-up-min", default=SEARCH_GAP_UP_MIN, help="Comma-separated minimum open gap percentages.")
     parser.add_argument("--search-mom15-windows", default=SEARCH_MOM15_WINDOWS, help="Comma-separated momentum windows as min:max in percentage points.")
+    parser.add_argument("--search-stop-pcts", default=None, help="Comma-separated stop percentages for pattern search. Defaults to --stop-pct.")
+    parser.add_argument("--search-target-pcts", default=None, help="Comma-separated target percentages for pattern search. Defaults to --target-pct.")
     parser.add_argument("--grid-limit", type=int, default=0, help="Optional deterministic downsample of pattern combos.")
     parser.add_argument("--min-trades", type=int, default=30, help="Minimum full-sample trades for selecting the best pattern.")
     return parser.parse_args()

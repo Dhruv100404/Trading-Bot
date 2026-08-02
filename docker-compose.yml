@@ -8,13 +8,14 @@ services:
       - clickhouse_data:/var/lib/clickhouse
       - ./init:/docker-entrypoint-initdb.d
       - ./parquets:/var/lib/clickhouse/user_files/parquets:ro
+      - ./data/events:/var/lib/clickhouse/user_files/events:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
       interval: 5s
       retries: 20
       timeout: 3s
-      start_period: 30s
+      start_period: 5m
 
   engine:
     build:
@@ -30,6 +31,15 @@ services:
       - DHAN_QUOTE_ENDPOINT=${DHAN_QUOTE_ENDPOINT:-/marketfeed/quote}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - NEWS_AUTO_REFRESH=${NEWS_AUTO_REFRESH:-true}
+      - NEWS_REFRESH_INTERVAL_SECS=${NEWS_REFRESH_INTERVAL_SECS:-900}
+      - NEWS_MAX_PER_SOURCE=${NEWS_MAX_PER_SOURCE:-40}
+      - NEWS_SOURCES=${NEWS_SOURCES:-}
+      - NSE_LARGE_DEALS_LOOKBACK_DAYS=${NSE_LARGE_DEALS_LOOKBACK_DAYS:-7}
+      - MARKET_ACTIVITY_AUTO_REFRESH=${MARKET_ACTIVITY_AUTO_REFRESH:-true}
+      - MARKET_ACTIVITY_REFRESH_INTERVAL_SECS=${MARKET_ACTIVITY_REFRESH_INTERVAL_SECS:-900}
+      - MARKET_ACTIVITY_MAX_ROWS_PER_SOURCE=${MARKET_ACTIVITY_MAX_ROWS_PER_SOURCE:-75}
+      - MARKET_ACTIVITY_SOURCES=${MARKET_ACTIVITY_SOURCES:-}
       - DEBUG=${DEBUG:-false}
     volumes:
       - ./docs:/app/docs

@@ -11,7 +11,7 @@ use csv::StringRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     io::ErrorKind,
     path::PathBuf,
@@ -25,6 +25,23 @@ use crate::types::now_ist;
 const LATEST_RUN_ID: &str = "watchlist-swing-20260503-001";
 const BACKTEST_CAPITAL_PER_TRADE: f64 = 10_000.0;
 const BACKTEST_MAX_NEW_POSITIONS_PER_DAY: u16 = 3;
+const BACKTEST_CASH_ACCOUNT_CAPITAL: f64 = 30_000.0;
+const CASH_PORTFOLIO_STRATEGY_ID: &str = "cash-portfolio-all";
+// A one-off result is research, not validation. This prevents sparse rules
+// from appearing as Candidate merely because their only trade was positive.
+const MIN_BACKTEST_TRADES_FOR_VALIDATION: usize = 30;
+const DEPRECATED_BACKTEST_STRATEGY_IDS: &[&str] = &[
+    "near-52w-high-tight-v2",
+    "breakout-volume-v2",
+    "tuned-ma-breakout-v1",
+    // Rejected by the latest completed database run. Keep them out of future
+    // runs and purge their persisted trade rows during this cleanup.
+    "near-52w-high-runner-v2",
+    "pullback-quality-v2",
+    "regime-trend-breakout-v1",
+    "regime-breakout-volume-v1",
+    "regime-multifactor-score-v1",
+];
 
 const CREATE_BACKTEST_TRADES: &str = r#"
 CREATE TABLE IF NOT EXISTS trading.backtest_trades (
@@ -207,6 +224,15 @@ pub struct BacktestStrategyDiagnostic {
     win_rate: f64,
     profit_factor: f64,
     expectancy_pct: f64,
+    annualized_return_pct: f64,
+    max_drawdown_pct: f64,
+    sharpe_ratio: f64,
+    sortino_ratio: f64,
+    avg_win_pct: f64,
+    avg_loss_pct: f64,
+    payoff_ratio: f64,
+    max_losing_streak: u32,
+    recovery_factor: f64,
     positive_months_pct: f64,
     median_monthly_pnl: f64,
     worst_month: f64,
@@ -214,6 +240,67 @@ pub struct BacktestStrategyDiagnostic {
     max_drawdown_rs: f64,
     stability_score: f64,
     status: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct BacktestCashProfile {
+    strategy_id: String,
+    method_family: String,
+    initial_capital: f64,
+    candidate_trades: u32,
+    trades_taken: u32,
+    skipped_entries: u32,
+    cash_blocked_entries: u32,
+    duplicate_entries_skipped: u32,
+    total_pnl: f64,
+    return_pct: f64,
+    annualized_return_pct: f64,
+    win_rate: f64,
+    profit_factor: f64,
+    sharpe_ratio: f64,
+    sortino_ratio: f64,
+    max_drawdown_rs: f64,
+    max_drawdown_pct: f64,
+    recovery_factor: f64,
+    max_losing_streak: u32,
+    positive_months_pct: f64,
+    max_open_positions: u32,
+    peak_capital_used: f64,
+    peak_capital_used_pct: f64,
+    avg_capital_used_pct: f64,
+    from_date: String,
+    to_date: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct BacktestCashMonthlyReturn {
+    strategy_id: String,
+    year: u16,
+    month: u8,
+    month_label: String,
+    trades_closed: u32,
+    entries_taken: u32,
+    skipped_entries: u32,
+    pnl: f64,
+    return_pct: f64,
+    ending_equity: f64,
+    max_drawdown_pct: f64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct BacktestCashEquityPoint {
+    strategy_id: String,
+    trade_date: String,
+    realized_pnl: f64,
+    cumulative_pnl: f64,
+    equity_value: f64,
+    drawdown_rs: f64,
+    return_pct: f64,
+    open_positions: u32,
+    capital_used: f64,
+    cash_available: f64,
+    entries_taken: u32,
+    skipped_entries: u32,
 }
 
 #[derive(Serialize)]
@@ -229,6 +316,9 @@ pub struct BacktestDashboardResponse {
     losers: Vec<BacktestSymbolResult>,
     day_quality: Vec<BacktestDayQuality>,
     trades: Vec<BacktestTradeLogRow>,
+    cash_profiles: Vec<BacktestCashProfile>,
+    cash_monthly_returns: Vec<BacktestCashMonthlyReturn>,
+    cash_equity_curve: Vec<BacktestCashEquityPoint>,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +427,36 @@ struct FileBacktestTrade {
     score: u8,
 }
 
+#[derive(Clone)]
+struct BacktestAnalysisTrade {
+    strategy_id: String,
+    method_family: String,
+    symbol: String,
+    signal_date: NaiveDate,
+    entry_date: NaiveDate,
+    exit_date: NaiveDate,
+    setup_family: String,
+    capital_used: f64,
+    pnl: f64,
+    score: u8,
+}
+
+#[derive(Default)]
+struct CashMonthAccumulator {
+    trades_closed: u32,
+    entries_taken: u32,
+    skipped_entries: u32,
+    pnl: f64,
+    ending_equity: f64,
+    max_drawdown_pct: f64,
+}
+
+struct CashSimulationResult {
+    profile: BacktestCashProfile,
+    monthly_returns: Vec<BacktestCashMonthlyReturn>,
+    equity_curve: Vec<BacktestCashEquityPoint>,
+}
+
 pub async fn dashboard(State(state): State<AppState>) -> Json<BacktestDashboardResponse> {
     let run_id = latest_run_id(&state)
         .await
@@ -378,13 +498,21 @@ pub async fn run(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("backtest run failed: {err}")))?;
 
+    let stored_trade_count = state
+        .ch
+        .query(&format!(
+            "SELECT count() FROM trading.backtest_trades WHERE run_id = '{}'",
+            escape_sql(&run_id)
+        ))
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("backtest trade count failed: {err}")))?;
     let dashboard = build_dashboard(&state, &run_id).await;
-    let trade_count: u32 = dashboard.summaries.iter().map(|summary| summary.total_trades).sum();
 
     Ok(Json(BacktestRunResponse {
         ok: true,
         run_id,
-        message: format!("Backtest completed with {} stored trades.", trade_count),
+        message: format!("Backtest completed with {} stored database trades.", stored_trade_count),
         cache: backtest_cache_status(&state).await.unwrap_or_default(),
         dashboard,
     }))
@@ -615,6 +743,104 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+fn is_deprecated_backtest_strategy(strategy_id: &str) -> bool {
+    DEPRECATED_BACKTEST_STRATEGY_IDS.contains(&strategy_id)
+}
+
+fn deprecated_strategy_sql_clause(alias: &str) -> String {
+    let ids = DEPRECATED_BACKTEST_STRATEGY_IDS
+        .iter()
+        .map(|id| format!("'{}'", escape_sql(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND {alias}.strategy_id NOT IN ({ids})")
+}
+
+fn filter_deprecated_backtest_results(
+    summaries: &mut Vec<BacktestRunSummary>,
+    yearly_returns: &mut Vec<BacktestYearlyReturn>,
+    monthly_returns: &mut Vec<BacktestMonthlyReturn>,
+    equity_curve: &mut Vec<BacktestEquityPoint>,
+    diagnostics: &mut Vec<BacktestStrategyDiagnostic>,
+    winners: &mut Vec<BacktestSymbolResult>,
+    losers: &mut Vec<BacktestSymbolResult>,
+    day_quality: &mut Vec<BacktestDayQuality>,
+    trades: &mut Vec<BacktestTradeLogRow>,
+) {
+    summaries.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    yearly_returns.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    monthly_returns.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    equity_curve.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    diagnostics.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    winners.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    losers.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    day_quality.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    trades.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+}
+
+/// The source query naturally returns only months that had entries. Fill the
+/// gaps between a strategy's first and last observed trade so the dashboard
+/// can distinguish a flat, zero-trade month from missing backtest data and
+/// calculate monthly hit rates honestly.
+fn fill_missing_monthly_returns(monthly_returns: &mut Vec<BacktestMonthlyReturn>) {
+    let mut grouped = BTreeMap::<String, BTreeMap<(u16, u8), BacktestMonthlyReturn>>::new();
+    for row in monthly_returns.drain(..) {
+        grouped
+            .entry(row.strategy_id.clone())
+            .or_default()
+            .insert((row.year, row.month), row);
+    }
+
+    let mut filled = Vec::new();
+    for (strategy_id, mut rows) in grouped {
+        let Some((start_year, start_month)) = rows.keys().next().copied() else {
+            continue;
+        };
+        let Some((end_year, end_month)) = rows.keys().next_back().copied() else {
+            continue;
+        };
+
+        let mut year = start_year;
+        let mut month = start_month;
+        loop {
+            if let Some(row) = rows.remove(&(year, month)) {
+                filled.push(row);
+            } else {
+                let date = NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), 1)
+                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                filled.push(BacktestMonthlyReturn {
+                    strategy_id: strategy_id.clone(),
+                    year,
+                    month,
+                    month_label: date.format("%b").to_string(),
+                    trades: 0,
+                    win_rate: 0.0,
+                    pnl: 0.0,
+                    return_pct: 0.0,
+                });
+            }
+
+            if year == end_year && month == end_month {
+                break;
+            }
+            if month == 12 {
+                year += 1;
+                month = 1;
+            } else {
+                month += 1;
+            }
+        }
+    }
+
+    filled.sort_by(|left, right| {
+        left.strategy_id
+            .cmp(&right.strategy_id)
+            .then(left.year.cmp(&right.year))
+            .then(left.month.cmp(&right.month))
+    });
+    *monthly_returns = filled;
+}
+
 fn append_file_backtest_results(
     summaries: &mut Vec<BacktestRunSummary>,
     yearly_returns: &mut Vec<BacktestYearlyReturn>,
@@ -694,13 +920,6 @@ fn append_file_backtest_results(
 fn file_strategy_sources() -> Vec<FileStrategySource> {
     vec![
         FileStrategySource {
-            strategy_id: "tuned-ma-breakout-v1",
-            strategy_name: "MA Breakout Lab",
-            setup_family: "MA Breakout",
-            method_family: "MA Breakout",
-            relative_path: "docs/complex_strategy_tuning_lab/ma_best_trades.csv",
-        },
-        FileStrategySource {
             strategy_id: "tuned-panic-reversal-v1",
             strategy_name: "Panic Reversal Lab",
             setup_family: "Panic Reversal",
@@ -750,6 +969,28 @@ fn load_file_backtest_trades() -> anyhow::Result<Vec<FileBacktestTrade>> {
         }
     }
     Ok(out)
+}
+
+fn load_file_analysis_trades() -> anyhow::Result<Vec<BacktestAnalysisTrade>> {
+    Ok(load_file_backtest_trades()?
+        .iter()
+        .map(file_trade_to_analysis_trade)
+        .collect())
+}
+
+fn file_trade_to_analysis_trade(trade: &FileBacktestTrade) -> BacktestAnalysisTrade {
+    BacktestAnalysisTrade {
+        strategy_id: trade.strategy_id.clone(),
+        method_family: trade.method_family.clone(),
+        symbol: trade.symbol.clone(),
+        signal_date: trade.signal_date,
+        entry_date: trade.entry_date,
+        exit_date: trade.exit_date,
+        setup_family: trade.setup_family.clone(),
+        capital_used: trade.capital_used,
+        pnl: trade.pnl,
+        score: trade.score,
+    }
 }
 
 fn parse_file_backtest_trade(
@@ -875,6 +1116,7 @@ fn file_summaries(trades: &[FileBacktestTrade]) -> Vec<BacktestRunSummary> {
 }
 
 fn file_yearly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestYearlyReturn> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
     let mut grouped: BTreeMap<(String, u16), Vec<&FileBacktestTrade>> = BTreeMap::new();
     for trade in trades {
         grouped
@@ -886,7 +1128,6 @@ fn file_yearly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestYearlyReturn
         .into_iter()
         .map(|((strategy_id, year), rows)| {
             let pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
-            let capital: f64 = rows.iter().map(|trade| trade.capital_used).sum();
             BacktestYearlyReturn {
                 strategy_id,
                 year,
@@ -894,13 +1135,14 @@ fn file_yearly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestYearlyReturn
                 win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
                 avg_return_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
                 pnl: round2(pnl),
-                return_pct: round3(100.0 * pnl / capital.max(1.0)),
+                return_pct: round3(100.0 * pnl / active_capital.max(1.0)),
             }
         })
         .collect()
 }
 
 fn file_monthly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestMonthlyReturn> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
     let mut grouped: BTreeMap<(String, u16, u8), Vec<&FileBacktestTrade>> = BTreeMap::new();
     for trade in trades {
         grouped
@@ -912,7 +1154,6 @@ fn file_monthly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestMonthlyRetu
         .into_iter()
         .map(|((strategy_id, year, month), rows)| {
             let pnl: f64 = rows.iter().map(|trade| trade.pnl).sum();
-            let capital: f64 = rows.iter().map(|trade| trade.capital_used).sum();
             let date = NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), 1)
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
             BacktestMonthlyReturn {
@@ -923,7 +1164,7 @@ fn file_monthly_returns(trades: &[FileBacktestTrade]) -> Vec<BacktestMonthlyRetu
                 trades: rows.len() as u32,
                 win_rate: round2(100.0 * rows.iter().filter(|trade| trade.pnl > 0.0).count() as f64 / rows.len() as f64),
                 pnl: round2(pnl),
-                return_pct: round3(100.0 * pnl / capital.max(1.0)),
+                return_pct: round3(100.0 * pnl / active_capital.max(1.0)),
             }
         })
         .collect()
@@ -965,6 +1206,7 @@ fn file_equity_curve(trades: &[FileBacktestTrade]) -> Vec<BacktestEquityPoint> {
 }
 
 fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnostic> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
     let monthly = file_monthly_returns(trades);
     let monthly_by_strategy = monthly.iter().fold(HashMap::<String, Vec<f64>>::new(), |mut map, row| {
         map.entry(row.strategy_id.clone()).or_default().push(row.pnl);
@@ -984,6 +1226,16 @@ fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnos
             let losses: Vec<f64> = rows.iter().filter(|trade| trade.pnl < 0.0).map(|trade| trade.pnl).collect();
             let gross_profit: f64 = wins.iter().sum();
             let gross_loss = losses.iter().sum::<f64>().abs();
+            let win_returns = rows
+                .iter()
+                .filter(|trade| trade.return_pct > 0.0)
+                .map(|trade| trade.return_pct)
+                .collect::<Vec<_>>();
+            let loss_returns = rows
+                .iter()
+                .filter(|trade| trade.return_pct < 0.0)
+                .map(|trade| trade.return_pct)
+                .collect::<Vec<_>>();
             let months = monthly_by_strategy.get(&first.strategy_id).cloned().unwrap_or_default();
             let positive_months_pct = if months.is_empty() {
                 0.0
@@ -993,6 +1245,55 @@ fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnos
             let worst_month = months.iter().copied().reduce(f64::min).unwrap_or(0.0);
             let best_month = months.iter().copied().reduce(f64::max).unwrap_or(0.0);
             let max_drawdown_rs = *dd_by_strategy.get(&first.strategy_id).unwrap_or(&0.0);
+            let mut daily = BTreeMap::<NaiveDate, f64>::new();
+            for trade in &rows {
+                *daily.entry(trade.entry_date).or_default() += trade.pnl;
+            }
+            let daily_returns = daily
+                .values()
+                .map(|pnl| *pnl / active_capital.max(1.0))
+                .collect::<Vec<_>>();
+            let downside_returns = daily_returns
+                .iter()
+                .copied()
+                .filter(|value| *value < 0.0)
+                .collect::<Vec<_>>();
+            let avg_daily_return = if daily_returns.is_empty() {
+                0.0
+            } else {
+                daily_returns.iter().sum::<f64>() / daily_returns.len() as f64
+            };
+            let daily_std = stddev_pop(&daily_returns);
+            let downside_std = stddev_pop(&downside_returns);
+            let first_entry = rows.iter().map(|trade| trade.entry_date).min().unwrap_or(first.entry_date);
+            let last_exit = rows.iter().map(|trade| trade.exit_date).max().unwrap_or(first.exit_date);
+            let span_days = (last_exit - first_entry).num_days().max(1) as f64;
+            let total_return = total_pnl / active_capital.max(1.0);
+            let annualized_return_pct = if total_return <= -0.999 {
+                -100.0
+            } else {
+                ((1.0 + total_return).powf(365.25 / span_days) - 1.0) * 100.0
+            };
+            let avg_win_pct = if win_returns.is_empty() {
+                0.0
+            } else {
+                win_returns.iter().sum::<f64>() / win_returns.len() as f64
+            };
+            let avg_loss_pct = if loss_returns.is_empty() {
+                0.0
+            } else {
+                loss_returns.iter().sum::<f64>() / loss_returns.len() as f64
+            };
+            let payoff_ratio = if avg_loss_pct == 0.0 {
+                if avg_win_pct > 0.0 { 99.0 } else { 0.0 }
+            } else {
+                avg_win_pct / avg_loss_pct.abs()
+            };
+            let recovery_factor = if max_drawdown_rs == 0.0 {
+                if total_pnl > 0.0 { 99.0 } else { 0.0 }
+            } else {
+                total_pnl / max_drawdown_rs.abs()
+            };
             let profit_factor = if gross_loss == 0.0 {
                 if gross_profit > 0.0 { 99.0 } else { 0.0 }
             } else {
@@ -1005,7 +1306,9 @@ fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnos
                 + if total_pnl > 0.0 { 8.0 } else { -18.0 }
                 - (max_drawdown_rs.abs() / total_pnl.abs().max(1.0) * 12.0).min(22.0))
                 .clamp(0.0, 100.0);
-            let status = if total_pnl <= 0.0 {
+            let status = if rows.len() < MIN_BACKTEST_TRADES_FOR_VALIDATION {
+                "Fragile"
+            } else if total_pnl <= 0.0 {
                 "Rejected"
             } else if raw_stability >= 56.0 && positive_months_pct >= 55.0 {
                 "Candidate"
@@ -1023,6 +1326,15 @@ fn file_diagnostics(trades: &[FileBacktestTrade]) -> Vec<BacktestStrategyDiagnos
                 win_rate: round2(win_rate),
                 profit_factor: round2(profit_factor),
                 expectancy_pct: round3(rows.iter().map(|trade| trade.return_pct).sum::<f64>() / rows.len() as f64),
+                annualized_return_pct: round2(annualized_return_pct),
+                max_drawdown_pct: round2(100.0 * max_drawdown_rs / active_capital.max(1.0)),
+                sharpe_ratio: round2(if daily_std == 0.0 { 0.0 } else { avg_daily_return / daily_std * 252.0_f64.sqrt() }),
+                sortino_ratio: round2(if downside_std == 0.0 { 0.0 } else { avg_daily_return / downside_std * 252.0_f64.sqrt() }),
+                avg_win_pct: round3(avg_win_pct),
+                avg_loss_pct: round3(avg_loss_pct),
+                payoff_ratio: round2(payoff_ratio),
+                max_losing_streak: max_losing_streak(&rows),
+                recovery_factor: round2(recovery_factor),
                 positive_months_pct: round2(positive_months_pct),
                 median_monthly_pnl: round2(median(months)),
                 worst_month: round2(worst_month),
@@ -1123,6 +1435,38 @@ fn file_day_quality(trades: &[FileBacktestTrade]) -> Vec<BacktestDayQuality> {
         .collect()
 }
 
+fn stddev_pop(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+fn max_losing_streak(rows: &[&FileBacktestTrade]) -> u32 {
+    let mut ordered = rows.to_vec();
+    ordered.sort_by(|a, b| a.entry_date.cmp(&b.entry_date).then(a.symbol.cmp(&b.symbol)));
+    let mut current = 0_u32;
+    let mut best = 0_u32;
+    for trade in ordered {
+        if trade.pnl <= 0.0 {
+            current += 1;
+            best = best.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    best
+}
+
 fn file_trade_log(trades: &[FileBacktestTrade]) -> Vec<BacktestTradeLogRow> {
     let mut rows = trades
         .iter()
@@ -1158,6 +1502,352 @@ fn grouped_file_trades(trades: &[FileBacktestTrade]) -> BTreeMap<String, Vec<&Fi
         grouped.entry(trade.strategy_id.clone()).or_default().push(trade);
     }
     grouped
+}
+
+fn build_cash_analytics(
+    trades: &[BacktestAnalysisTrade],
+) -> (
+    Vec<BacktestCashProfile>,
+    Vec<BacktestCashMonthlyReturn>,
+    Vec<BacktestCashEquityPoint>,
+) {
+    let clean_trades = trades
+        .iter()
+        .filter(|trade| trade.capital_used > 0.0 && trade.entry_date <= trade.exit_date)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if clean_trades.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let mut simulations = Vec::new();
+    simulations.push(simulate_cash_strategy(
+        CASH_PORTFOLIO_STRATEGY_ID,
+        "Cash Portfolio",
+        &clean_trades,
+    ));
+
+    let mut grouped = BTreeMap::<String, Vec<BacktestAnalysisTrade>>::new();
+    for trade in clean_trades {
+        grouped.entry(trade.strategy_id.clone()).or_default().push(trade);
+    }
+    for (strategy_id, rows) in grouped {
+        let method_family = rows
+            .first()
+            .map(|trade| trade.method_family.as_str())
+            .unwrap_or("Other");
+        simulations.push(simulate_cash_strategy(&strategy_id, method_family, &rows));
+    }
+
+    let mut profiles = Vec::new();
+    let mut monthly_returns = Vec::new();
+    let mut equity_curve = Vec::new();
+    for simulation in simulations {
+        profiles.push(simulation.profile);
+        monthly_returns.extend(simulation.monthly_returns);
+        equity_curve.extend(simulation.equity_curve);
+    }
+
+    profiles.sort_by(|a, b| {
+        if a.strategy_id == CASH_PORTFOLIO_STRATEGY_ID {
+            std::cmp::Ordering::Less
+        } else if b.strategy_id == CASH_PORTFOLIO_STRATEGY_ID {
+            std::cmp::Ordering::Greater
+        } else {
+            b.return_pct
+                .partial_cmp(&a.return_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.strategy_id.cmp(&b.strategy_id))
+        }
+    });
+    monthly_returns.sort_by(|a, b| {
+        a.strategy_id
+            .cmp(&b.strategy_id)
+            .then(a.year.cmp(&b.year))
+            .then(a.month.cmp(&b.month))
+    });
+    equity_curve.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id).then(a.trade_date.cmp(&b.trade_date)));
+
+    (profiles, monthly_returns, equity_curve)
+}
+
+fn simulate_cash_strategy(
+    strategy_id: &str,
+    method_family: &str,
+    trades: &[BacktestAnalysisTrade],
+) -> CashSimulationResult {
+    let initial_capital = BACKTEST_CASH_ACCOUNT_CAPITAL;
+    let mut entry_by_date = BTreeMap::<NaiveDate, Vec<BacktestAnalysisTrade>>::new();
+    let mut event_dates = BTreeSet::<NaiveDate>::new();
+    let mut first_entry: Option<NaiveDate> = None;
+    let mut last_exit: Option<NaiveDate> = None;
+
+    for trade in trades {
+        entry_by_date.entry(trade.entry_date).or_default().push(trade.clone());
+        event_dates.insert(trade.entry_date);
+        event_dates.insert(trade.exit_date);
+        first_entry = Some(first_entry.map_or(trade.entry_date, |date| date.min(trade.entry_date)));
+        last_exit = Some(last_exit.map_or(trade.exit_date, |date| date.max(trade.exit_date)));
+    }
+
+    let mut cash = initial_capital;
+    let mut open_positions = Vec::<BacktestAnalysisTrade>::new();
+    let mut accepted_trades = Vec::<BacktestAnalysisTrade>::new();
+    let mut equity_curve = Vec::<BacktestCashEquityPoint>::new();
+    let mut monthly = BTreeMap::<(u16, u8), CashMonthAccumulator>::new();
+    let mut daily_returns = Vec::<f64>::new();
+    let mut cumulative_peak: f64 = 0.0;
+    let mut max_drawdown_rs: f64 = 0.0;
+    let mut max_open_positions = 0_u32;
+    let mut peak_capital_used: f64 = 0.0;
+    let mut capital_used_pct_sum: f64 = 0.0;
+    let mut event_day_count = 0_u32;
+    let mut skipped_entries = 0_u32;
+    let mut cash_blocked_entries = 0_u32;
+    let mut duplicate_entries_skipped = 0_u32;
+
+    for date in event_dates {
+        let mut realized_today = 0.0;
+        let mut closed_today = 0_u32;
+        let mut entries_taken_today = 0_u32;
+        let mut skipped_today = 0_u32;
+
+        close_cash_positions(
+            &mut open_positions,
+            date,
+            false,
+            &mut cash,
+            &mut realized_today,
+            &mut closed_today,
+        );
+
+        let mut candidates = entry_by_date.remove(&date).unwrap_or_default();
+        candidates.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.signal_date.cmp(&a.signal_date))
+                .then_with(|| a.strategy_id.cmp(&b.strategy_id))
+                .then_with(|| a.setup_family.cmp(&b.setup_family))
+                .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+
+        for candidate in candidates {
+            if open_positions.iter().any(|position| position.symbol == candidate.symbol) {
+                duplicate_entries_skipped += 1;
+                skipped_entries += 1;
+                skipped_today += 1;
+                continue;
+            }
+            if candidate.capital_used <= cash + 0.01 {
+                cash -= candidate.capital_used;
+                accepted_trades.push(candidate.clone());
+                open_positions.push(candidate);
+                entries_taken_today += 1;
+            } else {
+                cash_blocked_entries += 1;
+                skipped_entries += 1;
+                skipped_today += 1;
+            }
+        }
+
+        let intraday_capital_used = open_positions.iter().map(|trade| trade.capital_used).sum::<f64>();
+        let intraday_open_positions = open_positions.len() as u32;
+        close_cash_positions(
+            &mut open_positions,
+            date,
+            true,
+            &mut cash,
+            &mut realized_today,
+            &mut closed_today,
+        );
+
+        let capital_used = open_positions.iter().map(|trade| trade.capital_used).sum::<f64>();
+        let equity_value = cash + capital_used;
+        let cumulative_pnl = equity_value - initial_capital;
+        if cumulative_pnl > cumulative_peak {
+            cumulative_peak = cumulative_pnl;
+        }
+        let drawdown_rs = cumulative_pnl - cumulative_peak;
+        if drawdown_rs < max_drawdown_rs {
+            max_drawdown_rs = drawdown_rs;
+        }
+        max_open_positions = max_open_positions.max(intraday_open_positions).max(open_positions.len() as u32);
+        let peak_day_capital_used = intraday_capital_used.max(capital_used);
+        peak_capital_used = peak_capital_used.max(peak_day_capital_used);
+        capital_used_pct_sum += 100.0 * peak_day_capital_used / initial_capital.max(1.0);
+        event_day_count += 1;
+        daily_returns.push(realized_today / initial_capital.max(1.0));
+
+        let key = (date.year() as u16, date.month() as u8);
+        let month = monthly.entry(key).or_default();
+        month.trades_closed += closed_today;
+        month.entries_taken += entries_taken_today;
+        month.skipped_entries += skipped_today;
+        month.pnl += realized_today;
+        month.ending_equity = equity_value;
+        month.max_drawdown_pct = month.max_drawdown_pct.min(100.0 * drawdown_rs / initial_capital.max(1.0));
+
+        equity_curve.push(BacktestCashEquityPoint {
+            strategy_id: strategy_id.to_string(),
+            trade_date: date.to_string(),
+            realized_pnl: round2(realized_today),
+            cumulative_pnl: round2(cumulative_pnl),
+            equity_value: round2(equity_value),
+            drawdown_rs: round2(drawdown_rs),
+            return_pct: round3(100.0 * cumulative_pnl / initial_capital.max(1.0)),
+            open_positions: open_positions.len() as u32,
+            capital_used: round2(capital_used),
+            cash_available: round2(cash),
+            entries_taken: entries_taken_today,
+            skipped_entries: skipped_today,
+        });
+    }
+
+    let total_pnl = equity_curve.last().map(|point| point.cumulative_pnl).unwrap_or(0.0);
+    let total_return = total_pnl / initial_capital.max(1.0);
+    let span_days = first_entry
+        .zip(last_exit)
+        .map(|(start, end)| (end - start).num_days().max(1) as f64)
+        .unwrap_or(1.0);
+    let annualized_return_pct = if total_return <= -0.999 {
+        -100.0
+    } else {
+        ((1.0 + total_return).powf(365.25 / span_days) - 1.0) * 100.0
+    };
+
+    let wins = accepted_trades.iter().filter(|trade| trade.pnl > 0.0).count();
+    let gross_profit = accepted_trades
+        .iter()
+        .filter(|trade| trade.pnl > 0.0)
+        .map(|trade| trade.pnl)
+        .sum::<f64>();
+    let gross_loss = accepted_trades
+        .iter()
+        .filter(|trade| trade.pnl < 0.0)
+        .map(|trade| trade.pnl)
+        .sum::<f64>()
+        .abs();
+    let downside_returns = daily_returns
+        .iter()
+        .copied()
+        .filter(|value| *value < 0.0)
+        .collect::<Vec<_>>();
+    let avg_daily_return = if daily_returns.is_empty() {
+        0.0
+    } else {
+        daily_returns.iter().sum::<f64>() / daily_returns.len() as f64
+    };
+    let daily_std = stddev_pop(&daily_returns);
+    let downside_std = stddev_pop(&downside_returns);
+    let monthly_pnls = monthly.values().map(|row| row.pnl).collect::<Vec<_>>();
+    let positive_months_pct = if monthly_pnls.is_empty() {
+        0.0
+    } else {
+        100.0 * monthly_pnls.iter().filter(|pnl| **pnl > 0.0).count() as f64 / monthly_pnls.len() as f64
+    };
+
+    let monthly_returns = monthly
+        .into_iter()
+        .map(|((year, month), row)| {
+            let date = NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), 1)
+                .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            BacktestCashMonthlyReturn {
+                strategy_id: strategy_id.to_string(),
+                year,
+                month,
+                month_label: date.format("%b").to_string(),
+                trades_closed: row.trades_closed,
+                entries_taken: row.entries_taken,
+                skipped_entries: row.skipped_entries,
+                pnl: round2(row.pnl),
+                return_pct: round3(100.0 * row.pnl / initial_capital.max(1.0)),
+                ending_equity: round2(row.ending_equity),
+                max_drawdown_pct: round2(row.max_drawdown_pct),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    CashSimulationResult {
+        profile: BacktestCashProfile {
+            strategy_id: strategy_id.to_string(),
+            method_family: method_family.to_string(),
+            initial_capital: round2(initial_capital),
+            candidate_trades: trades.len() as u32,
+            trades_taken: accepted_trades.len() as u32,
+            skipped_entries,
+            cash_blocked_entries,
+            duplicate_entries_skipped,
+            total_pnl: round2(total_pnl),
+            return_pct: round3(100.0 * total_return),
+            annualized_return_pct: round2(annualized_return_pct),
+            win_rate: round2(if accepted_trades.is_empty() { 0.0 } else { 100.0 * wins as f64 / accepted_trades.len() as f64 }),
+            profit_factor: round2(if gross_loss == 0.0 { if gross_profit > 0.0 { 99.0 } else { 0.0 } } else { gross_profit / gross_loss }),
+            sharpe_ratio: round2(if daily_std == 0.0 { 0.0 } else { avg_daily_return / daily_std * 252.0_f64.sqrt() }),
+            sortino_ratio: round2(if downside_std == 0.0 { 0.0 } else { avg_daily_return / downside_std * 252.0_f64.sqrt() }),
+            max_drawdown_rs: round2(max_drawdown_rs),
+            max_drawdown_pct: round2(100.0 * max_drawdown_rs / initial_capital.max(1.0)),
+            recovery_factor: round2(if max_drawdown_rs == 0.0 { if total_pnl > 0.0 { 99.0 } else { 0.0 } } else { total_pnl / max_drawdown_rs.abs() }),
+            max_losing_streak: max_losing_streak_analysis(&accepted_trades),
+            positive_months_pct: round2(positive_months_pct),
+            max_open_positions,
+            peak_capital_used: round2(peak_capital_used),
+            peak_capital_used_pct: round2(100.0 * peak_capital_used / initial_capital.max(1.0)),
+            avg_capital_used_pct: round2(if event_day_count == 0 { 0.0 } else { capital_used_pct_sum / f64::from(event_day_count) }),
+            from_date: first_entry.map(|date| date.to_string()).unwrap_or_default(),
+            to_date: last_exit.map(|date| date.to_string()).unwrap_or_default(),
+        },
+        monthly_returns,
+        equity_curve,
+    }
+}
+
+fn close_cash_positions(
+    open_positions: &mut Vec<BacktestAnalysisTrade>,
+    date: NaiveDate,
+    include_same_day: bool,
+    cash: &mut f64,
+    realized_today: &mut f64,
+    closed_today: &mut u32,
+) {
+    let mut still_open = Vec::with_capacity(open_positions.len());
+    for trade in open_positions.drain(..) {
+        let should_close = if include_same_day {
+            trade.exit_date <= date
+        } else {
+            trade.exit_date < date
+        };
+        if should_close {
+            *cash += trade.capital_used + trade.pnl;
+            *realized_today += trade.pnl;
+            *closed_today += 1;
+        } else {
+            still_open.push(trade);
+        }
+    }
+    *open_positions = still_open;
+}
+
+fn max_losing_streak_analysis(rows: &[BacktestAnalysisTrade]) -> u32 {
+    let mut ordered = rows.to_vec();
+    ordered.sort_by(|a, b| {
+        a.exit_date
+            .cmp(&b.exit_date)
+            .then(a.entry_date.cmp(&b.entry_date))
+            .then(a.strategy_id.cmp(&b.strategy_id))
+            .then(a.symbol.cmp(&b.symbol))
+    });
+    let mut current = 0_u32;
+    let mut best = 0_u32;
+    for trade in ordered {
+        if trade.pnl <= 0.0 {
+            current += 1;
+            best = best.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    best
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -1201,6 +1891,7 @@ async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardRes
     let mut losers = fetch_symbol_results(state, run_id, true).await.unwrap_or_default();
     let mut day_quality = fetch_day_quality(state, run_id).await.unwrap_or_default();
     let mut trades = fetch_trade_log(state, run_id).await.unwrap_or_default();
+    let mut analysis_trades = fetch_analysis_trades(state, run_id).await.unwrap_or_default();
 
     if let Err(err) = append_file_backtest_results(
         &mut summaries,
@@ -1215,6 +1906,24 @@ async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardRes
     ) {
         tracing::warn!("file-backed backtest result load failed: {}", err);
     }
+    match load_file_analysis_trades() {
+        Ok(mut file_trades) => analysis_trades.append(&mut file_trades),
+        Err(err) => tracing::warn!("file-backed cash analysis load failed: {}", err),
+    }
+    filter_deprecated_backtest_results(
+        &mut summaries,
+        &mut yearly_returns,
+        &mut monthly_returns,
+        &mut equity_curve,
+        &mut diagnostics,
+        &mut winners,
+        &mut losers,
+        &mut day_quality,
+        &mut trades,
+    );
+    fill_missing_monthly_returns(&mut monthly_returns);
+    analysis_trades.retain(|row| !is_deprecated_backtest_strategy(&row.strategy_id));
+    let (cash_profiles, cash_monthly_returns, cash_equity_curve) = build_cash_analytics(&analysis_trades);
 
     BacktestDashboardResponse {
         run_id: run_id.to_string(),
@@ -1228,6 +1937,9 @@ async fn build_dashboard(state: &AppState, run_id: &str) -> BacktestDashboardRes
         losers,
         day_quality,
         trades,
+        cash_profiles,
+        cash_monthly_returns,
+        cash_equity_curve,
     }
 }
 
@@ -1423,9 +2135,7 @@ fn dynamic_exit_pct(atr_multiple: Option<f64>, fallback_pct: f64) -> String {
 
 fn default_strategy_condition(strategy: &BacktestStrategySpec) -> String {
     match strategy.strategy_id.as_str() {
-        "breakout-volume-v2" => "sig.volume_ratio >= 1.5 AND sig.breakout_pct <= 1.0 AND sig.trend_up = 1".to_string(),
         "pullback-quality-v2" => "sig.trend_up = 1 AND sig.pullback_zone = 1 AND sig.volume_ratio >= 0.8 AND sig.day_close >= sig.sma20".to_string(),
-        "near-52w-high-tight-v2" => "sig.distance_to_52w_high_pct <= 4.0 AND sig.range_position_pct >= 75.0".to_string(),
         "near-52w-high-runner-v2" => "sig.distance_to_52w_high_pct <= 3.0 AND sig.trend_up = 1 AND sig.volume_ratio >= 0.8".to_string(),
         "near-52w-high-volume-v3" => "sig.distance_to_52w_high_pct <= 6.0 AND sig.volume_ratio >= 1.15 AND sig.range_position_pct >= 75.0".to_string(),
         "momentum-core-v1" => "sig.distance_to_52w_high_pct <= 3.0 AND sig.range_position_pct >= 85.0 AND sig.trend_up = 1".to_string(),
@@ -1446,7 +2156,10 @@ fn load_backtest_strategy_specs() -> Vec<BacktestStrategySpec> {
     // Backtest strategy behavior is code-owned. Do not load strategy behavior from
     // external JSON files here; promote validated Python research into explicit
     // engine specs or a dedicated Python backtest service.
-    let mut specs = built_in_variant_specs();
+    let mut specs = built_in_variant_specs()
+        .into_iter()
+        .filter(|spec| !is_deprecated_backtest_strategy(&spec.strategy_id))
+        .collect::<Vec<_>>();
     if specs.is_empty() {
         specs.push(BacktestStrategySpec {
             strategy_id: "near-52w-high-v1".to_string(),
@@ -1526,40 +2239,12 @@ fn built_in_variant_specs() -> Vec<BacktestStrategySpec> {
             entry_condition_sql: None,
         },
         BacktestStrategySpec {
-            strategy_id: "breakout-volume-v2".to_string(),
-            strategy_name: "Breakout Volume V2".to_string(),
-            setup_family: "Breakout Setup".to_string(),
-            min_score: 90,
-            tp_pct: 10.0,
-            sl_pct: 4.0,
-            target_atr: None,
-            stop_atr: None,
-            max_hold_sessions: 12,
-            max_positions_per_day: BACKTEST_MAX_NEW_POSITIONS_PER_DAY,
-            capital_per_trade: BACKTEST_CAPITAL_PER_TRADE,
-            entry_condition_sql: None,
-        },
-        BacktestStrategySpec {
             strategy_id: "pullback-quality-v2".to_string(),
             strategy_name: "Pullback Quality V2".to_string(),
             setup_family: "Pullback To 20 DMA".to_string(),
             min_score: 88,
             tp_pct: 7.0,
             sl_pct: 3.0,
-            target_atr: None,
-            stop_atr: None,
-            max_hold_sessions: 12,
-            max_positions_per_day: BACKTEST_MAX_NEW_POSITIONS_PER_DAY,
-            capital_per_trade: BACKTEST_CAPITAL_PER_TRADE,
-            entry_condition_sql: None,
-        },
-        BacktestStrategySpec {
-            strategy_id: "near-52w-high-tight-v2".to_string(),
-            strategy_name: "Near 52W High Tight V2".to_string(),
-            setup_family: "Near 52W High".to_string(),
-            min_score: 88,
-            tp_pct: 8.0,
-            sl_pct: 4.0,
             target_atr: None,
             stop_atr: None,
             max_hold_sessions: 12,
@@ -1822,6 +2507,7 @@ async fn fetch_summaries(state: &AppState, run_id: &str) -> anyhow::Result<Vec<B
 }
 
 async fn fetch_yearly_returns(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestYearlyReturn>> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
     let query = format!(
         "SELECT strategy_id, year, trades, win_rate, avg_return_pct, yearly_pnl AS pnl, return_pct \
         FROM ( \
@@ -1832,7 +2518,7 @@ async fn fetch_yearly_returns(state: &AppState, run_id: &str) -> anyhow::Result<
                 round(100 * countIf(trade_pnl > 0) / count(), 2) AS win_rate, \
                 round(avg(trade_return_pct), 3) AS avg_return_pct, \
                 round(sum(trade_pnl), 2) AS yearly_pnl, \
-                round(100 * sum(trade_pnl) / sum(capital_used), 3) AS return_pct \
+                round(100 * sum(trade_pnl) / greatest({}, 1), 3) AS return_pct \
             FROM ( \
                 SELECT strategy_id, entry_date, pnl AS trade_pnl, return_pct AS trade_return_pct, capital_used \
                 FROM trading.backtest_trades \
@@ -1841,12 +2527,14 @@ async fn fetch_yearly_returns(state: &AppState, run_id: &str) -> anyhow::Result<
             GROUP BY strategy_id, year \
         ) \
         ORDER BY strategy_id, year",
+        active_capital,
         run_id
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestYearlyReturn>().await?)
 }
 
 async fn fetch_monthly_returns(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestMonthlyReturn>> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
     let query = format!(
         "SELECT strategy_id, year, month, month_label, trades, win_rate, monthly_pnl AS pnl, return_pct \
         FROM ( \
@@ -1858,12 +2546,13 @@ async fn fetch_monthly_returns(state: &AppState, run_id: &str) -> anyhow::Result
                 toUInt32(count()) AS trades, \
                 round(100 * countIf(pnl > 0) / count(), 2) AS win_rate, \
                 round(sum(pnl), 2) AS monthly_pnl, \
-                round(100 * sum(pnl) / sum(capital_used), 3) AS return_pct \
+                round(100 * sum(pnl) / greatest({}, 1), 3) AS return_pct \
             FROM trading.backtest_trades \
             WHERE run_id = '{}' \
             GROUP BY strategy_id, year, month, month_label \
         ) \
         ORDER BY strategy_id, year, month",
+        active_capital,
         run_id
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestMonthlyReturn>().await?)
@@ -1909,6 +2598,8 @@ async fn fetch_equity_curve(state: &AppState, run_id: &str) -> anyhow::Result<Ve
 }
 
 async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestStrategyDiagnostic>> {
+    let active_capital = BACKTEST_CAPITAL_PER_TRADE * f64::from(BACKTEST_MAX_NEW_POSITIONS_PER_DAY);
+    let minimum_trade_count = MIN_BACKTEST_TRADES_FOR_VALIDATION;
     let query = format!(
         "WITH strategy_stats AS ( \
             SELECT \
@@ -1918,7 +2609,11 @@ async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::R
                 round(100 * countIf(pnl > 0) / count(), 2) AS win_rate, \
                 sumIf(pnl, pnl > 0) AS gross_profit, \
                 abs(sumIf(pnl, pnl < 0)) AS gross_loss, \
-                round(avg(return_pct), 3) AS expectancy_pct \
+                round(avg(return_pct), 3) AS expectancy_pct, \
+                ifNull(avgIf(return_pct, pnl > 0), 0) AS avg_win_pct, \
+                ifNull(avgIf(return_pct, pnl < 0), 0) AS avg_loss_pct, \
+                min(entry_date) AS first_entry_date, \
+                max(exit_date) AS last_exit_date \
             FROM trading.backtest_trades \
             WHERE run_id = '{}' \
             GROUP BY strategy_id \
@@ -1951,12 +2646,38 @@ async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::R
             SELECT strategy_id, round(min(equity - peak), 2) AS max_drawdown_rs \
             FROM dd \
             GROUP BY strategy_id \
+        ), daily_stats AS ( \
+            SELECT \
+                strategy_id, \
+                avg(daily_pnl / greatest({}, 1)) AS avg_daily_return, \
+                stddevPop(daily_pnl / greatest({}, 1)) AS std_daily_return, \
+                stddevPopIf(daily_pnl / greatest({}, 1), daily_pnl < 0) AS downside_daily_return \
+            FROM daily \
+            GROUP BY strategy_id \
+        ), trade_sequence AS ( \
+            SELECT \
+                strategy_id, \
+                pnl, \
+                sum(if(pnl > 0, 1, 0)) OVER (PARTITION BY strategy_id ORDER BY entry_date, symbol ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS win_bucket \
+            FROM trading.backtest_trades \
+            WHERE run_id = '{}' \
+        ), losing_streaks AS ( \
+            SELECT strategy_id, toUInt32(max(streak_len)) AS max_losing_streak \
+            FROM ( \
+                SELECT strategy_id, win_bucket, count() AS streak_len \
+                FROM trade_sequence \
+                WHERE pnl <= 0 \
+                GROUP BY strategy_id, win_bucket \
+            ) \
+            GROUP BY strategy_id \
         ) \
         SELECT \
             strategy_id, method_family, total_trades, total_pnl, win_rate, profit_factor, expectancy_pct, \
+            annualized_return_pct, max_drawdown_pct, sharpe_ratio, sortino_ratio, avg_win_pct, avg_loss_pct, \
+            payoff_ratio, max_losing_streak, recovery_factor, \
             positive_months_pct, median_monthly_pnl, worst_month, best_month, max_drawdown_rs, \
             round(raw_stability_score, 2) AS stability_score, \
-            multiIf(total_pnl <= 0, 'Rejected', raw_stability_score >= 56 AND positive_months_pct >= 55, 'Candidate', raw_stability_score >= 50, 'Watch', 'Fragile') AS status \
+            multiIf(total_trades < {minimum_trade_count}, 'Fragile', total_pnl <= 0, 'Rejected', raw_stability_score >= 56 AND positive_months_pct >= 55, 'Candidate', raw_stability_score >= 50, 'Watch', 'Fragile') AS status \
         FROM ( \
             SELECT \
                 s.strategy_id AS strategy_id, \
@@ -1979,6 +2700,15 @@ async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::R
                 s.win_rate AS win_rate, \
                 round(if(s.gross_loss = 0, if(s.gross_profit > 0, 99, 0), s.gross_profit / s.gross_loss), 2) AS profit_factor, \
                 s.expectancy_pct AS expectancy_pct, \
+                round(if(100 * s.total_pnl / greatest({}, 1) <= -99.9, -100, (pow(1 + s.total_pnl / greatest({}, 1), 365.25 / greatest(dateDiff('day', s.first_entry_date, s.last_exit_date) + 1, 1)) - 1) * 100), 2) AS annualized_return_pct, \
+                round(100 * d.max_drawdown_rs / greatest({}, 1), 2) AS max_drawdown_pct, \
+                round(if(ds.std_daily_return = 0, 0, ds.avg_daily_return / ds.std_daily_return * sqrt(252)), 2) AS sharpe_ratio, \
+                round(if(ds.downside_daily_return = 0, 0, ds.avg_daily_return / ds.downside_daily_return * sqrt(252)), 2) AS sortino_ratio, \
+                round(s.avg_win_pct, 3) AS avg_win_pct, \
+                round(s.avg_loss_pct, 3) AS avg_loss_pct, \
+                round(if(abs(s.avg_loss_pct) = 0, if(s.avg_win_pct > 0, 99, 0), s.avg_win_pct / abs(s.avg_loss_pct)), 2) AS payoff_ratio, \
+                ifNull(ls.max_losing_streak, 0) AS max_losing_streak, \
+                round(if(d.max_drawdown_rs = 0, if(s.total_pnl > 0, 99, 0), s.total_pnl / abs(d.max_drawdown_rs)), 2) AS recovery_factor, \
                 m.positive_months_pct AS positive_months_pct, \
                 m.median_monthly_pnl AS median_monthly_pnl, \
                 m.worst_month AS worst_month, \
@@ -1994,9 +2724,20 @@ async fn fetch_strategy_diagnostics(state: &AppState, run_id: &str) -> anyhow::R
             FROM strategy_stats s \
             INNER JOIN monthly_stats m ON m.strategy_id = s.strategy_id \
             INNER JOIN drawdowns d ON d.strategy_id = s.strategy_id \
+            INNER JOIN daily_stats ds ON ds.strategy_id = s.strategy_id \
+            LEFT JOIN losing_streaks ls ON ls.strategy_id = s.strategy_id \
         ) \
         ORDER BY status ASC, stability_score DESC, total_pnl DESC",
-        run_id, run_id, run_id
+        run_id,
+        run_id,
+        run_id,
+        active_capital,
+        active_capital,
+        active_capital,
+        run_id,
+        active_capital,
+        active_capital,
+        active_capital
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestStrategyDiagnostic>().await?)
 }
@@ -2069,14 +2810,16 @@ async fn fetch_available_entry_dates(state: &AppState, run_id: &str) -> anyhow::
     struct DateRow {
         trade_date: String,
     }
+    let exclusion = deprecated_strategy_sql_clause("t");
     let query = format!(
         "SELECT toString(entry_date) AS trade_date \
-        FROM trading.backtest_trades \
-        WHERE run_id = '{}' \
+        FROM trading.backtest_trades AS t \
+        WHERE t.run_id = '{}'{} \
         GROUP BY entry_date \
         ORDER BY entry_date DESC \
         LIMIT 120",
-        escape_sql(run_id)
+        escape_sql(run_id),
+        exclusion
     );
     Ok(state
         .ch
@@ -2089,10 +2832,11 @@ async fn fetch_available_entry_dates(state: &AppState, run_id: &str) -> anyhow::
 }
 
 fn date_strategy_clause(strategy: &str) -> String {
+    let excluded = deprecated_strategy_sql_clause("t");
     if strategy == "all" {
-        String::new()
+        excluded
     } else {
-        format!(" AND t.strategy_id = '{}'", escape_sql(strategy))
+        format!("{} AND t.strategy_id = '{}'", excluded, escape_sql(strategy))
     }
 }
 
@@ -2151,6 +2895,7 @@ async fn fetch_date_strategy_summaries(
     run_id: &str,
     date: &str,
 ) -> anyhow::Result<Vec<BacktestDateStrategySummary>> {
+    let exclusion = deprecated_strategy_sql_clause("t");
     let query = format!(
         "SELECT \
             t.strategy_id, \
@@ -2163,11 +2908,12 @@ async fn fetch_date_strategy_summaries(
             argMin(t.symbol, t.pnl) AS worst_symbol, \
             round(min(t.pnl), 2) AS worst_pnl \
         FROM trading.backtest_trades AS t \
-        WHERE t.run_id = '{}' AND t.entry_date = toDate('{}') \
+        WHERE t.run_id = '{}' AND t.entry_date = toDate('{}'){} \
         GROUP BY t.strategy_id \
         ORDER BY pnl DESC",
         escape_sql(run_id),
-        escape_sql(date)
+        escape_sql(date),
+        exclusion
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestDateStrategySummary>().await?)
 }
@@ -2211,28 +2957,118 @@ async fn fetch_date_trades(
     Ok(state.ch.query(&query).fetch_all::<BacktestTradeLogRow>().await?)
 }
 
-async fn fetch_trade_log(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestTradeLogRow>> {
+async fn fetch_analysis_trades(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestAnalysisTrade>> {
+    #[derive(Row, Deserialize)]
+    struct DbAnalysisTrade {
+        strategy_id: String,
+        symbol: String,
+        signal_date: String,
+        entry_date: String,
+        exit_date: String,
+        setup_family: String,
+        capital_used: f64,
+        pnl: f64,
+        score: u8,
+    }
+
+    let exclusion = deprecated_strategy_sql_clause("t");
     let query = format!(
         "SELECT \
-            strategy_id, \
-            symbol, \
-            toString(signal_date) AS signal_date, \
-            toString(entry_date) AS entry_date, \
-            toString(exit_date) AS exit_date, \
-            setup_family, \
-            entry_price, \
-            exit_price, \
-            quantity, \
-            round(pnl, 2) AS pnl, \
-            round(return_pct, 3) AS return_pct, \
-            exit_reason, \
-            hold_sessions, \
-            score \
-        FROM trading.backtest_trades \
-        WHERE run_id = '{}' \
-        ORDER BY entry_date DESC, abs(pnl) DESC \
+            t.strategy_id, \
+            t.symbol, \
+            toString(t.signal_date) AS signal_date, \
+            toString(t.entry_date) AS entry_date, \
+            toString(t.exit_date) AS exit_date, \
+            t.setup_family, \
+            t.capital_used, \
+            t.pnl, \
+            t.score \
+        FROM trading.backtest_trades AS t \
+        WHERE t.run_id = '{}'{} \
+        ORDER BY t.entry_date ASC, t.score DESC, t.strategy_id ASC, t.symbol ASC",
+        escape_sql(run_id),
+        exclusion
+    );
+
+    let rows = state.ch.query(&query).fetch_all::<DbAnalysisTrade>().await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let signal_date = parse_csv_date(&row.signal_date)?;
+            let entry_date = parse_csv_date(&row.entry_date)?;
+            let exit_date = parse_csv_date(&row.exit_date)?;
+            Some(BacktestAnalysisTrade {
+                method_family: strategy_method_family(&row.strategy_id),
+                strategy_id: row.strategy_id,
+                symbol: row.symbol,
+                signal_date,
+                entry_date,
+                exit_date,
+                setup_family: row.setup_family,
+                capital_used: row.capital_used,
+                pnl: row.pnl,
+                score: row.score,
+            })
+        })
+        .collect())
+}
+
+fn strategy_method_family(strategy_id: &str) -> String {
+    let id = strategy_id.to_ascii_lowercase();
+    let family = if id.contains("regime-mean") {
+        "Regime Mean Reversion"
+    } else if id.contains("regime-trend") {
+        "Regime Trend"
+    } else if id.contains("regime-breakout") {
+        "Regime Breakout"
+    } else if id.contains("regime-multifactor") {
+        "Multi-Factor"
+    } else if id.contains("supertrend") {
+        "Weekly Supertrend"
+    } else if id.contains("king-candle") {
+        "King Candle"
+    } else if id.contains("reversal") {
+        "Reversal"
+    } else if id.contains("breakout") {
+        "Breakout"
+    } else if id.contains("pullback") {
+        "Pullback"
+    } else if id.contains("stretch") || id.contains("rsi10") {
+        "Mean Reversion"
+    } else if id.contains("52w") {
+        "52W Momentum"
+    } else if id.contains("momentum") {
+        "Momentum"
+    } else {
+        "Other"
+    };
+    family.to_string()
+}
+
+async fn fetch_trade_log(state: &AppState, run_id: &str) -> anyhow::Result<Vec<BacktestTradeLogRow>> {
+    let exclusion = deprecated_strategy_sql_clause("t");
+    let query = format!(
+        "SELECT \
+            t.strategy_id, \
+            t.symbol, \
+            toString(t.signal_date) AS signal_date, \
+            toString(t.entry_date) AS entry_date, \
+            toString(t.exit_date) AS exit_date, \
+            t.setup_family, \
+            t.entry_price, \
+            t.exit_price, \
+            t.quantity, \
+            round(t.pnl, 2) AS pnl, \
+            round(t.return_pct, 3) AS return_pct, \
+            t.exit_reason, \
+            t.hold_sessions, \
+            t.score \
+        FROM trading.backtest_trades AS t \
+        WHERE t.run_id = '{}'{} \
+        ORDER BY t.entry_date DESC, abs(t.pnl) DESC \
         LIMIT 80",
-        run_id
+        escape_sql(run_id),
+        exclusion
     );
     Ok(state.ch.query(&query).fetch_all::<BacktestTradeLogRow>().await?)
 }

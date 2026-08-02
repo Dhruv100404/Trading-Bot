@@ -11,6 +11,9 @@ pub mod positions;
 pub mod paper;
 pub mod swing;
 pub mod backtest;
+pub mod ch_http;
+pub mod market_activity;
+pub mod news;
 
 /// Short-lived cache of Dhan quotes shared across swing endpoints.
 pub struct CachedQuotes {
@@ -67,6 +70,14 @@ pub async fn serve(ch: ChClient, app_config: Config) -> anyhow::Result<()> {
         .route("/api/swing/history/:symbol",    get(swing::history))
         .route("/api/swing/candidates/:symbol", get(swing::candidate_detail))
         .route("/api/swing/broker-status",      get(swing::broker_status))
+        .route("/api/news",                     get(news::list))
+        .route("/api/news/refresh",             post(news::refresh))
+        .route("/api/news/events",              get(news::corporate_events))
+        .route("/api/news/strategy-evidence",   get(news::strategy_evidence))
+        .route("/api/news/predictions",         get(news::prediction_history))
+        .route("/api/nse/large-deals",          get(news::large_deals))
+        .route("/api/market-activity",          get(market_activity::list))
+        .route("/api/market-activity/refresh",  post(market_activity::refresh))
         .route("/api/backtests/dashboard",       get(backtest::dashboard))
         .route("/api/backtests/datewise",        get(backtest::datewise))
         .route("/api/backtests/feature-cache/refresh", post(backtest::refresh_cache))

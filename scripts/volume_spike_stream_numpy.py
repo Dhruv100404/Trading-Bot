@@ -129,22 +129,23 @@ def simulate_day_candidates(
     cand_symbol: np.ndarray,
     cand_entry_idx: np.ndarray,
     holds: list[int],
-    stop_pct: float,
-    target_pct: float,
+    stop_target_pairs: list[tuple[float, float]],
     round_trip_cost_pct: float,
 ) -> dict[str, np.ndarray]:
     n = cand_symbol.size
     out: dict[str, np.ndarray] = {}
     for hold in holds:
-        out[f"net_h{hold}"] = np.full(n, np.nan, dtype=np.float32)
-        out[f"gross_h{hold}"] = np.full(n, np.nan, dtype=np.float32)
-        out[f"exit_idx_h{hold}"] = np.full(n, -1, dtype=np.int32)
-        out[f"exit_offset_h{hold}"] = np.full(n, -1, dtype=np.int16)
-        out[f"exit_price_h{hold}"] = np.full(n, np.nan, dtype=np.float32)
-        out[f"target_first_h{hold}"] = np.zeros(n, dtype=bool)
-        out[f"stop_first_h{hold}"] = np.zeros(n, dtype=bool)
-        out[f"timeout_h{hold}"] = np.zeros(n, dtype=bool)
-        out[f"exit_type_h{hold}"] = np.full(n, "", dtype=object)
+        for stop_pct, target_pct in stop_target_pairs:
+            suffix = whole.result_suffix(hold, stop_pct, target_pct)
+            out[f"net_{suffix}"] = np.full(n, np.nan, dtype=np.float32)
+            out[f"gross_{suffix}"] = np.full(n, np.nan, dtype=np.float32)
+            out[f"exit_idx_{suffix}"] = np.full(n, -1, dtype=np.int32)
+            out[f"exit_offset_{suffix}"] = np.full(n, -1, dtype=np.int16)
+            out[f"exit_price_{suffix}"] = np.full(n, np.nan, dtype=np.float32)
+            out[f"target_first_{suffix}"] = np.zeros(n, dtype=bool)
+            out[f"stop_first_{suffix}"] = np.zeros(n, dtype=bool)
+            out[f"timeout_{suffix}"] = np.zeros(n, dtype=bool)
+            out[f"exit_type_{suffix}"] = np.full(n, "", dtype=object)
 
     for hold in holds:
         safe = np.flatnonzero(cand_entry_idx + int(hold) <= min(lab.BUCKET_COUNT, lab.LATEST_EXIT_BUCKET)).astype(np.int32)
@@ -174,36 +175,38 @@ def simulate_day_candidates(
         path_high = path_high[valid]
         path_low = path_low[valid]
         path_close = path_close[valid]
-        stop_price = entry * (1.0 + np.float32(stop_pct) / 100.0)
-        target_price = entry * (1.0 - np.float32(target_pct) / 100.0)
-        stop_hit = path_high >= stop_price.reshape(-1, 1)
-        target_hit = path_low <= target_price.reshape(-1, 1)
-        stop_any = stop_hit.any(axis=1)
-        target_any = target_hit.any(axis=1)
-        stop_first_idx = np.where(stop_any, np.argmax(stop_hit, axis=1), int(hold) + 1).astype(np.int16)
-        target_first_idx = np.where(target_any, np.argmax(target_hit, axis=1), int(hold) + 1).astype(np.int16)
-        stop_first = stop_any & (stop_first_idx <= target_first_idx)
-        target_first = target_any & (target_first_idx < stop_first_idx)
-        timeout = ~(stop_first | target_first)
-        exit_offset = np.where(stop_first, stop_first_idx, np.where(target_first, target_first_idx, int(hold) - 1)).astype(np.int32)
         row_idx = np.arange(path_open.shape[0], dtype=np.int32)
-        exit_open = path_open[row_idx, exit_offset]
-        exit_close = path_close[row_idx, exit_offset]
-        stop_gap = stop_first & (exit_open >= stop_price)
-        exit_price = np.where(stop_gap, exit_open, np.where(stop_first, stop_price, np.where(target_first, target_price, exit_close))).astype(np.float32)
-        gross = ((entry - exit_price) / entry * 100.0).astype(np.float32)
-        net = (gross - np.float32(round_trip_cost_pct)).astype(np.float32)
-        exit_type = np.where(stop_gap, "SL_GAP", np.where(stop_first, "SL", np.where(target_first, "TARGET", "TIME"))).astype(object)
+        for stop_pct, target_pct in stop_target_pairs:
+            suffix = whole.result_suffix(hold, stop_pct, target_pct)
+            stop_price = entry * (1.0 + np.float32(stop_pct) / 100.0)
+            target_price = entry * (1.0 - np.float32(target_pct) / 100.0)
+            stop_hit = path_high >= stop_price.reshape(-1, 1)
+            target_hit = path_low <= target_price.reshape(-1, 1)
+            stop_any = stop_hit.any(axis=1)
+            target_any = target_hit.any(axis=1)
+            stop_first_idx = np.where(stop_any, np.argmax(stop_hit, axis=1), int(hold) + 1).astype(np.int16)
+            target_first_idx = np.where(target_any, np.argmax(target_hit, axis=1), int(hold) + 1).astype(np.int16)
+            stop_first = stop_any & (stop_first_idx <= target_first_idx)
+            target_first = target_any & (target_first_idx < stop_first_idx)
+            timeout = ~(stop_first | target_first)
+            exit_offset = np.where(stop_first, stop_first_idx, np.where(target_first, target_first_idx, int(hold) - 1)).astype(np.int32)
+            exit_open = path_open[row_idx, exit_offset]
+            exit_close = path_close[row_idx, exit_offset]
+            stop_gap = stop_first & (exit_open >= stop_price)
+            exit_price = np.where(stop_gap, exit_open, np.where(stop_first, stop_price, np.where(target_first, target_price, exit_close))).astype(np.float32)
+            gross = ((entry - exit_price) / entry * 100.0).astype(np.float32)
+            net = (gross - np.float32(round_trip_cost_pct)).astype(np.float32)
+            exit_type = np.where(stop_gap, "SL_GAP", np.where(stop_first, "SL", np.where(target_first, "TARGET", "TIME"))).astype(object)
 
-        out[f"net_h{hold}"][rows] = net
-        out[f"gross_h{hold}"][rows] = gross
-        out[f"exit_idx_h{hold}"][rows] = cand_entry_idx[rows] + exit_offset
-        out[f"exit_offset_h{hold}"][rows] = exit_offset.astype(np.int16)
-        out[f"exit_price_h{hold}"][rows] = exit_price
-        out[f"target_first_h{hold}"][rows] = target_first
-        out[f"stop_first_h{hold}"][rows] = stop_first
-        out[f"timeout_h{hold}"][rows] = timeout
-        out[f"exit_type_h{hold}"][rows] = exit_type
+            out[f"net_{suffix}"][rows] = net
+            out[f"gross_{suffix}"][rows] = gross
+            out[f"exit_idx_{suffix}"][rows] = cand_entry_idx[rows] + exit_offset
+            out[f"exit_offset_{suffix}"][rows] = exit_offset.astype(np.int16)
+            out[f"exit_price_{suffix}"][rows] = exit_price
+            out[f"target_first_{suffix}"][rows] = target_first
+            out[f"stop_first_{suffix}"][rows] = stop_first
+            out[f"timeout_{suffix}"][rows] = timeout
+            out[f"exit_type_{suffix}"][rows] = exit_type
     return out
 
 
@@ -215,6 +218,7 @@ def extract_month_candidates(
     args: argparse.Namespace,
     broad_specs: list[dict[str, float | int | str]],
     holds: list[int],
+    stop_target_pairs: list[tuple[float, float]],
     trade_start: np.datetime64,
     trade_end: np.datetime64,
     processed_days: int,
@@ -341,12 +345,10 @@ def extract_month_candidates(
                 cand_symbol,
                 cand_entry_idx,
                 holds,
-                float(args.stop_pct),
-                float(args.target_pct),
+                stop_target_pairs,
                 float(args.round_trip_cost_pct),
             )
-            for key, value in sim.items():
-                out[key] = value
+            out = pd.concat([out, pd.DataFrame(sim, index=out.index)], axis=1)
             frames.append(out)
 
         slot = current_day_id % hist_slot_count
@@ -405,6 +407,7 @@ def run(args: argparse.Namespace) -> None:
     baseline_spec = whole.baseline_spec_from_args(args)
     broad_specs = [*(specs or [baseline_spec]), baseline_spec]
     holds = sorted({int(spec["hold_minutes"]) for spec in broad_specs})
+    stop_target_pairs = sorted({(float(spec["stop_pct"]), float(spec["target_pct"])) for spec in broad_specs})
 
     if not args.resume_candidates:
         for old in chunks_dir.glob("*"):
@@ -437,6 +440,7 @@ def run(args: argparse.Namespace) -> None:
             args,
             broad_specs,
             holds,
+            stop_target_pairs,
             trade_start,
             trade_end,
             processed_days,
@@ -464,21 +468,31 @@ def run(args: argparse.Namespace) -> None:
     log(f"Combined candidates {len(table):,} | days {dates_np.size:,} | symbols {len(symbol_uniques):,}")
 
     baseline_row, baseline_rows = whole.evaluate_spec(table, baseline_spec, day_idx, symbol_idx, dates_np, trade_day_mask, int(args.min_trades))
-    baseline_tradebook = whole.tradebook_from_rows(table, baseline_rows, int(baseline_spec["hold_minutes"]))
+    baseline_hold = int(baseline_spec["hold_minutes"])
+    baseline_stop = float(baseline_spec["stop_pct"])
+    baseline_target = float(baseline_spec["target_pct"])
+    baseline_tradebook = whole.tradebook_from_rows(
+        table,
+        baseline_rows,
+        baseline_hold,
+        stop_pct=baseline_stop,
+        target_pct=baseline_target,
+    )
     baseline_daily = whole.daily_from_tradebook(baseline_tradebook, dates_np)
     summary = lab.metric_summary(
         baseline_tradebook["net_pct"].to_numpy(np.float32),
         np.bincount(day_idx[baseline_rows], weights=baseline_tradebook["net_pct"].to_numpy(np.float32), minlength=dates_np.size).astype(np.float32),
         np.bincount(day_idx[baseline_rows], minlength=dates_np.size).astype(np.float32),
-        table.iloc[baseline_rows][f"target_first_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
-        table.iloc[baseline_rows][f"stop_first_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
-        table.iloc[baseline_rows][f"timeout_h{int(baseline_spec['hold_minutes'])}"].to_numpy(bool),
+        table.iloc[baseline_rows][whole.result_col(table, "target_first", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
+        table.iloc[baseline_rows][whole.result_col(table, "stop_first", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
+        table.iloc[baseline_rows][whole.result_col(table, "timeout", baseline_hold, baseline_stop, baseline_target)].to_numpy(bool),
         trade_day_mask,
     )
     baseline_tradebook.to_csv(out_dir / "tradebook.csv", index=False)
     baseline_daily.to_csv(out_dir / "daily_summary.csv", index=False)
     summary.to_csv(out_dir / "summary.csv", index=False)
-    whole.save_chart_set(out_dir, baseline_daily, "")
+    baseline_title = f"Volume-spike {args.preset} short: SL {baseline_stop:g}%, TG {baseline_target:g}%, hold {baseline_hold}m"
+    whole.save_chart_set(out_dir, baseline_daily, "", baseline_title)
     baseline_diag = lab.write_diagnostics("", baseline_tradebook, baseline_daily, out_dir)
     live_section = ""
     if args.live_signals:
@@ -521,11 +535,22 @@ def run(args: argparse.Namespace) -> None:
         lab.plot_pattern_search(pattern_results, out_dir)
         if best_spec is not None:
             best_hold = int(best_spec["hold_minutes"])
-            best_tradebook = whole.tradebook_from_rows(table, best_rows, best_hold, str(best_spec["name"]))
+            best_tradebook = whole.tradebook_from_rows(
+                table,
+                best_rows,
+                best_hold,
+                str(best_spec["name"]),
+                stop_pct=float(best_spec["stop_pct"]),
+                target_pct=float(best_spec["target_pct"]),
+            )
             best_daily = whole.daily_from_tradebook(best_tradebook, dates_np)
             best_tradebook.to_csv(out_dir / "best_pattern_tradebook.csv", index=False)
             best_daily.to_csv(out_dir / "best_pattern_daily_summary.csv", index=False)
-            whole.save_chart_set(out_dir, best_daily, "best_pattern_")
+            best_title = (
+                f"Best volume-spike short: SL {float(best_spec['stop_pct']):g}%, "
+                f"TG {float(best_spec['target_pct']):g}%, hold {best_hold}m"
+            )
+            whole.save_chart_set(out_dir, best_daily, "best_pattern_", best_title)
             best_diag = lab.write_diagnostics("best_pattern", best_tradebook, best_daily, out_dir)
             log(f"Best pattern {best_spec['name']} | trades {len(best_tradebook):,} | score {best_score:0.2f}")
 
@@ -533,6 +558,8 @@ def run(args: argparse.Namespace) -> None:
         "name",
         "score",
         "hold_minutes",
+        "stop_pct",
+        "target_pct",
         "bar_rvol_min",
         "vol20_rvol_min",
         "cum_rvol_min",
@@ -643,6 +670,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-drop-from-high", default=lab.SEARCH_DROP_FROM_HIGH)
     parser.add_argument("--search-gap-up-min", default=lab.SEARCH_GAP_UP_MIN)
     parser.add_argument("--search-mom15-windows", default=lab.SEARCH_MOM15_WINDOWS)
+    parser.add_argument("--search-stop-pcts", default=None)
+    parser.add_argument("--search-target-pcts", default=None)
     parser.add_argument("--grid-limit", type=int, default=0)
     parser.add_argument("--min-trades", type=int, default=250)
     parser.add_argument("--resume-candidates", action="store_true")

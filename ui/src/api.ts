@@ -10,6 +10,151 @@ export interface BrokerStatus {
   live_quotes: boolean
 }
 
+export interface NewsItem {
+  article_id: string
+  source: string
+  source_kind: string
+  category: string
+  title: string
+  url: string
+  summary: string
+  published_at: string
+  fetched_at: string
+  symbol: string
+  security_id: string
+  company_name: string
+  match_confidence: number
+  matched_text: string
+  sentiment: number
+  impact_score: number
+  direction: 'BULLISH' | 'BEARISH' | 'WATCH' | 'NEUTRAL' | string
+  horizon: string
+  confidence: number
+  reason: string
+  model: string
+}
+
+export interface NseLargeDeal {
+  deal_id: string
+  deal_type: string
+  deal_date: string
+  deal_date_raw: string
+  symbol: string
+  security_name: string
+  client_name: string
+  side: string
+  quantity: number
+  price: number
+  value_lakh: number
+  source_url: string
+  fetched_at: string
+}
+
+export interface CorporateEvent {
+  event_id: string
+  source: string
+  source_event_id: string
+  symbol: string
+  company_name: string
+  event_time: string
+  event_date: string
+  event_category: string
+  catalyst_score: number
+  title: string
+  summary: string
+  attachment_url: string
+  source_url: string
+  evidence_count?: number
+}
+
+export interface BacktestPrediction {
+  strategy?: string
+  signal_id?: string
+  symbol: string
+  signal_date: string
+  entry_date: string
+  exit_date: string
+  entry_price?: number
+  target_price?: number
+  stop_price?: number
+  exit_price?: number
+  entry?: number
+  target?: number
+  stop?: number
+  exit?: number
+  outcome?: string
+  exit_reason?: string
+  target_hit: boolean | null
+  hold_sessions: number
+  net_return_pct: number
+  split?: string
+  relvol50?: number
+  event_category?: string
+  event_categories?: string
+  event_title?: string
+  event_titles?: string
+}
+
+export interface PredictionHistoryResponse {
+  predictions: BacktestPrediction[]
+  matched: number
+  evidence_kind: 'historical_backtest' | string
+  live_predictions: boolean
+  message: string
+}
+
+export interface MarketActivityItem {
+  row_id: string
+  snapshot_at: string
+  trading_date: string
+  source: string
+  metric_type: string
+  exchange: string
+  index_name: string
+  rank: number
+  symbol: string
+  stock_name: string
+  moneycontrol_id: string
+  slug: string
+  price: number
+  change_abs: number
+  change_pct: number
+  day_high: number
+  day_low: number
+  open: number
+  prev_close: number
+  volume: number
+  avg_volume: number
+  volume_multiplier: number
+  volume_change_pct: number
+  value_cr: number
+  vwap: number
+  direction: string
+  mcap_cr: number
+  month_return_pct: number
+  month3_return_pct: number
+  share_url: string
+  source_url: string
+  fetched_at: string
+}
+
+export interface NewsRefreshResult {
+  ok: boolean
+  articles: number
+  mentions: number
+  scores: number
+  deals: number
+  watchlist_companies: number
+  refreshed_at: string
+  deal_error: string | null
+}
+
+export interface MarketActivityRefreshResult {
+  ok: boolean
+  rows: number
+  refreshed_at: string
+}
+
 export interface MarketRegime {
   label: string
   tone: 'bullish' | 'neutral' | 'cautious' | string
@@ -31,6 +176,104 @@ export interface LiveSignal {
   as_of: string
   trigger_price: number | null
   trigger_source: string | null
+}
+
+/**
+ * Optional research evidence supplied alongside a strategy row.  The scanner
+ * remains usable with older engine payloads, so every field is deliberately
+ * optional and the UI can fall back to the original strategy-only view.
+ */
+export interface ConfluenceScoreBreakdown {
+  base_score?: number | null
+  model_score?: number | null
+  technical?: number | null
+  technical_quality?: number | null
+  trend?: number | null
+  trend_quality?: number | null
+  volume?: number | null
+  volume_quality?: number | null
+  regime?: number | null
+  regime_quality?: number | null
+  risk_reward?: number | null
+  risk_reward_quality?: number | null
+  catalyst_adjustment?: number | null
+  total_score?: number | null
+}
+
+export interface ConfluenceStrategyMatch {
+  timeframe?: string
+  strategy_id?: string
+  strategy_label?: string
+  setup_family?: string
+  status?: string
+  strategy_status?: string
+  signal_status?: string
+  signal_label?: string
+  selected?: boolean
+  score?: number | null
+  reason?: string
+}
+
+export interface ConfluenceFinding {
+  label?: string
+  title?: string
+  detail?: string
+  reason?: string
+  pillar?: string
+  status?: string
+  tone?: string
+  source?: string
+  source_url?: string
+  url?: string
+  published_at?: string
+}
+
+export interface ConfluenceNewsArticle {
+  title?: string
+  summary?: string
+  reason?: string
+  source?: string
+  source_url?: string
+  url?: string
+  published_at?: string
+  direction?: string
+  impact_score?: number | null
+}
+
+export interface ConfluenceNewsSummary {
+  lookback_hours?: number | null
+  article_count?: number | null
+  bullish_articles?: number | null
+  bearish_articles?: number | null
+  avg_sentiment?: number | null
+  average_sentiment?: number | null
+  max_impact?: number | null
+  direction?: string
+  score_adjustment?: number | null
+  latest_reason?: string
+  latest_headline?: string
+  latest_source?: string
+  latest_url?: string
+  source?: string
+  source_url?: string
+  url?: string
+  articles?: ConfluenceNewsArticle[]
+  items?: ConfluenceNewsArticle[]
+}
+
+export interface ResearchConfluence {
+  research_score?: number | null
+  research_state?: string
+  trade_state?: string
+  confluence_state?: string
+  pillar_count?: number | null
+  supporting_pillars?: number | null
+  conflicting_pillars?: number | null
+  score_breakdown?: ConfluenceScoreBreakdown
+  strategy_matches?: ConfluenceStrategyMatch[]
+  evidence?: Array<string | ConfluenceFinding>
+  risks?: Array<string | ConfluenceFinding>
+  news?: ConfluenceNewsSummary
 }
 
 export interface LiveStrategyRow {
@@ -56,6 +299,7 @@ export interface LiveStrategyRow {
   risk_reward: number
   source: string
   updated_at: string
+  confluence?: ResearchConfluence
 }
 
 export interface LiveStrategySnapshot {
@@ -94,6 +338,7 @@ export interface SwingCandidate {
   risks: string[]
   source: string
   live_signal: LiveSignal
+  confluence?: ResearchConfluence
 }
 
 export interface SetupMix {
@@ -395,6 +640,15 @@ export interface BacktestStrategyDiagnostic {
   win_rate: number
   profit_factor: number
   expectancy_pct: number
+  annualized_return_pct: number
+  max_drawdown_pct: number
+  sharpe_ratio: number
+  sortino_ratio: number
+  avg_win_pct: number
+  avg_loss_pct: number
+  payoff_ratio: number
+  max_losing_streak: number
+  recovery_factor: number
   positive_months_pct: number
   median_monthly_pnl: number
   worst_month: number
@@ -402,6 +656,64 @@ export interface BacktestStrategyDiagnostic {
   max_drawdown_rs: number
   stability_score: number
   status: string
+}
+
+export interface BacktestCashProfile {
+  strategy_id: string
+  method_family: string
+  initial_capital: number
+  candidate_trades: number
+  trades_taken: number
+  skipped_entries: number
+  cash_blocked_entries: number
+  duplicate_entries_skipped: number
+  total_pnl: number
+  return_pct: number
+  annualized_return_pct: number
+  win_rate: number
+  profit_factor: number
+  sharpe_ratio: number
+  sortino_ratio: number
+  max_drawdown_rs: number
+  max_drawdown_pct: number
+  recovery_factor: number
+  max_losing_streak: number
+  positive_months_pct: number
+  max_open_positions: number
+  peak_capital_used: number
+  peak_capital_used_pct: number
+  avg_capital_used_pct: number
+  from_date: string
+  to_date: string
+}
+
+export interface BacktestCashMonthlyReturn {
+  strategy_id: string
+  year: number
+  month: number
+  month_label: string
+  trades_closed: number
+  entries_taken: number
+  skipped_entries: number
+  pnl: number
+  return_pct: number
+  ending_equity: number
+  max_drawdown_pct: number
+}
+
+export interface BacktestCashEquityPoint {
+  strategy_id: string
+  trade_date: string
+  realized_pnl: number
+  cumulative_pnl: number
+  equity_value: number
+  drawdown_rs: number
+  return_pct: number
+  open_positions: number
+  capital_used: number
+  cash_available: number
+  entries_taken: number
+  skipped_entries: number
 }
 
 export interface BacktestTradeLogRow {
@@ -459,6 +771,9 @@ export interface BacktestDashboardResponse {
   losers: BacktestSymbolResult[]
   day_quality: BacktestDayQuality[]
   trades: BacktestTradeLogRow[]
+  cash_profiles: BacktestCashProfile[]
+  cash_monthly_returns: BacktestCashMonthlyReturn[]
+  cash_equity_curve: BacktestCashEquityPoint[]
 }
 
 export interface BacktestDatewiseResponse {
@@ -586,6 +901,8 @@ async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: n
       ? payload
       : payload && typeof payload === 'object' && 'message' in payload
         ? String(payload.message)
+        : payload && typeof payload === 'object' && 'error' in payload
+          ? String(payload.error)
         : `API request failed (${res.status}).`
     throw new Error(message)
   }
@@ -652,6 +969,101 @@ export async function refreshFeatureCache(): Promise<FeatureCacheRefreshResponse
 
 export async function getBambooLatest(): Promise<BambooLatestResponse> {
   return apiFetch<BambooLatestResponse>('/api/swing/bamboo/latest')
+}
+
+export async function getNews(params?: {
+  symbol?: string
+  source?: string
+  min_impact?: number
+  limit?: number
+}): Promise<NewsItem[]> {
+  const search = new URLSearchParams()
+  if (params?.symbol) search.set('symbol', params.symbol)
+  if (params?.source) search.set('source', params.source)
+  if (params?.min_impact) search.set('min_impact', String(params.min_impact))
+  if (params?.limit) search.set('limit', String(params.limit))
+  const query = search.toString()
+  const data = await apiFetch<{ news: NewsItem[] }>(`/api/news${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
+  return data.news ?? []
+}
+
+export async function refreshNews(): Promise<NewsRefreshResult> {
+  return apiFetch<NewsRefreshResult>('/api/news/refresh', {
+    method: 'POST',
+    timeoutMs: 120000,
+  })
+}
+
+export async function getNseLargeDeals(params?: {
+  symbol?: string
+  deal_type?: string
+  side?: string
+  limit?: number
+}): Promise<NseLargeDeal[]> {
+  const search = new URLSearchParams()
+  if (params?.symbol) search.set('symbol', params.symbol)
+  if (params?.deal_type) search.set('deal_type', params.deal_type)
+  if (params?.side) search.set('side', params.side)
+  if (params?.limit) search.set('limit', String(params.limit))
+  const query = search.toString()
+  const data = await apiFetch<{ deals: NseLargeDeal[] }>(`/api/nse/large-deals${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
+  return data.deals ?? []
+}
+
+export async function getCorporateEvents(params?: {
+  symbol?: string
+  category?: string
+  lookback_days?: number
+  limit?: number
+}): Promise<CorporateEvent[]> {
+  const search = new URLSearchParams()
+  if (params?.symbol) search.set('symbol', params.symbol)
+  if (params?.category) search.set('category', params.category)
+  if (params?.lookback_days) search.set('lookback_days', String(params.lookback_days))
+  if (params?.limit) search.set('limit', String(params.limit))
+  const query = search.toString()
+  const data = await apiFetch<{ events: CorporateEvent[] }>(`/api/news/events${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
+  return data.events ?? []
+}
+
+export async function getNewsPredictionHistory(params?: {
+  success?: boolean
+  split?: string
+  limit?: number
+}): Promise<PredictionHistoryResponse> {
+  const search = new URLSearchParams()
+  if (typeof params?.success === 'boolean') search.set('success', String(params.success))
+  if (params?.split) search.set('split', params.split)
+  if (params?.limit) search.set('limit', String(params.limit))
+  const query = search.toString()
+  return apiFetch<PredictionHistoryResponse>(`/api/news/predictions${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
+}
+
+export async function getMarketActivity(params?: {
+  symbol?: string
+  metric_type?: string
+  exchange?: string
+  source?: string
+  min_volume_multiplier?: number
+  limit?: number
+}): Promise<MarketActivityItem[]> {
+  const search = new URLSearchParams()
+  if (params?.symbol) search.set('symbol', params.symbol)
+  if (params?.metric_type) search.set('metric_type', params.metric_type)
+  if (params?.exchange) search.set('exchange', params.exchange)
+  if (params?.source) search.set('source', params.source)
+  if (params?.min_volume_multiplier) search.set('min_volume_multiplier', String(params.min_volume_multiplier))
+  if (params?.limit) search.set('limit', String(params.limit))
+  const query = search.toString()
+  const data = await apiFetch<{ activity: MarketActivityItem[] }>(`/api/market-activity${query ? `?${query}` : ''}`, { timeoutMs: 15000 })
+  return data.activity ?? []
+}
+
+export async function refreshMarketActivity(): Promise<MarketActivityRefreshResult> {
+  return apiFetch<MarketActivityRefreshResult>('/api/market-activity/refresh', {
+    method: 'POST',
+    timeoutMs: 90000,
+  })
 }
 
 export async function getBrokerStatus(): Promise<BrokerStatus> {

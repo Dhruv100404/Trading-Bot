@@ -50,6 +50,30 @@ def parse_date(value: str | date | pd.Timestamp) -> date:
     return pd.Timestamp(value).date()
 
 
+def parse_exchange_timestamp(*values: object) -> pd.Timestamp:
+    """Parse exchange timestamps without swapping ISO month/day fields.
+
+    NSE announcement `sort_date` values are ISO (`YYYY-MM-DD HH:MM:SS`),
+    while several legacy/calendar fields are day-first. Passing every value
+    through `dayfirst=True` silently turns e.g. 2026-01-08 into 2026-08-01.
+    """
+    for value in values:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        is_iso = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s]|$)", text))
+        parsed = pd.to_datetime(
+            text,
+            errors="coerce",
+            dayfirst=not is_iso,
+        )
+        if not pd.isna(parsed):
+            return parsed
+    return pd.NaT
+
+
 def month_chunks(start: date, end: date) -> Iterable[DateChunk]:
     cursor = date(start.year, start.month, 1)
     if cursor < start:
@@ -168,6 +192,69 @@ def fetch_nse_financial_results(client: NSEClient, out_dir: Path, chunks: Iterab
         if isinstance(data, list):
             rows.extend(data)
         print(f"NSE financial results {chunk.key}: {len(data) if isinstance(data, list) else 0}")
+    return rows
+
+
+def fetch_nse_integrated_financials(
+    client: NSEClient,
+    out_dir: Path,
+    chunks: Iterable[DateChunk],
+    refresh: bool,
+) -> list[dict]:
+    """Fetch the current NSE Integrated Filing - Financials archive.
+
+    NSE moved current results to this dataset beginning with quarter ended
+    March 2025. JSON is retained because it includes stable `seq_Id` values
+    that the CSV export omits.
+    """
+    rows: list[dict] = []
+    url = "https://www.nseindia.com/api/integrated-filing-results"
+    referer = (
+        "https://www.nseindia.com/companies-listing/corporate-integrated-filing"
+        "?integratedType=Integrated+Filing-+Financials"
+    )
+    coverage_start = date(2025, 4, 1)
+    for chunk in chunks:
+        if chunk.end < coverage_start:
+            continue
+        effective = DateChunk(max(chunk.start, coverage_start), chunk.end)
+        cache_path = out_dir / "raw" / f"nse_integrated_financials_{effective.key}.json.gz"
+
+        def fetch_chunk(effective: DateChunk = effective) -> list[dict]:
+            page = 1
+            size = 5000
+            combined: list[dict] = []
+            total_count: int | None = None
+            while total_count is None or len(combined) < total_count:
+                params = {
+                    "type": "Integrated Filing- Financials",
+                    "index": "equities",
+                    "from_date": effective.start.strftime("%d-%m-%Y"),
+                    "to_date": effective.end.strftime("%d-%m-%Y"),
+                    "page": str(page),
+                    "size": str(size),
+                }
+                payload = client.get_json(url, referer, params)
+                if not isinstance(payload, dict):
+                    break
+                page_rows = payload.get("data") or []
+                if not isinstance(page_rows, list):
+                    break
+                combined.extend(page_rows)
+                total_count = int(payload.get("totalCount") or len(combined))
+                if not page_rows:
+                    break
+                page += 1
+            if total_count is not None and len(combined) < total_count:
+                raise RuntimeError(
+                    f"Integrated filing pagination incomplete: {len(combined)} of {total_count}"
+                )
+            return combined
+
+        data = cached_fetch(cache_path, refresh, fetch_chunk)
+        if isinstance(data, list):
+            rows.extend(data)
+        print(f"NSE integrated financials {effective.key}: {len(data) if isinstance(data, list) else 0}")
     return rows
 
 
@@ -302,7 +389,7 @@ def normalize_nse_announcements(rows: list[dict]) -> pd.DataFrame:
         title = clean_text(row.get("desc"))
         summary = clean_text(row.get("attchmntText"))
         category, score = classify_event(title, title, summary)
-        event_time = pd.to_datetime(row.get("sort_date") or row.get("an_dt"), errors="coerce", dayfirst=True)
+        event_time = parse_exchange_timestamp(row.get("sort_date"), row.get("an_dt"))
         out.append(
             {
                 "source": "nse_announcements",
@@ -329,7 +416,7 @@ def normalize_nse_financial_results(rows: list[dict]) -> pd.DataFrame:
     for row in rows:
         title = clean_text("Financial Results", row.get("period"), row.get("relatingTo"))
         summary = clean_text(row.get("companyName"), row.get("audited"), row.get("consolidated"), row.get("financialYear"))
-        event_time = pd.to_datetime(row.get("broadCastDate") or row.get("filingDate"), errors="coerce", dayfirst=True)
+        event_time = parse_exchange_timestamp(row.get("broadCastDate"), row.get("filingDate"))
         out.append(
             {
                 "source": "nse_financial_results",
@@ -355,13 +442,62 @@ def normalize_nse_financial_results(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def normalize_nse_integrated_financials(rows: list[dict]) -> pd.DataFrame:
+    out = []
+    for row in rows:
+        event_time = parse_exchange_timestamp(
+            row.get("broadcast_Date"),
+            row.get("creation_Date"),
+            row.get("revised_Date"),
+        )
+        period_end = clean_text(row.get("qe_Date"))
+        submission = clean_text(row.get("type_Sub"), row.get("type"))
+        title = clean_text("Integrated Financial Results", period_end, submission)
+        summary = clean_text(
+            row.get("smName") or row.get("cmName"),
+            row.get("audited"),
+            row.get("consolidated"),
+            row.get("revision_Remark"),
+        )
+        out.append(
+            {
+                "source": "nse_integrated_financials",
+                "source_event_id": row.get("seq_Id"),
+                "symbol": str(row.get("symbol") or "").upper().strip(),
+                "company_name": row.get("smName") or row.get("cmName"),
+                "isin": row.get("isin"),
+                "event_time": event_time,
+                "event_date": event_time.date() if not pd.isna(event_time) else pd.NaT,
+                "raw_category": submission or "Integrated Filing- Financials",
+                "event_category": "financial_results",
+                "catalyst_score": 95,
+                "title": title,
+                "summary": summary,
+                "attachment_url": row.get("pdf_attach") or row.get("xbrl") or row.get("ixbrl"),
+                "source_url": referer_url_for_integrated_financials(),
+                "period_end": period_end,
+                "relating_to": submission,
+                "consolidated": row.get("consolidated"),
+                "audited": row.get("audited"),
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def referer_url_for_integrated_financials() -> str:
+    return (
+        "https://www.nseindia.com/companies-listing/corporate-integrated-filing"
+        "?integratedType=Integrated+Filing-+Financials"
+    )
+
+
 def normalize_nse_event_calendar(rows: list[dict]) -> pd.DataFrame:
     out = []
     for row in rows:
         title = clean_text(row.get("purpose"))
         summary = clean_text(row.get("bm_desc"))
         category, score = classify_event("event calendar", title, summary)
-        event_time = pd.to_datetime(row.get("date"), errors="coerce", dayfirst=True)
+        event_time = parse_exchange_timestamp(row.get("date"))
         out.append(
             {
                 "source": "nse_event_calendar",
@@ -482,7 +618,12 @@ def run(args: argparse.Namespace) -> None:
     frames: list[pd.DataFrame] = []
     print(f"Fetching corporate events from {start} to {end}: {', '.join(sorted(sources))}")
 
-    if sources & {"nse_announcements", "nse_financial_results", "nse_event_calendar"}:
+    if sources & {
+        "nse_announcements",
+        "nse_financial_results",
+        "nse_integrated_financials",
+        "nse_event_calendar",
+    }:
         nse = NSEClient(sleep_seconds=args.nse_sleep)
         chunks = list(month_chunks(start, end))
         if "nse_announcements" in sources:
@@ -491,6 +632,9 @@ def run(args: argparse.Namespace) -> None:
         if "nse_financial_results" in sources:
             rows = fetch_nse_financial_results(nse, out_dir, chunks, args.refresh)
             frames.append(normalize_nse_financial_results(rows))
+        if "nse_integrated_financials" in sources:
+            rows = fetch_nse_integrated_financials(nse, out_dir, chunks, args.refresh)
+            frames.append(normalize_nse_integrated_financials(rows))
         if "nse_event_calendar" in sources:
             rows = fetch_nse_event_calendar(nse, out_dir, chunks, args.refresh)
             frames.append(normalize_nse_event_calendar(rows))
@@ -523,8 +667,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sources",
         nargs="+",
-        default=["nse_announcements", "nse_financial_results", "nse_event_calendar"],
-        choices=["nse_announcements", "nse_financial_results", "nse_event_calendar", "bse_announcements"],
+        default=[
+            "nse_announcements",
+            "nse_financial_results",
+            "nse_integrated_financials",
+            "nse_event_calendar",
+        ],
+        choices=[
+            "nse_announcements",
+            "nse_financial_results",
+            "nse_integrated_financials",
+            "nse_event_calendar",
+            "bse_announcements",
+        ],
     )
     parser.add_argument("--refresh", action="store_true", help="Refetch even when raw cache files exist.")
     parser.add_argument("--nse-sleep", type=float, default=0.35)
