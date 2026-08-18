@@ -1,0 +1,69 @@
+[project]
+name = "swing-atlas"
+version = "0.1.0"
+description = "Python replacement for the Rust trading engine (API + live feed + swing scoring + backtests)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "clickhouse-connect[async]>=0.8",
+    "httpx>=0.27",
+    "websockets>=13.1",
+    "apscheduler>=3.10",
+    "tenacity>=9.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "feedparser>=6.0",
+    "pyjwt>=2.9",
+    "pandas>=2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Embeds large verbatim ClickHouse SQL blocks kept byte-for-byte identical to
+# engine/src/api/backtest.rs's window-function queries -- wrapping these lines
+# would mean editing the SQL text itself, risking a transcription error in the
+# highest-fidelity-risk part of the whole migration. `# noqa` can't be placed
+# inside a triple-quoted string either, so this is a file-scoped exemption.
+"src/swing_atlas/repositories/backtest_repo.py" = ["E501"]
+"src/swing_atlas/repositories/screener_feature_cache_repo.py" = ["E501"]
+"src/swing_atlas/repositories/paper_trades_repo.py" = ["E501"]
+"src/swing_atlas/repositories/live_signal_baseline_repo.py" = ["E501"]
+"src/swing_atlas/repositories/news_confluence_repo.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["feedparser", "apscheduler.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swing_atlas"]

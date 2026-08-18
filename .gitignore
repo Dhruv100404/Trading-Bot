@@ -25,6 +25,10 @@ __pycache__/
 *.woff2
 
 venv/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 # Added by code-review-graph
 .code-review-graph/
 
