@@ -21,11 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "parquets"
 OUT_DIR = ROOT / "docs" / "volume_spike_3x3_parquet_20day"
 VOLUME_GROUPS_PATH = ROOT / "data" / "volume_groups.json"
-PARQUET_GLOB = "candles_2026*.parquet"
+PARQUET_GLOB = "candles_20*.parquet"
 # Set True to bypass volume_groups.json and test every symbol present in parquet.
 USE_ALL_PARQUET_SYMBOLS = True
-TRADE_START_DATE = np.datetime64("2026-05-01")
-TRADE_END_DATE = np.datetime64("2026-05-30")
+TRADE_START_DATE = np.datetime64("2021-01-01")
+TRADE_END_DATE = "auto"
 
 BUCKET_COUNT = 375
 LATEST_EXIT_BUCKET = 361
@@ -1134,7 +1134,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR, help="Output directory for report, summary, charts, and tradebook.")
     parser.add_argument("--volume-groups-path", type=Path, default=VOLUME_GROUPS_PATH)
     parser.add_argument("--trade-start-date", default=str(TRADE_START_DATE), help="Inclusive trade start date, YYYY-MM-DD.")
-    parser.add_argument("--trade-end-date", default=str(TRADE_END_DATE), help="Inclusive trade end date, YYYY-MM-DD.")
+    parser.add_argument("--trade-end-date", default=str(TRADE_END_DATE), help="Inclusive trade end date, YYYY-MM-DD, or auto/latest for all available parquet dates.")
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="Use the legacy dense in-memory engine. Default uses the faster whole-data streaming engine.",
+    )
     parser.add_argument(
         "--use-volume-groups",
         action="store_true",
@@ -1173,7 +1178,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-target-pcts", default=None, help="Comma-separated target percentages for pattern search. Defaults to --target-pct.")
     parser.add_argument("--grid-limit", type=int, default=0, help="Optional deterministic downsample of pattern combos.")
     parser.add_argument("--min-trades", type=int, default=30, help="Minimum full-sample trades for selecting the best pattern.")
+    parser.add_argument("--resume-candidates", action="store_true", help="Reuse fast-stream candidate chunks already written in the output directory.")
     return parser.parse_args()
+
+
+def run_fast_stream(args: argparse.Namespace) -> None:
+    import volume_spike_stream_numpy as stream
+
+    args.all_symbols = not bool(args.use_volume_groups)
+    if Path(args.out_dir).resolve() == OUT_DIR.resolve():
+        args.out_dir = stream.DEFAULT_OUT_DIR
+    stream.lab.VOLUME_GROUPS_PATH = Path(args.volume_groups_path).resolve()
+    log("Delegating to whole-data one-pass NumPy stream. Use --dense for the legacy in-memory engine.")
+    stream.run(args)
 
 
 def main() -> None:
@@ -1192,6 +1209,12 @@ def main() -> None:
         args.gap_up_min = 0.5
         args.mom15_min = 0.0
         args.mom15_max = 1.5
+
+    if not args.dense:
+        run_fast_stream(args)
+        return
+    if str(args.trade_end_date).strip().lower() in {"", "auto", "latest"}:
+        raise ValueError("--dense requires an explicit --trade-end-date. Leave --dense off for the fast all-data run.")
 
     DATA_DIR = Path(args.parquet_dir).resolve()
     OUT_DIR = Path(args.out_dir).resolve()

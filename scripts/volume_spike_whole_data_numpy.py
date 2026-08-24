@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARQUET_DIR = ROOT / "parquets"
 DEFAULT_OUT_DIR = ROOT / "docs" / "volume_spike_3x3_parquet_20day_whole_data"
 DEFAULT_START_DATE = "2021-01-01"
-DEFAULT_END_DATE = "2026-05-30"
+DEFAULT_END_DATE = "auto"
 
 T0 = time.perf_counter()
 
@@ -30,10 +30,15 @@ def monthly_file_key(path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def monthly_files(parquet_dir: Path, glob: str, start: np.datetime64, end: np.datetime64) -> list[Path]:
+def parse_end_date(raw: str) -> np.datetime64 | None:
+    value = str(raw).strip().lower()
+    return None if value in {"", "auto", "latest"} else np.datetime64(raw)
+
+
+def monthly_files(parquet_dir: Path, glob: str, start: np.datetime64, end: np.datetime64 | None) -> list[Path]:
     paths: list[Path] = []
     start_month = str(start)[:7].replace("-", "")
-    end_month = str(end)[:7].replace("-", "")
+    end_month = "999912" if end is None else str(end)[:7].replace("-", "")
     for path in sorted(parquet_dir.glob(glob)):
         key = monthly_file_key(path)
         if key is None:
@@ -43,14 +48,15 @@ def monthly_files(parquet_dir: Path, glob: str, start: np.datetime64, end: np.da
     return paths
 
 
-def read_chunk(paths: list[Path], end: np.datetime64, target_symbols: pd.Index | None) -> pd.DataFrame:
+def read_chunk(paths: list[Path], end: np.datetime64 | None, target_symbols: pd.Index | None) -> pd.DataFrame:
     if not paths:
         return pd.DataFrame(columns=lab.COLS)
     df = pd.read_parquet([str(path) for path in paths], columns=lab.COLS)
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    df = df[df["date"] <= str(end)]
+    if end is not None:
+        df = df[df["date"] <= str(end)]
     df = df[df["bucket"].between(1, int(lab.BUCKET_COUNT))]
     if target_symbols is not None and target_symbols.size > 0:
         df = df[df["symbol"].isin(target_symbols)]
@@ -443,14 +449,14 @@ def baseline_spec_from_args(args: argparse.Namespace) -> dict[str, float | int |
         }
     return {
         "name": "baseline_rv8_v203_cum8_acc3_drop3_gap0.5_m-0.5_0_h30",
-        "bar_rvol_min": float(lab.BAR_RVOL_MIN),
-        "vol20_rvol_min": float(lab.VOL20_RVOL_MIN),
-        "cum_rvol_min": float(lab.CUM_RVOL_MIN),
-        "volume_accel_max": float(lab.VOLUME_ACCEL_MAX),
-        "drop_from_high_min": float(lab.DROP_FROM_HIGH_MIN),
-        "gap_up_min": float(lab.GAP_UP_MIN),
-        "mom15_min": float(lab.MOM15_MIN),
-        "mom15_max": float(lab.MOM15_MAX),
+        "bar_rvol_min": float(getattr(args, "bar_rvol_min", lab.BAR_RVOL_MIN)),
+        "vol20_rvol_min": float(getattr(args, "vol20_rvol_min", lab.VOL20_RVOL_MIN)),
+        "cum_rvol_min": float(getattr(args, "cum_rvol_min", lab.CUM_RVOL_MIN)),
+        "volume_accel_max": float(getattr(args, "volume_accel_max", lab.VOLUME_ACCEL_MAX)),
+        "drop_from_high_min": float(getattr(args, "drop_from_high_min", lab.DROP_FROM_HIGH_MIN)),
+        "gap_up_min": float(getattr(args, "gap_up_min", lab.GAP_UP_MIN)),
+        "mom15_min": float(getattr(args, "mom15_min", lab.MOM15_MIN)),
+        "mom15_max": float(getattr(args, "mom15_max", lab.MOM15_MAX)),
         "hold_minutes": int(args.hold_minutes),
         "stop_pct": float(args.stop_pct),
         "target_pct": float(args.target_pct),
@@ -462,7 +468,7 @@ def run(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     parquet_dir = Path(args.parquet_dir).resolve()
     start = np.datetime64(args.trade_start_date)
-    end = np.datetime64(args.trade_end_date)
+    end = parse_end_date(args.trade_end_date)
     files = monthly_files(parquet_dir, args.parquet_glob, start, end)
     if not files:
         raise FileNotFoundError(f"No monthly parquet files matched {parquet_dir / args.parquet_glob}")
@@ -497,7 +503,8 @@ def run(args: argparse.Namespace) -> None:
         if first_key is None or last_key is None:
             continue
         target_start = max(start, np.datetime64(f"{first_key[:4]}-{first_key[4:]}-01"))
-        target_end = min(end, np.datetime64(pd.Period(f"{last_key[:4]}-{last_key[4:]}", freq="M").end_time.date()))
+        month_end = np.datetime64(pd.Period(f"{last_key[:4]}-{last_key[4:]}", freq="M").end_time.date())
+        target_end = month_end if end is None else min(end, month_end)
         chunk_id = f"{first_key}_{last_key}"
         candidate_path = chunks_dir / f"candidates_{chunk_id}.parquet"
         dates_path = chunks_dir / f"dates_{chunk_id}.csv"
@@ -681,11 +688,12 @@ def run(args: argparse.Namespace) -> None:
     else:
         pattern_section = "\n## Fast Pattern Search\n\nNot run. Add `--search-grid`.\n"
 
+    actual_end_date = str(dates_np.max()) if dates_np.size else str(args.trade_end_date)
     report = f"""# Whole-Data Parquet Volume-Spike Backtest
 
 - Source parquet glob: `{parquet_dir / args.parquet_glob}`
 - Strategy preset: `{args.preset}`
-- Trade dates: `{args.trade_start_date}` to `{args.trade_end_date}`
+- Trade dates: `{args.trade_start_date}` to `{actual_end_date}` (`--trade-end-date {args.trade_end_date}`)
 - Universe: `{"all parquet symbols" if args.all_symbols else "volume_groups MEGA/LARGE"}`
 - Monthly files used: {len(files):,}
 - Chunk months: {chunk_months}, warmup files per chunk: {warmup_files}
@@ -752,6 +760,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-pct", type=float, default=float(lab.STOP_PCT))
     parser.add_argument("--target-pct", type=float, default=float(lab.TARGET_PCT))
     parser.add_argument("--round-trip-cost-pct", type=float, default=float(lab.ROUND_TRIP_COST_PCT))
+    parser.add_argument("--bar-rvol-min", type=float, default=float(lab.BAR_RVOL_MIN))
+    parser.add_argument("--vol20-rvol-min", type=float, default=float(lab.VOL20_RVOL_MIN))
+    parser.add_argument("--cum-rvol-min", type=float, default=float(lab.CUM_RVOL_MIN))
+    parser.add_argument("--volume-accel-max", type=float, default=float(lab.VOLUME_ACCEL_MAX))
+    parser.add_argument("--drop-from-high-min", type=float, default=float(lab.DROP_FROM_HIGH_MIN))
+    parser.add_argument("--gap-up-min", type=float, default=float(lab.GAP_UP_MIN))
+    parser.add_argument("--mom15-min", type=float, default=float(lab.MOM15_MIN))
+    parser.add_argument("--mom15-max", type=float, default=float(lab.MOM15_MAX))
     parser.add_argument("--live-signals", action="store_true", help="Write latest-session signal sheet for the configured baseline/preset rule.")
     parser.add_argument("--live-date", default=None, help="Signal date to export. Defaults to latest available trade date in the run.")
     parser.add_argument("--search-grid", action="store_true")

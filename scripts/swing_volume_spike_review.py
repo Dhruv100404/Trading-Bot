@@ -36,6 +36,7 @@ class StrategySpec:
     exit_mode: str = "fixed"
     min_hold_days: int = 5
     stop_atr: float = 2.5
+    target_atr: float | None = None
     max_new_per_day: int = 5
     max_positions: int = 10
 
@@ -265,6 +266,7 @@ def exit_for_candidate(sdf: pd.DataFrame, signal_idx: int, spec: StrategySpec) -
     entry = float(sdf.at[entry_idx, "open"])
     atr = float(sdf.at[signal_idx, "atr14"])
     stop = entry - spec.stop_atr * atr
+    target = entry + spec.target_atr * atr if spec.target_atr is not None else None
     exit_idx = max_exit_idx
     exit_price = float(sdf.at[exit_idx, "close"])
     exit_reason = "time"
@@ -272,11 +274,20 @@ def exit_for_candidate(sdf: pd.DataFrame, signal_idx: int, spec: StrategySpec) -
         hold = j - entry_idx + 1
         open_j = float(sdf.at[j, "open"])
         low_j = float(sdf.at[j, "low"])
+        high_j = float(sdf.at[j, "high"])
         close_j = float(sdf.at[j, "close"])
-        if spec.exit_mode in {"atr", "atr_ema20"} and low_j <= stop:
+        use_stop = spec.exit_mode in {"atr", "atr_ema20", "target_stop"}
+        # Stop is checked before target when a bar's range spans both: daily OHLC
+        # can't tell us which came first intraday, so we take the conservative read.
+        if use_stop and low_j <= stop:
             exit_idx = j
             exit_price = open_j if open_j < stop else stop
             exit_reason = "atr_stop"
+            break
+        if target is not None and spec.exit_mode == "target_stop" and high_j >= target:
+            exit_idx = j
+            exit_price = open_j if open_j > target else target
+            exit_reason = "atr_target"
             break
         if spec.exit_mode in {"ema20", "atr_ema20"} and hold >= spec.min_hold_days:
             ema20 = float(sdf.at[j, "ema20"])
