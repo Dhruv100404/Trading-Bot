@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 import volume_spike_3x3_parquet_20day as lab
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARQUET_DIR = ROOT / "parquets"
 DEFAULT_OUT_DIR = ROOT / "docs" / "volume_spike_3x3_parquet_20day_whole_data_fast"
 DEFAULT_START_DATE = "2021-01-01"
-DEFAULT_END_DATE = "2026-05-30"
+DEFAULT_END_DATE = "auto"
 PRICE_BUCKETS = int(lab.LATEST_EXIT_BUCKET)
 VOLUME_BUCKETS = int(lab.FEATURE_BUCKET_END_REQUESTED)
 
@@ -35,9 +36,9 @@ def monthly_file_key(path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def monthly_files(parquet_dir: Path, glob: str, start: np.datetime64, end: np.datetime64) -> list[Path]:
+def monthly_files(parquet_dir: Path, glob: str, start: np.datetime64, end: np.datetime64 | None) -> list[Path]:
     start_month = str(start)[:7].replace("-", "")
-    end_month = str(end)[:7].replace("-", "")
+    end_month = "999912" if end is None else str(end)[:7].replace("-", "")
     paths: list[Path] = []
     for path in sorted(parquet_dir.glob(glob)):
         key = monthly_file_key(path)
@@ -54,9 +55,20 @@ def all_group_symbols(path: Path) -> pd.Index:
     return pd.Index(sorted(symbols), name="symbol")
 
 
-def load_symbols(args: argparse.Namespace) -> pd.Index:
+def discover_parquet_symbols(paths: list[Path]) -> pd.Index:
+    symbols: set[str] = set()
+    for idx, path in enumerate(paths, start=1):
+        if idx == 1 or idx % 10 == 0 or idx == len(paths):
+            log(f"Discovering symbols {idx:,}/{len(paths):,}")
+        table = pq.read_table(str(path), columns=["symbol"])
+        symbols.update(str(symbol) for symbol in pc.unique(table.column("symbol")).to_pylist() if symbol is not None)
+        del table
+    return pd.Index(sorted(symbols), name="symbol")
+
+
+def load_symbols(args: argparse.Namespace, paths: list[Path]) -> pd.Index:
     if args.all_symbols:
-        return all_group_symbols(Path(args.volume_groups_path))
+        return discover_parquet_symbols(paths)
     return lab.load_target_symbols()
 
 
@@ -397,12 +409,14 @@ def run(args: argparse.Namespace) -> None:
     chunks_dir.mkdir(parents=True, exist_ok=True)
     parquet_dir = Path(args.parquet_dir).resolve()
     trade_start = np.datetime64(args.trade_start_date)
-    trade_end = np.datetime64(args.trade_end_date)
+    trade_end = whole.parse_end_date(args.trade_end_date)
+    trade_end_bound = trade_end if trade_end is not None else np.datetime64("2262-04-11")
     files = monthly_files(parquet_dir, args.parquet_glob, trade_start, trade_end)
     if not files:
         raise FileNotFoundError(f"No monthly parquet files matched {parquet_dir / args.parquet_glob}")
 
-    symbols = load_symbols(args)
+    symbols = load_symbols(args, files)
+    log(f"Symbol universe: {len(symbols):,} symbols")
     specs = lab.pattern_grid_specs(args) if args.search_grid else []
     baseline_spec = whole.baseline_spec_from_args(args)
     broad_specs = [*(specs or [baseline_spec]), baseline_spec]
@@ -442,7 +456,7 @@ def run(args: argparse.Namespace) -> None:
             holds,
             stop_target_pairs,
             trade_start,
-            trade_end,
+            trade_end_bound,
             processed_days,
         )
         log(f"{key}: candidates {len(candidates):,}")
@@ -463,7 +477,7 @@ def run(args: argparse.Namespace) -> None:
     symbol_codes, symbol_uniques = pd.factorize(table["symbol"], sort=True)
     day_idx = table["date"].map(day_lookup).astype(np.int32).to_numpy()
     symbol_idx = symbol_codes.astype(np.int32)
-    trade_day_mask = (dates_np >= trade_start) & (dates_np <= trade_end)
+    trade_day_mask = (dates_np >= trade_start) & (dates_np <= trade_end_bound)
     table.to_parquet(out_dir / "broad_candidate_rows.parquet", index=False)
     log(f"Combined candidates {len(table):,} | days {dates_np.size:,} | symbols {len(symbol_uniques):,}")
 
@@ -597,12 +611,13 @@ def run(args: argparse.Namespace) -> None:
     else:
         pattern_section = "\n## Fast Pattern Search\n\nNot run. Add `--search-grid`.\n"
 
+    actual_end_date = str(dates_np[trade_day_mask].max()) if trade_day_mask.any() else str(args.trade_end_date)
     report = f"""# Whole-Data One-Pass NumPy Volume-Spike Backtest
 
 - Source parquet glob: `{parquet_dir / args.parquet_glob}`
 - Strategy preset: `{args.preset}`
-- Trade dates: `{args.trade_start_date}` to `{args.trade_end_date}`
-- Universe: `{"all volume_groups symbols" if args.all_symbols else "volume_groups MEGA/LARGE"}`
+- Trade dates: `{args.trade_start_date}` to `{actual_end_date}` (`--trade-end-date {args.trade_end_date}`)
+- Universe: `{"all parquet symbols" if args.all_symbols else "volume_groups MEGA/LARGE"}`
 - Monthly files used: {len(files):,}
 - Candidate chunk files: {len(candidate_files):,}
 - Combined broad candidate rows: {len(table):,}
@@ -648,7 +663,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-groups-path", type=Path, default=lab.VOLUME_GROUPS_PATH)
     parser.add_argument("--trade-start-date", default=DEFAULT_START_DATE)
     parser.add_argument("--trade-end-date", default=DEFAULT_END_DATE)
-    parser.add_argument("--all-symbols", action="store_true")
+    parser.add_argument("--all-symbols", action="store_true", help="Use every symbol present in the selected monthly parquet files.")
     parser.add_argument(
         "--preset",
         choices=["baseline", "candidate60"],
@@ -659,6 +674,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-pct", type=float, default=float(lab.STOP_PCT))
     parser.add_argument("--target-pct", type=float, default=float(lab.TARGET_PCT))
     parser.add_argument("--round-trip-cost-pct", type=float, default=float(lab.ROUND_TRIP_COST_PCT))
+    parser.add_argument("--bar-rvol-min", type=float, default=float(lab.BAR_RVOL_MIN))
+    parser.add_argument("--vol20-rvol-min", type=float, default=float(lab.VOL20_RVOL_MIN))
+    parser.add_argument("--cum-rvol-min", type=float, default=float(lab.CUM_RVOL_MIN))
+    parser.add_argument("--volume-accel-max", type=float, default=float(lab.VOLUME_ACCEL_MAX))
+    parser.add_argument("--drop-from-high-min", type=float, default=float(lab.DROP_FROM_HIGH_MIN))
+    parser.add_argument("--gap-up-min", type=float, default=float(lab.GAP_UP_MIN))
+    parser.add_argument("--mom15-min", type=float, default=float(lab.MOM15_MIN))
+    parser.add_argument("--mom15-max", type=float, default=float(lab.MOM15_MAX))
     parser.add_argument("--live-signals", action="store_true", help="Write latest-session signal sheet for the configured baseline/preset rule.")
     parser.add_argument("--live-date", default=None, help="Signal date to export. Defaults to latest available trade date in the run.")
     parser.add_argument("--search-grid", action="store_true")
